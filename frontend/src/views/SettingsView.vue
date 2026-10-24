@@ -79,13 +79,6 @@
                 <v-icon icon="mdi-swap-horizontal" size="small" /> 代理行为
               </v-card-title>
               <v-card-text class="d-flex flex-column ga-4">
-                <v-switch
-                  v-model="draft.force_merge_by_tmdb_id"
-                  color="primary"
-                  label="全局强制按 TMDB ID 合并"
-                  hint="覆盖所有虚拟库的独立设置,在全库范围内整合不同版本"
-                  persistent-hint
-                />
                 <v-combobox
                   v-model="draft.hide"
                   :items="HIDE_TYPE_PRESETS"
@@ -172,17 +165,24 @@
           </v-col>
 
           <v-col cols="12" md="4">
-            <!-- TMDB 索引(合并加速) -->
+            <!-- TMDB 合并与索引加速 -->
             <v-card class="fill-height">
               <v-card-title class="d-flex align-center ga-2">
-                <v-icon icon="mdi-movie-search" size="small" /> TMDB 索引(合并加速)
+                <v-icon icon="mdi-movie-search" size="small" /> TMDB 合并与索引加速
               </v-card-title>
               <v-card-text class="d-flex flex-column ga-4">
+                <v-switch
+                  v-model="draft.force_merge_by_tmdb_id"
+                  color="primary"
+                  label="全局强制按 TMDB ID 合并"
+                  hint="同一部作品(相同 TMDB ID)的多个版本条目,在虚拟库列表和详情页的季/集中去重合并为一个展示。开启后覆盖所有虚拟库的独立设置;未开启时各虚拟库可在编辑页单独开启。"
+                  persistent-hint
+                />
                 <v-switch
                   v-model="draft.enable_tmdb_index"
                   color="primary"
                   label="启用 TMDB 索引"
-                  hint="把全库「媒体条目 → TMDB ID」的对应关系建成一张本地查找表(管理员视角)。开启后,进入剧集详情页合并季/集时直接查索引定位关联剧集,不再全库遍历 Emby —— 这是详情页打开速度的最大瓶颈。关闭后退回旧的遍历方案,功能不变但每次进详情页都会全库扫描。"
+                  hint="把全库「媒体条目 → TMDB ID」的对应关系建成一张本地查找表(管理员视角)。开启后,进入剧集详情页合并季/集时直接查索引定位关联剧集,不再全库遍历 Emby —— 这是详情页打开速度的最大瓶颈。关闭后退回旧的遍历方案,功能不变但每次进详情页都会全库扫描。服务于所有启用合并的库(全局强制或单库开启均可)。"
                   persistent-hint
                 />
                 <v-text-field
@@ -200,10 +200,10 @@
 
                 <div class="text-caption text-medium-emphasis">
                   <div class="font-weight-medium text-high-emphasis mb-1">工作原理</div>
-                  <div>① 索引构建:定时以管理员身份拉取全库带 TMDB ID 的条目清单,一次性重建查找表;</div>
-                  <div>② 查询:进详情页合并季/集时,按 TMDB ID 查索引得到候选剧集,再一次批量校验条目存活与当前账号可见性;</div>
-                  <div>③ 自愈:新入库的剧集还没进索引时,自动回退一次全库遍历并把结果回写索引,下一次起走索引;</div>
-                  <div>④ 多用户安全:索引是全库视角,返回给每个账号前都会实时校验该账号的可见性,不会串数据。</div>
+                  <div>① 合并:列表与详情页中,相同 TMDB ID 的多版本条目按顺序去重,保留第一个作为代表;</div>
+                  <div>② 索引构建:定时以管理员身份拉取全库带 TMDB ID 的条目清单,一次性重建「条目 → TMDB ID」查找表;</div>
+                  <div>③ 查询:进详情页合并季/集时,按 TMDB ID 查索引定位关联剧集,再一次批量校验条目存活与当前账号可见性;</div>
+                  <div>④ 自愈与安全:新入库剧集未进索引时,自动回退一次全库遍历并把结果回写;每个账号的可见性实时校验,不会串数据。</div>
                 </div>
               </v-card-text>
             </v-card>
