@@ -1,0 +1,9 @@
+/* 设计令牌:圆角/间距/页面宽度,与主题色(plugins/vuetify.ts)解耦 */
+:root {
+  --evp-card-radius: 16px;
+  --evp-field-radius: 10px;
+  --evp-page-max-width: 1320px;
+  --evp-page-padding: 16px;
+  --evp-section-gap: 16px;
+  --evp-cover-ratio: 16 / 9;
+}

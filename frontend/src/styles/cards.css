@@ -1,0 +1,7 @@
+.v-card {
+  border-radius: var(--evp-card-radius);
+}
+
+.v-field {
+  border-radius: var(--evp-field-radius);
+}

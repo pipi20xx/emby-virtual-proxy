@@ -1,5 +1,6 @@
 # --- STAGE 1: Build Frontend (这一阶段不变) ---
-FROM node:18-alpine AS frontend-builder
+# Vite 8 要求 Node >= 20.19,使用 LTS 22
+FROM node:22-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json .
 # 使用 npm 淘宝镜像/阿里云镜像

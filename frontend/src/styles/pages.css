@@ -1,0 +1,22 @@
+.evp-page {
+  max-width: var(--evp-page-max-width);
+  margin: 0 auto;
+  padding: var(--evp-page-padding);
+  display: flex;
+  flex-direction: column;
+  gap: var(--evp-section-gap);
+}
+
+.evp-cover {
+  aspect-ratio: var(--evp-cover-ratio);
+  overflow: hidden;
+  border-radius: inherit;
+}
+
+.text-truncate-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
