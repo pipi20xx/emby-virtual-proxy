@@ -16,6 +16,109 @@ logger = logging.getLogger(__name__)
 # 【新增】定义封面存储路径
 COVERS_DIR = Path("/app/config/images")
 
+# 转发上游时的请求头白名单(与其它 handler 保持一致)
+_HEADERS_WHITELIST = [
+    'accept', 'accept-language', 'user-agent',
+    'x-emby-authorization', 'x-emby-client', 'x-emby-device-name',
+    'x-emby-device-id', 'x-emby-client-version', 'x-emby-language',
+    'x-emby-token'
+]
+
+
+def _forward_headers(request: Request) -> dict:
+    return {k: v for k, v in request.headers.items() if k.lower() in _HEADERS_WHITELIST}
+
+
+def _extract_user_id(params, full_path: str):
+    user_id = params.get("UserId")
+    if not user_id:
+        path_parts = full_path.split('/')
+        if 'Users' in path_parts:
+            try:
+                user_id_index = path_parts.index('Users') + 1
+                if user_id_index < len(path_parts):
+                    user_id = path_parts[user_id_index]
+            except (ValueError, IndexError):
+                pass
+    return user_id
+
+
+def build_vlib_view_stub(vlib, server_id: str, user_id=None, api_key=None) -> dict:
+    """构建虚拟库在首页视图/磁贴中的占位条目。
+
+    封面已存在时注入真实 ImageTag;否则注入占位 Tag 并触发后台自动生成。
+    """
+    vlib_data = {
+        "Name": vlib.name, "ServerId": server_id, "Id": vlib.id,
+        "Type": "CollectionFolder",
+        "CollectionType": "tvshows",
+        "IsFolder": True,
+        "ImageTags": {}
+    }
+
+    image_file = COVERS_DIR / f"{vlib.id}.jpg"
+    if image_file.is_file():
+        # 图片已存在, 注入真实的 ImageTag
+        if vlib.image_tag:
+            vlib_data["ImageTags"]["Primary"] = vlib.image_tag
+            vlib_data["HasPrimaryImage"] = True
+    else:
+        # 图片不存在, 触发后台生成并注入假Tag
+        logger.info(f"主页视图：发现虚拟库 '{vlib.name}' ({vlib.id}) 缺少封面。")
+
+        # 检查任务是否已在运行，防止重复触发
+        if vlib.id not in handler_autogen.GENERATION_IN_PROGRESS:
+            if user_id and api_key:
+                asyncio.create_task(handler_autogen.generate_poster_in_background(vlib.id, user_id, api_key))
+            else:
+                logger.warning(f"无法为库 {vlib.id} 触发后台任务，因为缺少 UserId 或 ApiKey。")
+
+        vlib_data["ImageTags"]["Primary"] = "generating_placeholder"
+        vlib_data["HasPrimaryImage"] = True
+
+    return vlib_data
+
+
+def apply_full_layout(original_data: dict, config: AppConfig, params, full_path: str) -> dict:
+    """全量布局控制:按 display_order 重建媒体库列表并注入虚拟库。
+
+    供 /Views 与 Emby 4.10+ 的 /Sections/smalllibrarytiles/Items 共用。
+    直接修改并返回 original_data。
+    """
+    all_available_libs = {item["Id"]: item for item in original_data.get("Items", [])}
+
+    server_id = next((item.get("ServerId") for item in all_available_libs.values() if item.get("ServerId")), "unknown")
+
+    user_id = _extract_user_id(params, full_path)
+    api_key = params.get("X-Emby-Token") or config.emby_api_key
+
+    for vlib in config.virtual_libraries:
+        all_available_libs[vlib.id] = build_vlib_view_stub(vlib, server_id, user_id, api_key)
+
+    original_data["Items"] = [all_available_libs[lib_id] for lib_id in config.display_order if lib_id in all_available_libs]
+    original_data["TotalRecordCount"] = len(original_data["Items"])
+    return original_data
+
+
+def apply_legacy_layout(content_json: dict, config: AppConfig) -> dict:
+    """旧版布局:按 hide 过滤真实库后,把虚拟库追加到列表末尾。"""
+    if content_json.get("Items"):
+        if config.hide:
+            content_json["Items"] = [item for item in content_json["Items"] if item.get("CollectionType") not in config.hide]
+
+        sorted_virtual_libraries = sorted(config.virtual_libraries, key=lambda vlib: getattr(vlib, 'order', 0))
+        server_id = content_json["Items"][0].get("ServerId") if content_json.get("Items") else "unknown"
+
+        for vlib in sorted_virtual_libraries:
+            if not any(item.get("Id") == vlib.id for item in content_json["Items"]):
+                content_json["Items"].append({
+                    "Name": vlib.name, "ServerId": server_id, "Id": vlib.id,
+                    "Type": "CollectionFolder", "CollectionType": "tvshows",
+                    "IsFolder": True, "ImageTags": {}
+                })
+    return content_json
+
+
 async def handle_view_injection(
     request: Request,
     full_path: str,
@@ -32,78 +135,17 @@ async def handle_view_injection(
         return await legacy_handle_view_injection(request, full_path, method, real_emby_url, session, config)
 
     logger.info(f"Full layout control enabled. Intercepting views for path: {full_path}")
-    
+
     target_url = f"{real_emby_url}/{full_path}"
     params = request.query_params
-    
-    # 采用更稳健的白名单策略转发必要的请求头，确保认证信息不丢失
-    headers_to_forward = {
-        k: v for k, v in request.headers.items() 
-        if k.lower() in [
-            'accept', 'accept-language', 'user-agent',
-            'x-emby-authorization', 'x-emby-client', 'x-emby-device-name',
-            'x-emby-device-id', 'x-emby-client-version', 'x-emby-language',
-            'x-emby-token'
-        ]
-    }
 
-    async with session.get(target_url, params=params, headers=headers_to_forward) as resp:
+    async with session.get(target_url, params=params, headers=_forward_headers(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             return None
 
         original_data = await resp.json()
-        
-        all_available_libs = {item["Id"]: item for item in original_data.get("Items", [])}
-        
-        server_id = next((item.get("ServerId") for item in all_available_libs.values() if item.get("ServerId")), "unknown")
+        original_data = apply_full_layout(original_data, config, params, full_path)
 
-        for vlib in config.virtual_libraries:
-            vlib_data = {
-                "Name": vlib.name, "ServerId": server_id, "Id": vlib.id,
-                "Type": "CollectionFolder",
-                "CollectionType": "tvshows",
-                "IsFolder": True,
-                "ImageTags": {}
-            }
-            
-            # 【【【 核心修改：在这里决定是否触发自动生成 】】】
-            image_file = COVERS_DIR / f"{vlib.id}.jpg"
-
-            if image_file.is_file():
-                # 图片已存在, 注入真实的 ImageTag
-                if vlib.image_tag:
-                    vlib_data["ImageTags"]["Primary"] = vlib.image_tag
-                    vlib_data["HasPrimaryImage"] = True
-            else:
-                # 图片不存在, 触发后台生成并注入假Tag
-                logger.info(f"主页视图：发现虚拟库 '{vlib.name}' ({vlib.id}) 缺少封面。")
-                
-                # 检查任务是否已在运行，防止重复触发
-                if vlib.id not in handler_autogen.GENERATION_IN_PROGRESS:
-                    # 【【【 核心修正2：传递用户ID和API Key 】】】
-                    # 从当前请求中提取必要信息
-                    user_id = params.get("UserId")
-                    if not user_id: # 如果参数里没有，就从路径里找
-                        path_parts = full_path.split('/')
-                        if 'Users' in path_parts:
-                            user_id = path_parts[path_parts.index('Users') + 1]
-                    api_key = params.get("X-Emby-Token") or config.emby_api_key
-
-                    if user_id and api_key:
-                        asyncio.create_task(handler_autogen.generate_poster_in_background(vlib.id, user_id, api_key))
-                    else:
-                        logger.warning(f"无法为库 {vlib.id} 触发后台任务，因为缺少 UserId 或 ApiKey。")
-
-                vlib_data["ImageTags"]["Primary"] = "generating_placeholder"
-                vlib_data["HasPrimaryImage"] = True
-
-            all_available_libs[vlib.id] = vlib_data
-
-        sorted_items = [all_available_libs[lib_id] for lib_id in config.display_order if lib_id in all_available_libs]
-        
-        original_data["Items"] = sorted_items
-        original_data["TotalRecordCount"] = len(sorted_items)
-        
         final_content = json.dumps(original_data).encode('utf-8')
         return Response(content=final_content, status_code=200, media_type="application/json")
 
@@ -112,35 +154,11 @@ async def legacy_handle_view_injection(request: Request, full_path: str, method:
     target_url = f"{real_emby_url}/{full_path}"
     params = request.query_params
 
-    # 同样在此处采用白名单策略
-    headers_to_forward = {
-        k: v for k, v in request.headers.items() 
-        if k.lower() in [
-            'accept', 'accept-language', 'user-agent',
-            'x-emby-authorization', 'x-emby-client', 'x-emby-device-name',
-            'x-emby-device-id', 'x-emby-client-version', 'x-emby-language',
-            'x-emby-token'
-        ]
-    }
-    
-    async with session.get(target_url, params=params, headers=headers_to_forward) as resp:
+    async with session.get(target_url, params=params, headers=_forward_headers(request)) as resp:
         if resp.status == 200 and "application/json" in resp.headers.get("Content-Type", ""):
             content_json = await resp.json()
             if content_json.get("Items"):
-                if config.hide:
-                    content_json["Items"] = [item for item in content_json["Items"] if item.get("CollectionType") not in config.hide]
-
-                # 【【【 已删除 is_hidden 判断 】】】
-                sorted_virtual_libraries = sorted(config.virtual_libraries, key=lambda vlib: getattr(vlib, 'order', 0))
-                server_id = content_json["Items"][0].get("ServerId") if content_json.get("Items") else "unknown"
-
-                for vlib in sorted_virtual_libraries:
-                    if not any(item.get("Id") == vlib.id for item in content_json["Items"]):
-                        content_json["Items"].append({
-                            "Name": vlib.name, "ServerId": server_id, "Id": vlib.id, 
-                            "Type": "CollectionFolder", "CollectionType": "tvshows", 
-                            "IsFolder": True, "ImageTags": {}
-                        })
+                content_json = apply_legacy_layout(content_json, config)
                 final_content = json.dumps(content_json).encode('utf-8')
                 return Response(content=final_content, status_code=200, media_type="application/json")
     return None

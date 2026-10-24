@@ -22,6 +22,7 @@ from proxy_handlers import (
     handler_episodes,
     handler_default,
     handler_latest,
+    handler_home_sections,
     handler_images,
     handler_virtual_items
 )
@@ -141,6 +142,8 @@ async def reverse_proxy(request: Request, full_path: str):
     if not response: response = await handler_images.handle_virtual_library_image(request, full_path)
     if not response: response = await handler_virtual_items.handle_get_virtual_item_info(request, full_path, config)
     if not response: response = await handler_latest.handle_home_latest_items(request, full_path, request.method, real_emby_url, session, config)
+    # Emby 4.10+ 首页分区接口(我的媒体磁贴/各库最新横排),必须在默认转发之前拦截
+    if not response: response = await handler_home_sections.handle_home_sections(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_system.handle_system_and_playback_info(request, full_path, request.method, real_emby_url, proxy_address, session)
     if not response: response = await handler_episodes.handle_episodes_merge(request, full_path, session, real_emby_url)
     if not response: response = await handler_seasons.handle_seasons_merge(request, full_path, session, real_emby_url)
