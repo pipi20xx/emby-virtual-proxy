@@ -339,6 +339,39 @@
 
 ---
 
+## 📁 项目结构
+
+```
+src/
+├── main.py                 # 双服务入口 (admin / proxy)
+├── app_paths.py            # 文件系统路径唯一定义处
+├── models.py               # Pydantic 数据模型
+├── config_manager.py       # config.json 读写 (TTL缓存 + 原子写入)
+├── db_manager.py           # SQLite 缓存库管理 (每线程独立连接)
+├── proxy_cache.py          # 代理端内存缓存
+│
+├── admin_server.py         # 管理后台 API (纯薄路由层,只调用 services/)
+├── services/               # 管理后台业务服务层
+│   ├── emby_client.py      #   Emby API 统一访问 (管理侧)
+│   ├── cover_service.py    #   封面生成 (素材四级回退 + 样式插件调度)
+│   ├── rss_service.py      #   RSS 虚拟库刷新与定时调度
+│   ├── library_service.py  #   虚拟库 CRUD 与显示顺序
+│   └── system_service.py   #   系统级操作 (Docker 容器重启)
+│
+├── advanced_filters/       # 高级筛选器 (规则翻译为 Emby 原生参数)
+│   └── translator.py       #   纯函数,无网络请求
+│
+├── proxy_server.py         # 代理核心 (客户端流量入口,勿随意改动)
+├── proxy_handlers/         # 代理端各端点处理器 (转发/虚拟库/合并/RSS条目等)
+├── rss_processor/          # RSS 数据刷新处理器 (豆瓣/Bangumi, 基类+子类)
+└── cover_generator/        # 封面样式插件 (每个 style_*.py 一个样式,可插拔)
+```
+
+分层原则:**代理核心** (`proxy_server.py` + `proxy_handlers/`) 面向客户端,
+改动需极度谨慎;**管理后台** (`admin_server.py` + `services/`) 面向配置,
+业务逻辑沉淀在服务层,路由层保持薄。两边通过 `/api/internal/get-cached-items`
+内部接口和 SQLite 缓存库交互,不直接共享内存。
+
 ## 🛠️ 技术架构
 
 ## 📱 关于客户端与播放器兼容性
