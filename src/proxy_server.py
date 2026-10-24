@@ -14,7 +14,7 @@ from typing import Tuple, Dict, List, Optional
 # 【【【 同时修改这一行，从 proxy_cache 导入两个缓存实例 】】】
 # api_cache 经 proxy_cache.api_cache 间接访问(TTL 可配置时会重建实例)
 import proxy_cache
-from proxy_cache import vlib_items_cache, serving_items_cache
+from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
 import config_manager
 import db_manager
 from proxy_handlers import (
@@ -171,40 +171,38 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
     items: List[dict] = []
 
     if vlib.resource_type != "rsshub" and config.enable_vlib_local_serving:
-        # 规则库:全量解析一次,同一份结果同时喂直出缓存(按用户)与封面素材缓存
-        all_users = await _list_emby_users(config)
-        if user_id not in all_users:
-            all_users.insert(0, user_id)
-        for uid in all_users:
-            try:
-                user_items = await handler_items.resolve_full_vlib_items(
-                    config, vlib, uid, proxy_app.state.aiohttp_session,
-                    config.emby_url.rstrip('/'), internal_headers,
-                )
-                if not user_items:
-                    logger.warning(f"直出缓存预热:库 '{vlib.name}' 用户 {uid} 解析结果为空。")
-                    continue
-                if config.enable_vlib_cache:
-                    handler_items.store_serving_cache(vlib, uid, user_items)
-                    if uid == user_id:
-                        items = user_items
-                    logger.info(f"直出缓存预热:库 '{vlib.name}' 用户 {uid} 已解析 {len(user_items)} 个项目。")
-            except Exception as e:
-                logger.warning(f"直出缓存预热失败 ('{vlib.name}' 用户 {uid}): {e}")
-
-        if not items:
-            # 逐用户解析都失败或未启用缓存时,保底用默认用户的结果
-            items = await handler_items.resolve_full_vlib_items(
-                config, vlib, user_id, proxy_app.state.aiohttp_session,
-                config.emby_url.rstrip('/'), internal_headers,
-            )
+        # 规则库:共享元数据只解析一次(管理员身份,可见性最全),
+        # 各用户仅做轻量 UserData 叠加层 —— 用户数再多也不会放大全量解析
+        items = await handler_items.resolve_shared_metadata(
+            config, vlib, user_id, proxy_app.state.aiohttp_session,
+            config.emby_url.rstrip('/'), internal_headers,
+        )
         if not items:
             raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则")
+
         if config.enable_vlib_cache:
-            # 封面素材缓存沿用全量结果前 100 项,省一次独立查询
+            handler_items.store_shared_metadata(vlib, items)
+            # 封面素材缓存沿用元数据前 100 项
             cover_items = items[:100]
             vlib_items_cache[library_id] = cover_items
             db_manager.save_vlib_items_cache(library_id, cover_items)
+
+            all_users = await _list_emby_users(config)
+            if user_id not in all_users:
+                all_users.insert(0, user_id)
+            for uid in all_users:
+                try:
+                    count = await handler_items.build_and_store_user_overlay(
+                        config, vlib, uid, proxy_app.state.aiohttp_session,
+                        config.emby_url.rstrip('/'), internal_headers,
+                    )
+                    if count is None:
+                        logger.warning(f"叠加层预热失败:库 '{vlib.name}' 用户 {uid}。")
+                    else:
+                        logger.info(f"叠加层预热:库 '{vlib.name}' 用户 {uid} 已叠加 {count} 项用户状态。")
+                except Exception as e:
+                    logger.warning(f"叠加层预热失败 ('{vlib.name}' 用户 {uid}): {e}")
+
         logger.info(f"主动预热完成:库 '{vlib.name}' ({library_id}) 解析 {len(items)} 个项目。")
         return items
 
@@ -257,10 +255,11 @@ async def autogen_cover_for_library(library_id: str):
 
 @proxy_app.post("/api/internal/clear-vlib-cache")
 async def clear_vlib_cache():
-    """清空代理核心内存中的虚拟库项目缓存(admin 侧同时清 SQLite 持久层)。"""
+    """清空代理核心内存中的虚拟库缓存(admin 侧同时清 SQLite 持久层)。"""
     vlib_items_cache.clear()
-    serving_items_cache.clear()
-    logger.info("已清空内存中的虚拟库项目缓存与直出解析缓存。")
+    vlib_metadata_cache.clear()
+    user_overlay_cache.clear()
+    logger.info("已清空内存中的虚拟库项目缓存、共享元数据与用户叠加层。")
     return {"success": True}
 
 
@@ -295,6 +294,14 @@ async def _startup_warmup():
             if persisted:
                 vlib_items_cache[vlib.id] = persisted
                 logger.info(f"启动预热:已从 SQLite 恢复库 '{vlib.name}' 的 {len(persisted)} 条项目缓存。")
+        if config.enable_vlib_local_serving:
+            for vlib in config.virtual_libraries:
+                if vlib.id in vlib_metadata_cache:
+                    continue
+                persisted_meta = db_manager.load_vlib_metadata(vlib.id)
+                if persisted_meta:
+                    vlib_metadata_cache[vlib.id] = {"items": persisted_meta[0], "updated_at": persisted_meta[1]}
+                    logger.info(f"启动预热:已从 SQLite 恢复库 '{vlib.name}' 的共享元数据({len(persisted_meta[0])} 项)。")
 
     # 2. 缺封面的库补生成
     for vlib in config.virtual_libraries:

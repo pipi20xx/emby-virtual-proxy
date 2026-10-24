@@ -14,14 +14,17 @@ from . import handler_merger, handler_views
 # 导入我们新的翻译器和旧的后筛选逻辑
 from ._filter_translator import translate_rules
 from .handler_rss import RssHandler
-from proxy_cache import vlib_items_cache, serving_items_cache
+from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
 import db_manager
 logger = logging.getLogger(__name__)
 
-# ================= 本地直出(访问加速)配置 =================
-# 软过期:超过后照常直出,同时后台异步刷新(stale-while-revalidate)
+# ================= 本地直出(访问加速,分层缓存) =================
+# 架构:共享元数据(每库一份,管理员身份解析,已剥离 UserData,所有用户共用)
+#      + 用户叠加层(每 用户+库 一份,仅存 {条目ID: UserData},体积约为元数据的 5%)
+# 服务时按叠加层裁剪可见性并叠加用户状态 —— 元数据只存/解析一份,任意用户数都低成本。
+# 软过期:超过后照常返回,同时后台异步刷新(stale-while-revalidate)
 _SERVING_SOFT_TTL = 6 * 3600
-# 硬过期:超过后不再直出,回退实时查询并后台刷新
+# 硬过期:元数据超过后不再直出,回退实时查询并后台重建;叠加层硬过期仍照常返回
 _SERVING_HARD_TTL = 72 * 3600
 
 # 全量解析时向 Emby 索取的字段(覆盖常规客户端浏览所需)
@@ -42,6 +45,9 @@ _SERVING_BLOCKLIST_PARAMS = [
 # 直出响应的本地排序支持
 _SERVING_NUMERIC_SORT_FIELDS = {"CommunityRating", "ProductionYear"}
 _SERVING_DATE_SORT_FIELDS = {"DateCreated", "PremiereDate"}
+
+# 叠加层按 Id 批量查询的每批条目数(控制 URL 长度)
+_SERVING_OVERLAY_CHUNK = 150
 
 # 转发上游的请求头白名单(与 handler_views 保持一致)
 _FORWARDABLE_HEADERS = [
@@ -94,6 +100,10 @@ def _apply_post_filter(items: List[Dict[str, Any]], post_filter_rules: List[Dict
 
 # ================= 本地直出(访问加速) =================
 
+def _extract_token(headers: Dict[str, str]) -> Optional[str]:
+    return headers.get("X-Emby-Token") or headers.get("x-emby-token")
+
+
 def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) -> Tuple[Dict[str, Any], List[Dict]]:
     """构建虚拟库解析请求参数(规则过滤 + 高级筛选翻译),供全量拉取复用。"""
     new_params: Dict[str, Any] = {
@@ -118,15 +128,15 @@ def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) 
     return new_params, post_filter_rules
 
 
-async def resolve_full_vlib_items(config: AppConfig, vlib, user_id: str, session: ClientSession,
+async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session: ClientSession,
                                   real_emby_url: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
-    """解析虚拟库完整项目列表(规则过滤 + 高级筛选 + TMDB 合并),供本地直出与预热使用。
+    """解析虚拟库共享元数据(规则过滤 + 高级筛选 + TMDB 合并),并剥离 UserData。
 
-    与浏览路径的页式查询不同,这里始终全量分页拉取;失败返回空列表。
+    共享元数据与用户无关,所有用户共用一份;可见性差异由用户叠加层在服务时裁剪。
+    以传入身份查询(预热时为管理员 api_key,可见性最全);失败返回空列表。
     """
     try:
-        token = headers.get("X-Emby-Token") or headers.get("x-emby-token")
-        new_params, post_filter_rules = _build_resolution_params(config, vlib, token)
+        new_params, post_filter_rules = _build_resolution_params(config, vlib, _extract_token(headers))
         search_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
 
         all_items: List[Dict[str, Any]] = []
@@ -153,6 +163,9 @@ async def resolve_full_vlib_items(config: AppConfig, vlib, user_id: str, session
         if vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id:
             all_items = await handler_merger.merge_items_by_tmdb(all_items)
 
+        for item in all_items:
+            item.pop("UserData", None)
+
         logger.info(f"全量解析 '{vlib.name}' 完成,共 {len(all_items)} 个项目。")
         return all_items
     except Exception as e:
@@ -160,41 +173,136 @@ async def resolve_full_vlib_items(config: AppConfig, vlib, user_id: str, session
         return []
 
 
-def store_serving_cache(vlib, user_id: str, items: List[Dict[str, Any]]) -> None:
-    """写入单个 (用户, 虚拟库) 的直出缓存(内存 + SQLite),供预热与后台刷新复用。"""
+def get_shared_metadata(vlib_id: str) -> Optional[Dict[str, Any]]:
+    """读取共享元数据(内存优先,未命中回退 SQLite 并回填)。"""
+    entry = vlib_metadata_cache.get(vlib_id)
+    if entry is None:
+        persisted = db_manager.load_vlib_metadata(vlib_id)
+        if persisted:
+            entry = {"items": persisted[0], "updated_at": persisted[1]}
+            vlib_metadata_cache[vlib_id] = entry
+    return entry
+
+
+def store_shared_metadata(vlib, items: List[Dict[str, Any]]) -> None:
     now = int(time.time())
-    serving_items_cache[(user_id, vlib.id)] = {"items": items, "updated_at": now}
-    db_manager.save_vlib_serving_items(user_id, vlib.id, items, now)
+    vlib_metadata_cache[vlib.id] = {"items": items, "updated_at": now}
+    db_manager.save_vlib_metadata(vlib.id, items, now)
 
 
-async def refresh_serving_cache(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                real_emby_url: str, headers: Dict[str, str]) -> int:
-    """重建单个 (用户, 虚拟库) 的直出缓存(受缓存总开关约束),返回项目数。"""
-    items = await resolve_full_vlib_items(config, vlib, user_id, session, real_emby_url, headers)
-    if items and config.enable_vlib_cache and config.enable_vlib_local_serving:
-        store_serving_cache(vlib, user_id, items)
-    return len(items)
+async def build_user_overlay_data(config: AppConfig, vlib, user_id: str, session: ClientSession,
+                                  real_emby_url: str, headers: Dict[str, str]) -> Optional[Dict[str, dict]]:
+    """基于共享元数据的条目 Id 分批拉取该用户的 UserData,返回 {条目ID: UserData}。
+
+    返回 None 表示构建失败(调用方不应落盘);叠加层缺失的 Id 即该用户不可见的条目。
+    """
+    meta = get_shared_metadata(vlib.id)
+    if meta is None:
+        logger.warning(f"叠加层构建跳过:'{vlib.name}' 尚无共享元数据。")
+        return None
+    if not meta["items"]:
+        return {}
+
+    token = _extract_token(headers)
+    url = f"{real_emby_url}/emby/Users/{user_id}/Items"
+    ids = [i.get("Id") for i in meta["items"] if i.get("Id")]
+    data: Dict[str, dict] = {}
+
+    for chunk_start in range(0, len(ids), _SERVING_OVERLAY_CHUNK):
+        chunk = ids[chunk_start:chunk_start + _SERVING_OVERLAY_CHUNK]
+        params: Dict[str, Any] = {"Ids": ",".join(chunk), "EnableUserData": "true", "Limit": "2000"}
+        if token:
+            params["X-Emby-Token"] = token
+        try:
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning(f"叠加层构建失败:'{vlib.name}' 用户 {user_id} 批次 Status={resp.status}")
+                    return None
+                for it in (await resp.json(content_type=None)).get("Items", []):
+                    if it.get("Id"):
+                        data[it["Id"]] = it.get("UserData") or {}
+        except Exception as e:
+            logger.warning(f"叠加层构建失败 ('{vlib.name}' 用户 {user_id}): {e}")
+            return None
+    return data
 
 
-_refreshing_serving_keys = set()
+def get_user_overlay(vlib_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """读取用户叠加层(内存优先,未命中回退 SQLite 并回填)。"""
+    key = (user_id, vlib_id)
+    entry = user_overlay_cache.get(key)
+    if entry is None:
+        persisted = db_manager.load_vlib_user_overlay(user_id, vlib_id)
+        if persisted:
+            entry = {"data": persisted[0], "updated_at": persisted[1]}
+            user_overlay_cache[key] = entry
+    return entry
 
 
-def _refresh_serving_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                real_emby_url: str, headers: Dict[str, str]) -> None:
-    """后台重建直出缓存(带去重锁,避免并发风暴)。"""
-    key = (user_id, vlib.id)
-    if key in _refreshing_serving_keys:
+def store_user_overlay(vlib, user_id: str, data: Dict[str, dict]) -> None:
+    now = int(time.time())
+    user_overlay_cache[(user_id, vlib.id)] = {"data": data, "updated_at": now}
+    db_manager.save_vlib_user_overlay(user_id, vlib.id, data, now)
+
+
+async def build_and_store_user_overlay(config: AppConfig, vlib, user_id: str, session: ClientSession,
+                                       real_emby_url: str, headers: Dict[str, str]) -> Optional[int]:
+    """重建并持久化用户叠加层(预热链路使用),返回叠加条目数;失败返回 None。"""
+    data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers)
+    if data is None:
+        return None
+    store_user_overlay(vlib, user_id, data)
+    return len(data)
+
+
+_refreshing_meta_keys = set()
+_refreshing_overlay_keys = set()
+
+
+def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
+                                 real_emby_url: str) -> None:
+    """后台重建共享元数据(带去重锁;以管理员 api_key 身份,可见性最全)。"""
+    if vlib.id in _refreshing_meta_keys:
         return
-    _refreshing_serving_keys.add(key)
+    _refreshing_meta_keys.add(vlib.id)
 
     async def _task():
         try:
-            count = await refresh_serving_cache(config, vlib, user_id, session, real_emby_url, headers)
-            logger.info(f"后台刷新直出缓存完成:'{vlib.name}' 共 {count} 个项目。")
+            headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
+            items = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers)
+            if items:
+                store_shared_metadata(vlib, items)
+                logger.info(f"后台重建共享元数据完成:'{vlib.name}' 共 {len(items)} 项。")
+            else:
+                logger.warning(f"后台重建共享元数据失败:'{vlib.name}' 解析结果为空。")
         except Exception as e:
-            logger.warning(f"后台刷新直出缓存失败 ('{vlib.name}'): {e}")
+            logger.warning(f"后台重建共享元数据出错 ('{vlib.name}'): {e}")
         finally:
-            _refreshing_serving_keys.discard(key)
+            _refreshing_meta_keys.discard(vlib.id)
+
+    asyncio.create_task(_task())
+
+
+def _refresh_overlay_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
+                                real_emby_url: str, headers: Dict[str, str]) -> None:
+    """后台重建用户叠加层(带去重锁;以该用户身份拉取其 UserData)。"""
+    key = (user_id, vlib.id)
+    if key in _refreshing_overlay_keys:
+        return
+    _refreshing_overlay_keys.add(key)
+
+    async def _task():
+        try:
+            data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers)
+            if data is None:
+                logger.warning(f"后台重建用户叠加层失败 ('{vlib.name}' 用户 {user_id})。")
+                return
+            store_user_overlay(vlib, user_id, data)
+            logger.info(f"后台重建用户叠加层完成:'{vlib.name}' 用户 {user_id} 共 {len(data)} 项状态。")
+        except Exception as e:
+            logger.warning(f"后台重建用户叠加层出错 ('{vlib.name}' 用户 {user_id}): {e}")
+        finally:
+            _refreshing_overlay_keys.discard(key)
 
     asyncio.create_task(_task())
 
@@ -224,10 +332,11 @@ def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: s
 async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, method: str,
                             session: ClientSession, real_emby_url: str,
                             request_headers) -> Optional[Response]:
-    """本地直出:命中完整解析缓存时在代理端排序/分页后直接返回,不再请求 Emby。
+    """本地直出:命中分层缓存时在代理端叠加用户状态、排序、分页后直接返回,不再请求 Emby。
 
-    仅处理"简单浏览"请求(无筛选/搜索参数);未命中或超过硬过期时回退实时查询,
-    超过软过期时照常直出并在后台异步刷新(stale-while-revalidate)。
+    共享元数据未命中/硬过期 → 回退实时查询并后台重建;
+    用户叠加层未命中 → 回退实时查询并后台构建(该用户此后秒开);
+    任意一层软过期 → 照常返回并后台刷新(stale-while-revalidate)。
     """
     if method != "GET" or not config.enable_vlib_local_serving or not config.enable_vlib_cache:
         return None
@@ -240,31 +349,49 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     if str(params.get("Recursive", "true")).lower() not in ("", "true"):
         return None
 
-    key = (user_id, vlib.id)
-    entry = serving_items_cache.get(key)
-    if entry is None:
-        persisted = db_manager.load_vlib_serving_items(user_id, vlib.id)
-        if persisted:
-            entry = {"items": persisted[0], "updated_at": persisted[1]}
-            serving_items_cache[key] = entry
+    now = int(time.time())
 
-    headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
-
-    if entry is None:
-        # 首次访问:本次仍走实时查询,同时后台构建全量缓存,下次即可直出
-        logger.info(f"直出缓存未命中('{vlib.name}'),本次实时查询并后台构建缓存。")
-        _refresh_serving_background(config, vlib, user_id, session, real_emby_url, headers)
+    meta = get_shared_metadata(vlib.id)
+    if meta is None:
+        logger.info(f"直出元数据未命中('{vlib.name}'),本次实时查询并后台构建共享元数据。")
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url)
+        return None
+    meta_age = now - int(meta["updated_at"])
+    if meta_age > _SERVING_HARD_TTL:
+        logger.info(f"直出元数据已硬过期({meta_age // 3600}h),回退实时查询并后台重建。")
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url)
         return None
 
-    age = int(time.time()) - int(entry["updated_at"])
-    if age > _SERVING_HARD_TTL:
-        logger.info(f"直出缓存已硬过期({age // 3600}h),回退实时查询并后台刷新。")
-        _refresh_serving_background(config, vlib, user_id, session, real_emby_url, headers)
+    overlay = get_user_overlay(vlib.id, user_id)
+    if overlay is None:
+        logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, '{vlib.name}'),本次实时查询并后台构建。")
+        headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
+        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers)
         return None
+    overlay_age = now - int(overlay["updated_at"])
 
-    items = list(entry["items"])
+    # 组装:元数据 ∩ 用户可见条目,并叠加用户自己的 UserData
+    overlay_data = overlay["data"]
+    items = []
+    for item in meta["items"]:
+        ud = overlay_data.get(item.get("Id"))
+        if ud is None:
+            continue  # 该用户不可见(权限差异或元数据滞后),自然裁剪
+        if ud:
+            item = {**item, "UserData": ud}
+        items.append(item)
 
-    # IncludeItemTypes 本地过滤(缓存本身是 Movie,Series,Video 的并集)
+    if meta_age > _SERVING_SOFT_TTL:
+        logger.info(f"直出元数据已软过期({meta_age // 3600}h),照常返回并后台重建。")
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url)
+    if overlay_age > _SERVING_SOFT_TTL:
+        logger.info(f"用户叠加层已软过期({overlay_age // 3600}h),照常返回并后台重建。")
+        headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
+        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers)
+
+    logger.info(f"本地直出:'{vlib.name}' 命中分层缓存(元数据 {len(meta['items'])} 项 / 用户可见 {len(items)} 项)。")
+
+    # IncludeItemTypes 本地过滤(元数据本身是 Movie,Series,Video 的并集)
     type_filter = params.get("IncludeItemTypes")
     if type_filter:
         allowed = {t.strip() for t in type_filter.split(",") if t.strip()}
@@ -286,12 +413,6 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
 
     payload = {"Items": page, "TotalRecordCount": len(items), "StartIndex": start_idx}
     content = json.dumps(payload).encode("utf-8")
-
-    if age > _SERVING_SOFT_TTL:
-        logger.info(f"直出缓存已软过期({age // 3600}h),照常返回并后台刷新。")
-        _refresh_serving_background(config, vlib, user_id, session, real_emby_url, headers)
-
-    logger.info(f"本地直出:'{vlib.name}' 命中解析缓存(共 {len(items)} 项),返回 {len(page)} 项。")
     return Response(content=content, status_code=200, media_type="application/json")
 
 

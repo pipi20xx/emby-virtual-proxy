@@ -15,10 +15,11 @@ api_cache_disabled = False
 # 这个缓存不需要时间过期，因为它只在用户浏览时更新
 vlib_items_cache = LRUCache(maxsize=100)
 
-# 虚拟库完整解析列表缓存(本地直出,访问加速)
-# - 键: (user_id, library_id),值: {"items": [...], "updated_at": unix秒}
-# - 新鲜度由 handler_items 的软/硬 TTL 管理,这里只做容量上限(LRU 淘汰)
-serving_items_cache = LRUCache(maxsize=32)
+# 本地直出分层缓存(访问加速):
+# - 共享元数据:每库一份、所有用户共用(已剥离 UserData)
+vlib_metadata_cache = LRUCache(maxsize=32)   # library_id -> {"items": [...], "updated_at": unix秒}
+# - 用户叠加层:每 用户+库 一份,只存 {条目ID: UserData}(体积约为元数据的 5%)
+user_overlay_cache = LRUCache(maxsize=64)    # (user_id, library_id) -> {"data": {...}, "updated_at": unix秒}
 
 
 def set_api_cache_ttl(ttl_seconds: int) -> None:

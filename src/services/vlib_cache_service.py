@@ -102,10 +102,13 @@ def reschedule_refresh_job(config: AppConfig) -> None:
 
 
 async def clear_all_caches() -> dict:
-    """清空虚拟库项目缓存:SQLite 持久层 + 代理核心内存,返回各类删除量。"""
+    """清空虚拟库缓存:SQLite 持久层 + 代理核心内存,返回各类删除量。"""
     import db_manager
     removed_libraries = db_manager.clear_vlib_items_cache()
-    removed_serving = db_manager.clear_vlib_serving_cache()
+    removed_meta = db_manager.clear_vlib_metadata()
+    removed_overlay = db_manager.clear_vlib_user_overlay()
+    # 旧版按用户全量缓存表一并清理(历史数据)
+    db_manager.clear_vlib_serving_cache()
 
     proxy_core_url = _proxy_core_url()
     if proxy_core_url:
@@ -120,8 +123,8 @@ async def clear_all_caches() -> dict:
         except Exception as e:
             logger.warning(f"通知代理核心清空内存缓存时出错: {e}")
 
-    logger.info(f"虚拟库缓存已清空(项目缓存 {removed_libraries} 库,直出解析 {removed_serving} 行,内存已通知清空)。")
-    return {"vlib_items": removed_libraries, "serving_rows": removed_serving}
+    logger.info(f"虚拟库缓存已清空(项目缓存 {removed_libraries} 库,共享元数据 {removed_meta},用户叠加层 {removed_overlay},内存已通知清空)。")
+    return {"vlib_items": removed_libraries, "serving_rows": removed_meta + removed_overlay}
 
 
 def start_scheduler() -> None:

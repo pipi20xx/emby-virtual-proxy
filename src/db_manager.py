@@ -211,6 +211,26 @@ def init_databases():
     )
     """, commit=True)
 
+    # 共享元数据(本地直出分层缓存):每库一份、所有用户共用(已剥离 UserData)
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS vlib_metadata (
+        library_id TEXT PRIMARY KEY,
+        items_json TEXT,
+        updated_at INTEGER
+    )
+    """, commit=True)
+
+    # 用户叠加层:每 用户+库 一份,只存 {条目ID: UserData}
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS vlib_user_overlay (
+        user_id TEXT,
+        library_id TEXT,
+        data_json TEXT,
+        updated_at INTEGER,
+        PRIMARY KEY (user_id, library_id)
+    )
+    """, commit=True)
+
 
 # --- 虚拟库项目缓存(内存 vlib_items_cache 的持久层) ---
 
@@ -293,13 +313,110 @@ def load_vlib_serving_items(user_id: str, library_id: str):
 
 
 def clear_vlib_serving_cache() -> int:
-    """清空全部虚拟库完整解析列表,返回删除的行数。"""
+    """清空旧版按用户全量缓存表(已由分层缓存取代),返回删除的行数。"""
     try:
         cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_serving_items", commit=True)
         return cursor.rowcount or 0
     except Exception as e:
         print(f"Error clearing vlib serving cache: {e}")
         return 0
+
+
+def save_vlib_metadata(library_id: str, items: list, updated_at: int) -> None:
+    """保存共享元数据(每库一份,已剥离 UserData)。"""
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "INSERT INTO vlib_metadata (library_id, items_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(library_id) DO UPDATE SET items_json = excluded.items_json, updated_at = excluded.updated_at",
+            (library_id, json.dumps(items, ensure_ascii=False), updated_at),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving vlib metadata for {library_id}: {e}")
+
+
+def load_vlib_metadata(library_id: str):
+    """读取共享元数据,返回 (items, updated_at) 或 None。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT items_json, updated_at FROM vlib_metadata WHERE library_id = ?", (library_id,)
+        )
+        if not row or not row["items_json"]:
+            return None
+        items = json.loads(row["items_json"])
+        if not isinstance(items, list):
+            return None
+        return items, int(row["updated_at"] or 0)
+    except Exception as e:
+        print(f"Error loading vlib metadata for {library_id}: {e}")
+        return None
+
+
+def clear_vlib_metadata() -> int:
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_metadata", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing vlib metadata: {e}")
+        return 0
+
+
+def save_vlib_user_overlay(user_id: str, library_id: str, data: dict, updated_at: int) -> None:
+    """保存用户叠加层 {条目ID: UserData}。"""
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "INSERT INTO vlib_user_overlay (user_id, library_id, data_json, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, library_id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at",
+            (user_id, library_id, json.dumps(data, ensure_ascii=False), updated_at),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving vlib user overlay for {library_id}/{user_id}: {e}")
+
+
+def load_vlib_user_overlay(user_id: str, library_id: str):
+    """读取用户叠加层,返回 (data, updated_at) 或 None。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT data_json, updated_at FROM vlib_user_overlay WHERE user_id = ? AND library_id = ?",
+            (user_id, library_id),
+        )
+        if not row or not row["data_json"]:
+            return None
+        data = json.loads(row["data_json"])
+        if not isinstance(data, dict):
+            return None
+        return data, int(row["updated_at"] or 0)
+    except Exception as e:
+        print(f"Error loading vlib user overlay for {library_id}/{user_id}: {e}")
+        return None
+
+
+def clear_vlib_user_overlay() -> int:
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_user_overlay", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing vlib user overlay: {e}")
+        return 0
+
+
+def delete_vlib_metadata(library_id: str) -> None:
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "DELETE FROM vlib_metadata WHERE library_id = ?", (library_id,), commit=True
+        )
+    except Exception as e:
+        print(f"Error deleting vlib metadata for {library_id}: {e}")
+
+
+def delete_vlib_user_overlay(library_id: str) -> None:
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "DELETE FROM vlib_user_overlay WHERE library_id = ?", (library_id,), commit=True
+        )
+    except Exception as e:
+        print(f"Error deleting vlib user overlay for {library_id}: {e}")
 
 
 # 在模块加载时执行初始化
