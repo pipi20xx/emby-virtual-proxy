@@ -87,6 +87,9 @@ class AppConfig(BaseModel):
     custom_en_font_path: Optional[str] = Field(default="")
     custom_image_path: Optional[str] = Field(default="") # <-- 【新增】全局自定义图片目录
 
+    # 新增：管理面板登录密码。留空 = 面板无需登录(局域网工具默认)
+    admin_password: Optional[str] = Field(default="")
+
     class Config:
         # 允许从别名填充模型
         populate_by_name = True

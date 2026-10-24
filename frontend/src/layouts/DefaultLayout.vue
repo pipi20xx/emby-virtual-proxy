@@ -23,6 +23,13 @@
         </v-chip>
 
         <v-btn
+          v-if="authStore.authRequired"
+          icon="mdi-logout"
+          variant="text"
+          title="退出登录"
+          @click="signOut"
+        />
+        <v-btn
           :icon="isDark ? 'mdi-weather-night' : 'mdi-weather-sunny'"
           variant="text"
           aria-label="切换主题"
@@ -43,8 +50,8 @@
       </v-list>
 
       <template #append>
-        <div class="pa-4 text-caption text-medium-emphasis">
-          虚拟库 · 筛选 · 布局 · 设置
+        <div class="pa-4 text-caption text-medium-emphasis text-center">
+          v{{ appVersion }}
         </div>
       </template>
     </v-navigation-drawer>
@@ -65,15 +72,21 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { useDisplay } from 'vuetify'
+import { useRouter } from 'vue-router'
 
 import AppSnackbar from '@/components/common/AppSnackbar.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import { useThemeControl } from '@/composables/useTheme'
+import { useAuthStore } from '@/stores/useAuthStore'
 import { useEmbyDataStore } from '@/stores/useEmbyDataStore'
 
 const display = useDisplay()
+const router = useRouter()
 const embyStore = useEmbyDataStore()
+const authStore = useAuthStore()
 const { isDark, toggle } = useThemeControl()
+
+const appVersion = __APP_VERSION__
 
 const drawer = ref(display.mdAndUp.value)
 
@@ -83,4 +96,9 @@ const navItems = [
   { routeName: 'layout', icon: 'mdi-view-dashboard-edit-outline', title: '主页布局' },
   { routeName: 'settings', icon: 'mdi-cog-outline', title: '系统设置' },
 ]
+
+function signOut() {
+  authStore.logout()
+  router.push({ name: 'login' })
+}
 </script>

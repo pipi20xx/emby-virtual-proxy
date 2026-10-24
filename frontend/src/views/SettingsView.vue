@@ -164,6 +164,22 @@
           </v-col>
         </v-row>
 
+        <!-- 访问安全 -->
+        <v-card>
+          <v-card-title class="d-flex align-center ga-2">
+            <v-icon icon="mdi-shield-lock-outline" size="small" /> 访问安全
+          </v-card-title>
+          <v-card-text>
+            <SecretField
+              v-model="draft.admin_password"
+              label="管理面板密码"
+              placeholder="留空 = 无需登录直接使用"
+              hint="设置并保存后,打开管理面板需要输入密码;只影响面板,代理核心(8999)不受影响"
+              persistent-hint
+            />
+          </v-card-text>
+        </v-card>
+
         <!-- 危险区域 -->
         <v-card class="border-error">
           <v-card-title class="d-flex align-center ga-2 text-error">

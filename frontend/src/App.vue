@@ -1,20 +1,35 @@
 <template>
-  <DefaultLayout />
+  <LoginView v-if="isLoginPage" />
+  <DefaultLayout v-else />
 </template>
 
 <script setup lang="ts">
-import { onMounted } from 'vue'
+import { computed, watch } from 'vue'
+import { useRoute } from 'vue-router'
 
 import DefaultLayout from '@/layouts/DefaultLayout.vue'
+import LoginView from '@/views/LoginView.vue'
+import { useAuthStore } from '@/stores/useAuthStore'
 import { useConfigStore } from '@/stores/useConfigStore'
 import { useEmbyDataStore } from '@/stores/useEmbyDataStore'
 
+const route = useRoute()
+const isLoginPage = computed(() => route.name === 'login')
+
+const authStore = useAuthStore()
 const configStore = useConfigStore()
 const embyStore = useEmbyDataStore()
 
-onMounted(async () => {
-  // 配置与 Emby 数据并行加载;Emby 不可达时页面仍可打开
-  await configStore.load()
-  await embyStore.load()
-})
+// 进入主界面时才拉取数据;登录页/未认证时不请求(401 由拦截器带回登录页)
+watch(
+  isLoginPage,
+  async (onLogin) => {
+    if (onLogin) return
+    await authStore.ensureChecked().catch(() => undefined)
+    if (!authStore.canEnter) return
+    await configStore.load()
+    await embyStore.load()
+  },
+  { immediate: true },
+)
 </script>

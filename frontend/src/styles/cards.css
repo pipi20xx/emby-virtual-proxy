@@ -1,7 +1,28 @@
 .v-card {
   border-radius: var(--evp-card-radius);
+  border: 1px solid rgba(var(--v-theme-on-surface), 0.08);
 }
 
 .v-field {
   border-radius: var(--evp-field-radius);
+}
+
+.v-dialog > .v-card {
+  border-radius: var(--evp-dialog-radius);
+}
+
+.v-menu > .v-overlay__content {
+  border-radius: var(--evp-menu-radius);
+}
+
+.v-btn {
+  border-radius: var(--evp-btn-radius);
+}
+
+.v-chip {
+  border-radius: var(--evp-chip-radius);
+}
+
+.v-navigation-drawer .v-list-item {
+  border-radius: var(--evp-list-item-radius);
 }

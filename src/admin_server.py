@@ -17,21 +17,39 @@ import logging
 import sys
 from typing import List, Optional
 
-from fastapi import FastAPI, APIRouter, HTTPException, Response, Query, File, UploadFile
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, Query, File, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import app_paths
 import config_manager
 from models import AppConfig, VirtualLibrary, AdvancedFilter
-from services import cover_service, library_service, rss_service, system_service
+from services import auth_service, cover_service, library_service, rss_service, system_service
 from services.emby_client import fetch_items
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 admin_app = FastAPI(title="Emby Virtual Proxy - Admin API")
-api_router = APIRouter(prefix="/api")
+
+
+async def _auth_guard(request: Request):
+    """面板访问控制:config.admin_password 留空时放行;/api/auth/* 自身放行。
+
+    只作用于 /api/* 路由;静态页面与 /covers 由应用级挂载,不经过此守卫。
+    代理核心(8999)是独立进程,完全不受影响。
+    """
+    if request.url.path.startswith("/api/auth/"):
+        return
+    config = config_manager.load_config()
+    if not auth_service.is_enabled(config):
+        return
+    token = request.headers.get("X-Auth-Token") or ""
+    if not auth_service.verify(token):
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+
+api_router = APIRouter(prefix="/api", dependencies=[Depends(_auth_guard)])
 
 
 class CoverRequest(BaseModel):
@@ -40,6 +58,38 @@ class CoverRequest(BaseModel):
     title_en: Optional[str] = None
     style_name: str
     temp_image_paths: Optional[List[str]] = None
+
+
+class LoginRequest(BaseModel):
+    password: str = ""
+
+
+# --- 登录(守卫自身对 /api/auth/* 放行) ---
+
+@api_router.post("/auth/login", tags=["Auth"])
+async def auth_login(body: LoginRequest):
+    config = config_manager.load_config()
+    if not auth_service.is_enabled(config):
+        return {"required": False, "token": None}
+    token = auth_service.login(config, body.password)
+    if not token:
+        raise HTTPException(status_code=401, detail="密码错误")
+    return {"required": True, "token": token}
+
+
+@api_router.get("/auth/status", tags=["Auth"])
+async def auth_status(request: Request):
+    """前端进入面板前先查此接口决定是否需要登录。"""
+    config = config_manager.load_config()
+    required = auth_service.is_enabled(config)
+    token = request.headers.get("X-Auth-Token") or ""
+    return {"required": required, "authenticated": (not required) or auth_service.verify(token)}
+
+
+@api_router.post("/auth/logout", status_code=204, tags=["Auth"])
+async def auth_logout(request: Request):
+    auth_service.logout(request.headers.get("X-Auth-Token") or "")
+    return Response(status_code=204)
 
 
 # --- 配置 ---

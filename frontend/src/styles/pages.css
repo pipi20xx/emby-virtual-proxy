@@ -7,6 +7,14 @@
   gap: var(--evp-section-gap);
 }
 
+/* 关键修复:v-form 不继承 .evp-page 的 flex gap,
+   表单内的卡片会全部贴死;这里给表单同样的纵向布局 */
+.evp-page form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--evp-section-gap);
+}
+
 .evp-cover {
   aspect-ratio: var(--evp-cover-ratio);
   overflow: hidden;

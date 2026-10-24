@@ -74,6 +74,8 @@ export interface AppConfig {
   custom_zh_font_path: string
   custom_en_font_path: string
   custom_image_path: string
+  /** 管理面板登录密码;空字符串 = 无需登录 */
+  admin_password: string
 }
 
 export const RESOURCE_TYPE_LABELS: Record<ResourceType, string> = {
@@ -159,5 +161,6 @@ export function createDefaultConfig(): AppConfig {
     custom_zh_font_path: '',
     custom_en_font_path: '',
     custom_image_path: '',
+    admin_password: '',
   }
 }

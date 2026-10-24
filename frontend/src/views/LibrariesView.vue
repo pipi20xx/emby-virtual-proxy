@@ -70,7 +70,7 @@
     </v-card>
 
     <!-- 库卡片网格 -->
-    <v-row v-else dense>
+    <v-row v-else>
       <v-col v-for="lib in filteredLibraries" :key="lib.id" cols="12" sm="6" md="4" lg="3">
         <v-card class="d-flex flex-column fill-height">
           <router-link :to="{ name: 'library-edit', params: { id: lib.id } }" class="text-decoration-none">

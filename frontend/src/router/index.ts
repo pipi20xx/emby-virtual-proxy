@@ -1,10 +1,18 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
+import { useAuthStore } from '@/stores/useAuthStore'
+
 // 使用 hash 模式:管理后台由 FastAPI StaticFiles(html=true) 托管,
 // 无需后端增加 SPA 回退路由即可支持任意页面的刷新与直达。
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
+    {
+      path: '/login',
+      name: 'login',
+      component: () => import('@/views/LoginView.vue'),
+      meta: { title: '登录' },
+    },
     { path: '/', redirect: { name: 'libraries' } },
     {
       path: '/libraries',
@@ -49,6 +57,18 @@ const router = createRouter({
 router.afterEach((to) => {
   const title = to.meta.title as string | undefined
   document.title = title ? `${title} · Emby Virtual Proxy` : 'Emby Virtual Proxy'
+})
+
+// 登录守卫:后台设置了管理密码时,未认证的访问一律回到登录页;
+// 密码未设置(admin_password 为空)时 ensureChecked 置 required=false,直接放行。
+router.beforeEach(async (to) => {
+  if (to.name === 'login') return true
+  const auth = useAuthStore()
+  await auth.ensureChecked().catch(() => undefined)
+  if (auth.authRequired && !auth.token) {
+    return { name: 'login', query: { redirect: to.fullPath } }
+  }
+  return true
 })
 
 export default router
