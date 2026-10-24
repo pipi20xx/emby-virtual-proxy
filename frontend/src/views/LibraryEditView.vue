@@ -155,8 +155,9 @@ function onResourceTypeChange(type: ResourceType) {
   draft.value.resource_id = null
 }
 
-function onCoverGenerated(imageTag: string) {
+function onCoverGenerated({ imageTag, coverFormat }: { imageTag: string; coverFormat: string }) {
   draft.value.image_tag = imageTag
+  draft.value.cover_format = coverFormat
   initialSnapshot.value = JSON.stringify(draft.value) // 封面由后端立即持久化,不算未保存修改
 }
 

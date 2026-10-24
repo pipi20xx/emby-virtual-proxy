@@ -28,6 +28,7 @@ class VirtualLibrary(BaseModel):
     resource_id: Optional[str] = None
     # image: Optional[str] = None  <-- 我们不再需要这个字段了，可以删除或注释掉
     image_tag: Optional[str] = None # <-- 【新增】用于存储图片的唯一标签
+    cover_format: Optional[str] = None # <-- 【新增】封面文件格式(jpg/gif/webp/png),用于定位封面文件
     rsshub_url: Optional[str] = None # <-- 【新增】RSSHUB链接
     rss_type: Optional[Literal["douban", "bangumi"]] = None # <-- 【新增】RSS类型
     fallback_tmdb_id: Optional[str] = None # <-- 【新增】RSS库的兜底TMDB ID

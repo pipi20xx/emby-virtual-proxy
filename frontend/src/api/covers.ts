@@ -7,6 +7,8 @@ export interface CoverGeneratePayload {
   title_en: string | null
   style_name: string
   temp_image_paths: string[] | null
+  /** 动图样式的输出格式: gif | webp | png;静态样式传 null */
+  animation_format: string | null
 }
 
 export async function generateCover(payload: CoverGeneratePayload): Promise<CoverGenerateResult> {

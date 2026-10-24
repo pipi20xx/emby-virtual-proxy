@@ -49,6 +49,17 @@
           label="封面样式"
         />
 
+        <v-select
+          v-if="isAnimatedStyle"
+          v-model="animationFormat"
+          :items="ANIMATION_FORMATS"
+          item-title="title"
+          item-value="value"
+          label="动图格式"
+          hint="GIF 兼容性最好,WebP 体积最小,APNG 画质最好"
+          persistent-hint
+        />
+
         <v-text-field
           v-model="library.cover_custom_zh_font_path"
           label="库级中文字体路径"
@@ -118,7 +129,7 @@ import { computed, ref } from 'vue'
 import * as coversApi from '@/api/covers'
 import { useNotification } from '@/composables/useNotification'
 import { useConfigStore } from '@/stores/useConfigStore'
-import { COVER_STYLES, type VirtualLibrary } from '@/types/config'
+import { ANIMATION_FORMATS, COVER_STYLES, type VirtualLibrary } from '@/types/config'
 
 const MAX_MATERIALS = 9
 
@@ -128,7 +139,7 @@ const props = defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'generated', imageTag: string): void
+  (e: 'generated', payload: { imageTag: string; coverFormat: string }): void
 }>()
 
 const configStore = useConfigStore()
@@ -137,8 +148,13 @@ const notify = useNotification()
 const titleZh = ref('')
 const titleEn = ref('')
 const selectedStyle = ref(configStore.config?.default_cover_style || 'style_multi_1')
+const animationFormat = ref('gif')
 const generating = ref(false)
 const uploading = ref(false)
+
+const isAnimatedStyle = computed(
+  () => COVER_STYLES.find((style) => style.value === selectedStyle.value)?.animated === true,
+)
 
 interface UploadedMaterial {
   path: string
@@ -148,12 +164,17 @@ interface UploadedMaterial {
 
 const uploads = ref<UploadedMaterial[]>([])
 const pendingFiles = ref<File[] | null>(null)
+/** 生成成功后优先使用后端返回的预览地址(带真实扩展名) */
+const previewOverride = ref<string | null>(null)
 
-const previewUrl = computed(() =>
-  props.library.id && props.library.image_tag
-    ? `/covers/${props.library.id}.jpg?t=${props.library.image_tag}`
-    : null,
-)
+const previewUrl = computed(() => {
+  if (previewOverride.value) return previewOverride.value
+  if (props.library.id && props.library.image_tag) {
+    const ext = props.library.cover_format || 'jpg'
+    return `/covers/${props.library.id}.${ext}?t=${props.library.image_tag}`
+  }
+  return null
+})
 
 function readPreview(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -202,9 +223,12 @@ async function generate() {
       title_en: titleEn.value.trim() || null,
       style_name: selectedStyle.value,
       temp_image_paths: uploads.value.length ? uploads.value.map((item) => item.path) : null,
+      animation_format: isAnimatedStyle.value ? animationFormat.value : null,
     })
-    // image_tag 变化会驱动预览刷新(时间戳防缓存)
-    emit('generated', result.image_tag)
+    // 后端返回带真实扩展名的预览地址;image_tag/cover_format 变化驱动预览刷新(时间戳防缓存)
+    previewOverride.value = result.image_url
+    const coverFormat = result.image_url.split('?')[0].split('.').pop() || 'jpg'
+    emit('generated', { imageTag: result.image_tag, coverFormat })
     notify.success('封面生成成功')
   } catch (error) {
     notify.error(error instanceof Error ? error.message : '封面生成失败,详见后端日志')

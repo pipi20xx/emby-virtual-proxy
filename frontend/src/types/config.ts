@@ -38,6 +38,8 @@ export interface VirtualLibrary {
   resource_type: ResourceType
   resource_id: string | null
   image_tag: string | null
+  /** 封面文件格式(jpg/gif/webp/png),动图样式生成后为非 jpg */
+  cover_format: string | null
   rsshub_url: string | null
   rss_type: RssType | null
   fallback_tmdb_id: string | null
@@ -97,10 +99,28 @@ export const RESOURCE_PLURAL_KEY: Record<string, keyof Classifications> = {
   person: 'persons',
 }
 
-export const COVER_STYLES = [
+export interface CoverStyleOption {
+  value: string
+  title: string
+  /** 动图样式(GIF/WebP/APNG 输出) */
+  animated?: boolean
+}
+
+export const COVER_STYLES: CoverStyleOption[] = [
   { value: 'style_multi_1', title: '样式一(多图拼接)' },
   { value: 'style_single_1', title: '样式二(单图)' },
   { value: 'style_single_2', title: '样式三(单图)' },
+  { value: 'style_multi_animated', title: '多图九宫格(动态)', animated: true },
+  { value: 'style_6_plus_1', title: '背景轮播(动态)', animated: true },
+  { value: 'style_9_plus_1', title: '背景斜播(动态)', animated: true },
+  { value: 'style_5_horizontal', title: '横向轮播(动态)', animated: true },
+]
+
+/** 动图样式的输出格式选项 */
+export const ANIMATION_FORMATS = [
+  { value: 'gif', title: 'GIF(兼容性最好)' },
+  { value: 'webp', title: 'WebP(体积最小)' },
+  { value: 'png', title: 'APNG(画质最好)' },
 ]
 
 /** 首页可以隐藏的真实库类型 */
@@ -123,6 +143,7 @@ export function createEmptyLibrary(): VirtualLibrary {  return {
     resource_type: 'collection',
     resource_id: null,
     image_tag: null,
+    cover_format: null,
     rsshub_url: null,
     rss_type: null,
     fallback_tmdb_id: null,

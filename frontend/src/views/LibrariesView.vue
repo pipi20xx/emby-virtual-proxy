@@ -76,7 +76,7 @@
           <router-link :to="{ name: 'library-edit', params: { id: lib.id } }" class="text-decoration-none">
             <v-img
               v-if="lib.image_tag"
-              :src="`/covers/${lib.id}.jpg?t=${lib.image_tag}`"
+              :src="`/covers/${lib.id}.${lib.cover_format || 'jpg'}?t=${lib.image_tag}`"
               aspect-ratio="16/9"
               cover
             >

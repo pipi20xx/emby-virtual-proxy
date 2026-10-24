@@ -13,6 +13,8 @@
       "multi"  接收 library_dir=<素材目录>,自行从目录中取多图拼接
       "single" 接收 image_path=<单张主图路径>
     未声明时按本模块的内置注册表兼容三个内置样式。
+  - 动图样式(GIF/WebP/APNG 输出)可在入口函数声明 animation_format 形参,
+    调度器检测到后自动下发取值("gif" | "webp" | "png"),旧样式不受影响。
   新增样式 = 在 cover_generator/ 新增一个文件,无需改动任何现有代码。
 """
 
@@ -20,6 +22,7 @@ import asyncio
 import base64
 import hashlib
 import importlib
+import inspect
 import logging
 import os
 import random
@@ -43,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 MAX_MATERIALS = 9
 SUPPORTED_IMAGE_FORMATS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
+
+# 动图样式输出的合法扩展名(静态样式仍统一落盘为 .jpg)
+ANIMATED_COVER_EXTENSIONS = ("gif", "webp", "png")
 
 # 内置样式的素材模式注册表:兼容未声明 MATERIAL_MODE 的旧样式模块
 _BUILTIN_STYLE_MATERIAL_MODES = {
@@ -175,7 +181,8 @@ async def _prepare_materials(library_id: str, image_gen_dir: Path, config: AppCo
 
 # --- 样式插件调度 ---
 
-def _load_style_function(style_name: str):
+def load_style_function(style_name: str):
+    """加载样式模块及其 create_ 入口函数;无效样式抛 400。"""
     try:
         style_module = importlib.import_module(f"cover_generator.{style_name}")
         create_function = getattr(style_module, f"create_{style_name}")
@@ -194,6 +201,66 @@ def _resolve_material_mode(style_name: str, style_module) -> str:
     if builtin:
         return builtin
     raise HTTPException(status_code=400, detail=f"未知的样式名称: {style_name}")
+
+
+def build_style_kwargs(style_name: str, style_module, title: Tuple[str, Optional[str]],
+                       font_path: Tuple[str, str], image_gen_dir: Path,
+                       animation_format: Optional[str] = None) -> Dict:
+    """按样式声明的素材模式与函数签名组装 create_ 入口参数。
+
+    供 admin 面板与 proxy-core 自动生成两条链路复用。
+    """
+    create_function = getattr(style_module, f"create_{style_name}")
+    material_mode = _resolve_material_mode(style_name, style_module)
+
+    kwargs: Dict = {
+        "title": title,
+        "font_path": font_path,
+    }
+    if material_mode == "single":
+        main_image_path = image_gen_dir / "1.jpg"
+        if not main_image_path.is_file():
+            raise HTTPException(status_code=404, detail="无法找到用于单图模式的主素材图片 (1.jpg)。")
+        kwargs["image_path"] = str(main_image_path)
+    else:
+        kwargs["library_dir"] = str(image_gen_dir)
+
+    # 动图样式声明了 animation_format 形参时才下发,保持旧样式插件兼容
+    if "animation_format" in inspect.signature(create_function).parameters:
+        fmt = (animation_format or "gif").lower()
+        if fmt not in ANIMATED_COVER_EXTENSIONS:
+            fmt = "gif"
+        kwargs["animation_format"] = fmt
+    return kwargs
+
+
+def save_style_output(res_base64: str, output_dir: Path, library_id: str) -> str:
+    """解码样式函数输出并落盘,返回扩展名(不含点)。
+
+    动图输出按原始格式保存(GIF/WebP/APNG);静态图保持 JPEG 重编码。
+    同库旧格式的封面文件会被清理,避免动/静态切换后残留。
+    """
+    image_data = base64.b64decode(res_base64)
+
+    ext = ".jpg"
+    with Image.open(BytesIO(image_data)) as probe:
+        is_animated = getattr(probe, "is_animated", False) and probe.n_frames > 1
+        if is_animated and (probe.format or "").lower() in ANIMATED_COVER_EXTENSIONS:
+            ext = f".{probe.format.lower()}"
+
+    if ext != ".jpg":
+        (output_dir / f"{library_id}{ext}").write_bytes(image_data)
+    else:
+        img = Image.open(BytesIO(image_data))
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        img.save(output_dir / f"{library_id}.jpg", "JPEG", quality=90)
+
+    for old_file in output_dir.glob(f"{library_id}.*"):
+        if old_file.is_file() and old_file.suffix != ext:
+            old_file.unlink()
+
+    return ext.lstrip(".")
 
 
 def _resolve_font_paths(library_id: str, config: AppConfig) -> Tuple[str, str]:
@@ -220,8 +287,9 @@ def _resolve_font_paths(library_id: str, config: AppConfig) -> Tuple[str, str]:
 # --- 主入口 ---
 
 async def generate_cover(library_id: str, title_zh: str, title_en: Optional[str],
-                         style_name: str, temp_image_paths: Optional[List[str]] = None) -> Optional[str]:
-    """生成封面并落盘,返回新的 image_tag。
+                         style_name: str, temp_image_paths: Optional[List[str]] = None,
+                         animation_format: Optional[str] = None) -> Tuple[str, str]:
+    """生成封面并落盘,返回 (新的 image_tag, 封面扩展名)。
 
     HTTPException 原样上抛(携带具体错误);其余异常记录日志后返回 None,
     由调用方决定对外的错误响应。
@@ -239,44 +307,34 @@ async def generate_cover(library_id: str, title_zh: str, title_en: Optional[str]
 
         # 2. 加载样式插件并组装参数
         logger.info(f"素材准备完毕，开始使用样式 '{style_name}' 为 '{title_zh}' ({library_id}) 生成封面...")
-        style_module, create_function = _load_style_function(style_name)
-        material_mode = _resolve_material_mode(style_name, style_module)
-
-        kwargs = {
-            "title": (title_zh, title_en),
-            "font_path": _resolve_font_paths(library_id, config),
-        }
-        if material_mode == "single":
-            main_image_path = image_gen_dir / "1.jpg"
-            if not main_image_path.is_file():
-                raise HTTPException(status_code=404, detail="无法找到用于单图模式的主素材图片 (1.jpg)。")
-            kwargs[MATERIAL_PARAM_BY_MODE[material_mode]] = str(main_image_path)
-        else:
-            kwargs[MATERIAL_PARAM_BY_MODE[material_mode]] = str(image_gen_dir)
+        style_module, _ = load_style_function(style_name)
+        kwargs = build_style_kwargs(
+            style_name, style_module,
+            title=(title_zh, title_en),
+            font_path=_resolve_font_paths(library_id, config),
+            image_gen_dir=image_gen_dir,
+            animation_format=animation_format,
+        )
+        create_function = getattr(style_module, f"create_{style_name}")
 
         res = create_function(**kwargs)
         if not res:
             logger.error(f"样式函数 {style_name} 返回失败。")
             raise HTTPException(status_code=500, detail=f"封面生成函数 {style_name} 内部错误。")
 
-        # 3. 解码、转换并以虚拟库 ID 为名保存
-        image_data = base64.b64decode(res)
-        img = Image.open(BytesIO(image_data))
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-
-        output_path = output_dir / f"{library_id}.jpg"
-        img.save(output_path, "JPEG", quality=90)
+        # 3. 解码、落盘(动图保留原始格式),并以虚拟库 ID 为名保存
+        cover_format = save_style_output(res, output_dir, library_id)
+        output_path = output_dir / f"{library_id}.{cover_format}"
 
         image_tag = hashlib.md5(str(time.time()).encode()).hexdigest()
         logger.info(f"封面成功保存至: {output_path}, ImageTag: {image_tag}")
-        return image_tag
+        return image_tag, cover_format
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"封面生成过程中发生未知错误: {e}", exc_info=True)
-        return None
+        return None, None
     finally:
         if image_gen_dir.exists():
             shutil.rmtree(image_gen_dir)

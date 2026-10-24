@@ -4,18 +4,13 @@ import asyncio
 import logging
 import shutil
 import random
-import base64
-import os
 import hashlib
 import time
 from pathlib import Path
-from io import BytesIO
-from PIL import Image
 import aiohttp
-import importlib
 
 import config_manager
-# from cover_generator import style_multi_1 # 改为动态导入
+from services import cover_service
 
 logger = logging.getLogger(__name__)
 
@@ -115,54 +110,42 @@ async def generate_poster_in_background(library_id: str, user_id: str, api_key: 
             logger.error(f"后台任务：为库 {library_id} 下载封面素材失败。")
             return
 
-        # --- 动态调用所选的默认样式 ---
+        # --- 动态调用所选的默认样式(与 admin 面板共用 cover_service 的调度逻辑) ---
         style_name = config.default_cover_style
         logger.info(f"后台任务：使用默认样式 '{style_name}' 为 '{vlib.name}' 生成封面...")
-
-        try:
-            style_module = importlib.import_module(f"cover_generator.{style_name}")
-            create_function = getattr(style_module, f"create_{style_name}")
-        except (ImportError, AttributeError) as e:
-            logger.error(f"后台任务：无法加载样式 '{style_name}': {e}")
-            return
 
         # 检查自定义字体路径，如果未设置则使用默认值
         zh_font_path = config.custom_zh_font_path or "/app/src/assets/fonts/multi_1_zh.ttf"
         en_font_path = config.custom_en_font_path or "/app/src/assets/fonts/multi_1_en.otf"
-        
-        kwargs = {
-            "title": (vlib.name, ""),
-            "font_path": (zh_font_path, en_font_path)
-        }
 
-        if style_name == 'style_multi_1':
-            kwargs['library_dir'] = str(temp_dir)
-        elif style_name in ['style_single_1', 'style_single_2']:
-            main_image_path = temp_dir / "1.jpg"
-            if not main_image_path.is_file():
-                logger.error(f"后台任务：无法找到用于单图模式的主素材图片 (1.jpg)。")
-                return
-            kwargs['image_path'] = str(main_image_path)
-        else:
-            logger.error(f"后台任务：未知的默认样式名称: {style_name}")
+        try:
+            style_module, _ = cover_service.load_style_function(style_name)
+            kwargs = cover_service.build_style_kwargs(
+                style_name, style_module,
+                title=(vlib.name, ""),
+                font_path=(zh_font_path, en_font_path),
+                image_gen_dir=temp_dir,
+            )
+        except Exception as e:
+            logger.error(f"后台任务：加载样式 '{style_name}' 失败: {e}")
             return
 
+        create_function = getattr(style_module, f"create_{style_name}")
         res_b64 = create_function(**kwargs)
         if not res_b64:
             logger.error(f"后台任务：为库 {library_id} 调用封面生成函数失败。")
             return
 
-        image_data = base64.b64decode(res_b64)
-        img = Image.open(BytesIO(image_data)).convert("RGB")
-        final_path = output_dir / f"{library_id}.jpg"
-        img.save(final_path, "JPEG", quality=90)
-        
+        cover_format = cover_service.save_style_output(res_b64, output_dir, library_id)
+        final_path = output_dir / f"{library_id}.{cover_format}"
+
         new_image_tag = hashlib.md5(str(time.time()).encode()).hexdigest()
         current_config = config_manager.load_config()
         vlib_found_and_updated = False
         for vlib_in_config in current_config.virtual_libraries:
             if vlib_in_config.id == library_id:
                 vlib_in_config.image_tag = new_image_tag
+                vlib_in_config.cover_format = cover_format
                 vlib_found_and_updated = True
                 break
         

@@ -58,6 +58,7 @@ class CoverRequest(BaseModel):
     title_en: Optional[str] = None
     style_name: str
     temp_image_paths: Optional[List[str]] = None
+    animation_format: Optional[str] = None  # 动图样式的输出格式: gif | webp | png
 
 
 class LoginRequest(BaseModel):
@@ -139,12 +140,13 @@ async def upload_temp_image(file: UploadFile = File(...)):
 @api_router.post("/generate-cover", tags=["Cover Generator"])
 async def generate_cover(body: CoverRequest):
     try:
-        image_tag = await cover_service.generate_cover(
+        image_tag, cover_format = await cover_service.generate_cover(
             library_id=body.library_id,
             title_zh=body.title_zh,
             title_en=body.title_en,
             style_name=body.style_name,
             temp_image_paths=body.temp_image_paths,
+            animation_format=body.animation_format,
         )
     except HTTPException:
         raise
@@ -155,14 +157,19 @@ async def generate_cover(body: CoverRequest):
     if not image_tag:
         raise HTTPException(status_code=500, detail="封面生成失败，详见后端日志。")
 
-    # 生成成功后把 image_tag 写回对应虚拟库
+    # 生成成功后把 image_tag / cover_format 写回对应虚拟库
     config = config_manager.load_config()
     vlib = next((lib for lib in config.virtual_libraries if lib.id == body.library_id), None)
     if not vlib:
         raise HTTPException(status_code=404, detail="未找到要更新封面的虚拟库。")
     vlib.image_tag = image_tag
+    vlib.cover_format = cover_format
     config_manager.save_config(config)
-    return {"success": True, "image_tag": image_tag}
+    return {
+        "success": True,
+        "image_tag": image_tag,
+        "image_url": f"/covers/{body.library_id}.{cover_format}?t={image_tag}",
+    }
 
 
 @api_router.post("/covers/clear", status_code=204, tags=["Cover Generator"])

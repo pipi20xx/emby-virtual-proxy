@@ -7,6 +7,9 @@
       "single" 额外接收 image_path=<单张主图路径>
     未声明时由 services/cover_service.py 的内置注册表按旧规则兼容
     (style_multi_1 -> multi, style_single_1/2 -> single)。
+  - 动图样式(输出 GIF/WebP/APNG)可在入口函数声明 animation_format 形参,
+    调度器检测到该形参后自动下发 "gif" | "webp" | "png"。
+    共享动画工具在 _anim_utils.py(移植自 sy1024 同作者项目)。
 
 新增样式无需改动任何现有代码:在本目录放置新文件后,
 管理后台 /api/generate-cover 传对应的 style_name 即可调用。

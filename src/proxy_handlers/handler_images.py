@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 IMAGE_PATH_REGEX = re.compile(r"/Items/([a-f0-9\-]{36}|tmdb[-_]\d+)/Images/(\w+)")
 
 COVERS_DIR = Path("/app/config/images")
+# 封面解析顺序:静态 jpg 优先,其次动图 gif/webp/apng
+COVER_EXTENSIONS = (".jpg", ".gif", ".webp", ".png")
+MEDIA_TYPE_BY_SUFFIX = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".png": "image/png",
+}
 PLACEHOLDER_GENERATING_PATH = Path("/app/src/assets/images_placeholder/generating.jpg")  # 虚拟库 (UUID)
 PLACEHOLDER_RSSHUB_PATH = Path("/app/src/assets/images_placeholder/rsshubpost.jpg")      # RSSHub (tmdb-)
 # 【重要】请确保这个路径下存在一个为缺失剧集准备的占位图文件
@@ -32,10 +41,17 @@ async def handle_virtual_library_image(request: Request, full_path: str) -> Resp
     if image_type != "Primary":
         return None
 
-    # 检查实际的封面文件是否存在，如果存在则直接返回
-    image_file = COVERS_DIR / f"{item_id}.jpg"
-    if image_file.is_file():
-        return FileResponse(str(image_file), media_type="image/jpeg")
+    # 检查实际的封面文件是否存在(兼容动图格式),如果存在则直接返回
+    image_file = next(
+        (
+            COVERS_DIR / f"{item_id}{ext}"
+            for ext in COVER_EXTENSIONS
+            if (COVERS_DIR / f"{item_id}{ext}").is_file()
+        ),
+        None,
+    )
+    if image_file:
+        return FileResponse(str(image_file), media_type=MEDIA_TYPE_BY_SUFFIX.get(image_file.suffix, "image/jpeg"))
 
     # --- 【修复 2】重构占位图返回逻辑 ---
     # 如果封面文件不存在，则根据 item_id 的格式返回对应的占位图

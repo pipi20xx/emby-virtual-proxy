@@ -23,4 +23,6 @@ export interface LibraryBrief {
 export interface CoverGenerateResult {
   success: boolean
   image_tag: string
+  /** 生成封面的可直接预览地址(/covers/{id}.{ext}?t={tag}) */
+  image_url: string
 }
