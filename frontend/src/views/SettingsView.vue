@@ -80,13 +80,6 @@
               </v-card-title>
               <v-card-text class="d-flex flex-column ga-4">
                 <v-switch
-                  v-model="draft.enable_cache"
-                  color="primary"
-                  label="启用内存缓存"
-                  hint="缓存 Emby API 响应约 5 分钟;修改配置后如未生效可重启代理"
-                  persistent-hint
-                />
-                <v-switch
                   v-model="draft.force_merge_by_tmdb_id"
                   color="primary"
                   label="全局强制按 TMDB ID 合并"
@@ -114,19 +107,22 @@
               <v-card-title class="d-flex align-center ga-2">
                 <v-icon icon="mdi-database-refresh" size="small" /> 缓存与访问加速
               </v-card-title>
-              <v-card-text class="d-flex flex-column ga-3">
+              <v-card-text class="d-flex flex-column ga-4">
+                <div class="text-subtitle-2 text-high-emphasis">虚拟库列表缓存(访问加速)</div>
                 <v-switch
                   v-model="draft.enable_vlib_cache"
                   color="primary"
                   label="启用项目缓存"
-                  hide-details
+                  hint="总开关:把每个虚拟库的项目列表解析结果缓存到内存与 SQLite(重启不丢)。关闭后不再保存任何项目数据,封面生成改为按需实时向 Emby 取材,下方所有选项停用。"
+                  persistent-hint
                 />
                 <v-switch
                   v-model="draft.enable_vlib_local_serving"
                   color="primary"
                   label="虚拟库列表本地直出"
                   :disabled="!draft.enable_vlib_cache"
-                  hide-details
+                  hint="浏览虚拟库时由代理直接返回缓存列表(排序、翻页、类型过滤都在本地完成),不再请求 Emby。分两层存储:共享元数据(每库一份、所有用户共用)+ 用户状态层(每账号只存自己的已看/进度),多用户互不串数据。"
+                  persistent-hint
                 />
                 <v-text-field
                   :model-value="String(draft.vlib_cache_refresh_interval ?? 0)"
@@ -136,9 +132,17 @@
                   step="1"
                   suffix="小时"
                   :disabled="!draft.enable_vlib_cache"
-                  hint="定时主动向 Emby 拉取各虚拟库的项目缓存并补齐缺失封面;启用后代理重启时也会先全量预热一轮,0 表示禁用"
+                  hint="每 N 小时后台自动刷新全部虚拟库缓存(重新解析共享元数据 + 刷新各用户状态层),并顺带补齐缺失封面;0 表示禁用。启用后代理重启时也会先全量预热一轮。"
                   persistent-hint
                   @update:model-value="setVlibCacheInterval"
+                />
+                <div class="text-subtitle-2 text-high-emphasis mt-2">Emby 响应缓存(内存)</div>
+                <v-switch
+                  v-model="draft.enable_cache"
+                  color="primary"
+                  label="启用响应缓存(内存)"
+                  hint="总开关:相同的 API 请求在 TTL 内直接返回内存缓存(重启即清空,由预热机制自动回填)。关闭后所有请求实时转发 Emby,下方 TTL 停用。"
+                  persistent-hint
                 />
                 <v-text-field
                   :model-value="String(draft.api_cache_ttl ?? 0)"
@@ -148,12 +152,20 @@
                   step="30"
                   suffix="秒"
                   :disabled="!draft.enable_cache"
-                  hint="相同请求在此时间内直接返回缓存响应,0 表示禁用;保存后即时生效"
+                  hint="内存缓存的有效期:相同请求在此时间内直接返回缓存响应(对首页、媒体库视图等所有 GET 接口生效);0 表示禁用。保存后即时生效,无需重启。"
                   persistent-hint
                   @update:model-value="setApiCacheTtl"
                 />
+
                 <div class="text-caption text-medium-emphasis">
-                  本地直出开启后,浏览虚拟库直接由代理返回解析好的列表(不请求 Emby),数据随预热刷新,过期自动回退实时查询。
+                  <div class="font-weight-medium text-high-emphasis mb-1">工作原理</div>
+                  <div>① 共享元数据:每个虚拟库只向 Emby 解析一份(所有用户共用),这是缓存的大头;</div>
+                  <div>② 用户状态层:每个账号只叠加自己的已看/进度(几十 KB),互不串数据;</div>
+                  <div>③ 没被预热到的用户,首次浏览照常实时查询并自动补建,第二次起秒开;</div>
+                  <div>④ 数据过期后先返回旧数据、后台静默刷新,浏览永不阻塞。</div>
+                  <div class="mt-1">
+                    注意:海报图片、播放控制与已看状态上报始终直连 Emby;列表与详情类请求由以上缓存加速,图片本地化暂未包含。
+                  </div>
                 </div>
               </v-card-text>
             </v-card>
