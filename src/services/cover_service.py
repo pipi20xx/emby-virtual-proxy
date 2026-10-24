@@ -102,33 +102,57 @@ async def _download_materials(selected_items: List[dict], temp_dir: Path, config
         raise HTTPException(status_code=500, detail="所有封面素材下载失败，无法生成海报。")
 
 
+async def _get_cached_vlib_items(proxy_core_url: str, library_id: str) -> Optional[List[dict]]:
+    """从 proxy-core 读取虚拟库项目缓存;未命中返回 None。"""
+    target_url = f"{proxy_core_url.rstrip('/')}/api/internal/get-cached-items/{library_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(target_url, timeout=10) as response:
+                if response.status == 200:
+                    return (await response.json()).get("Items", [])
+                detail = (await response.json()).get("detail")
+                logger.info(f"读取虚拟库 {library_id} 项目缓存未命中 (Status: {response.status}): {detail}")
+                return None
+    except aiohttp.ClientError as e:
+        logger.error(f"连接到内部代理服务时出错: {e}")
+        raise HTTPException(status_code=502, detail=f"无法连接到内部代理服务: {e}")
+
+
+async def _refresh_vlib_items(proxy_core_url: str, library_id: str) -> List[dict]:
+    """调用 proxy-core 的内部端点主动预热虚拟库项目缓存(主动向 Emby 拉取)。"""
+    target_url = f"{proxy_core_url.rstrip('/')}/api/internal/refresh-vlib-items/{library_id}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(target_url, timeout=120) as response:
+                if response.status == 200:
+                    return (await response.json()).get("Items", [])
+                detail = (await response.json(content_type=None)).get("detail", "未知错误")
+                logger.error(f"主动预热虚拟库 {library_id} 项目缓存失败 (Status: {response.status}): {detail}")
+                raise HTTPException(status_code=response.status, detail=f"主动获取虚拟库项目失败: {detail}")
+    except aiohttp.ClientError as e:
+        logger.error(f"连接到内部代理服务时出错: {e}")
+        raise HTTPException(status_code=502, detail=f"无法连接到内部代理服务: {e}")
+
+
 async def _fetch_images_from_vlib(library_id: str, temp_dir: Path, config: AppConfig) -> None:
-    """来源4:从 proxy-core 的内部缓存接口获取项目列表并下载封面素材。"""
-    logger.info(f"开始从内部缓存为虚拟库 {library_id} 获取封面素材...")
+    """来源4:获取虚拟库项目列表并下载封面素材。
+
+    缓存未命中时主动触发 proxy-core 预热(向 Emby 拉取),不再依赖客户端先浏览。
+    """
+    logger.info(f"开始为虚拟库 {library_id} 获取封面素材...")
 
     proxy_core_url = os.getenv("PROXY_CORE_URL")
     if not proxy_core_url:
         raise HTTPException(status_code=500, detail="环境变量 PROXY_CORE_URL 未设置。")
 
-    target_url = f"{proxy_core_url.rstrip('/')}/api/internal/get-cached-items/{library_id}"
-    logger.info(f"正在向内部代理服务 {target_url} 请求缓存数据...")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(target_url, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    items = data.get("Items", [])
-                else:
-                    error_detail = (await response.json()).get("detail")
-                    logger.error(f"从内部代理获取缓存失败 (Status: {response.status}): {error_detail}")
-                    raise HTTPException(status_code=response.status, detail=error_detail)
-    except aiohttp.ClientError as e:
-        logger.error(f"连接到内部代理服务时出错: {e}")
-        raise HTTPException(status_code=502, detail=f"无法连接到内部代理服务: {e}")
+    items = await _get_cached_vlib_items(proxy_core_url, library_id)
+    if items is None:
+        logger.info(f"缓存未命中,主动预热虚拟库 {library_id} 的项目数据...")
+        items = await _refresh_vlib_items(proxy_core_url, library_id)
 
     items_with_images = [item for item in items if item.get("ImageTags", {}).get("Primary")]
     if not items_with_images:
-        raise HTTPException(status_code=404, detail="缓存数据中不包含任何带有主封面的项目。")
+        raise HTTPException(status_code=404, detail="该虚拟库不包含任何带有主封面的项目。")
 
     selected_items = random.sample(items_with_images, min(MAX_MATERIALS, len(items_with_images)))
     await _download_materials(selected_items, temp_dir, config, headers={'X-Emby-Token': config.emby_api_key})
@@ -288,8 +312,8 @@ def _resolve_font_paths(library_id: str, config: AppConfig) -> Tuple[str, str]:
 
 async def generate_cover(library_id: str, title_zh: str, title_en: Optional[str],
                          style_name: str, temp_image_paths: Optional[List[str]] = None,
-                         animation_format: Optional[str] = None) -> Tuple[str, str]:
-    """生成封面并落盘,返回 (新的 image_tag, 封面扩展名)。
+                         animation_format: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    """生成封面并落盘,返回 (新的 image_tag, 封面扩展名);未知异常返回 None。
 
     HTTPException 原样上抛(携带具体错误);其余异常记录日志后返回 None,
     由调用方决定对外的错误响应。

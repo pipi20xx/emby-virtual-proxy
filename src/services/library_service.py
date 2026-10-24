@@ -12,7 +12,7 @@ from typing import List
 from fastapi import HTTPException
 
 import config_manager
-from db_manager import DBManager, RSS_CACHE_DB, RSS_LIBRARY_ITEMS_DB
+from db_manager import DBManager, RSS_CACHE_DB, RSS_LIBRARY_ITEMS_DB, delete_vlib_items_cache
 from models import VirtualLibrary
 from services.emby_client import get_real_libraries
 
@@ -87,6 +87,9 @@ def delete_library(library_id: str) -> None:
     # RSS 库:删除前先清理其源缓存与条目数据
     if lib_to_delete.resource_type == "rsshub":
         _cleanup_rss_library_data(lib_to_delete)
+
+    # 清理虚拟库项目持久化缓存(封面生成素材来源)
+    delete_vlib_items_cache(library_id)
 
     config.virtual_libraries = [lib for lib in config.virtual_libraries if lib.id != library_id]
     if library_id in config.display_order:

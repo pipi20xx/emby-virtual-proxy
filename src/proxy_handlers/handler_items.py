@@ -12,6 +12,7 @@ from . import handler_merger, handler_views
 from ._filter_translator import translate_rules
 from .handler_rss import RssHandler
 from proxy_cache import vlib_items_cache
+import db_manager
 logger = logging.getLogger(__name__)
 
 # --- 后筛选逻辑 (保留用于处理无法翻译的规则) ---
@@ -239,6 +240,7 @@ async def handle_virtual_library_items(
                     final_items_to_return = data.get("Items", [])
                     if final_items_to_return:
                         vlib_items_cache[found_vlib.id] = final_items_to_return
+                        db_manager.save_vlib_items_cache(found_vlib.id, final_items_to_return)
                         logger.info(f"✅ 已为虚拟库 '{found_vlib.name}' 缓存 {len(final_items_to_return)} 个项目以供封面生成使用。")
                     
                     content = json.dumps(data).encode('utf-8')
@@ -307,6 +309,7 @@ async def handle_virtual_library_items(
 
         if paginated_items:
             vlib_items_cache[found_vlib.id] = paginated_items
+            db_manager.save_vlib_items_cache(found_vlib.id, paginated_items)
             logger.info(f"✅ 已为虚拟库 '{found_vlib.name}' 缓存 {len(paginated_items)} 个项目以供封面生成使用。")
 
         content = json.dumps(final_data).encode('utf-8')

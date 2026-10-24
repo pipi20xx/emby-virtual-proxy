@@ -1,11 +1,12 @@
 # src/db_manager.py —— SQLite 缓存库管理
-"""各功能缓存库(RSS/豆瓣/Bangumi/TMDB)的统一访问入口。
+"""各功能缓存库(RSS/豆瓣/Bangumi/TMDB/虚拟库项目)的统一访问入口。
 
 - 每个 db_path 一个 DBManager 单例,内含一把写锁串行化查询。
 - 每线程持有自己的持久连接(threading.local)。
 - 所有库文件都存放在 config 目录下。
 """
 
+import json
 import sqlite3
 import threading
 import datetime
@@ -21,6 +22,7 @@ DOUBAN_CACHE_DB = DB_DIR / "douban_cache.db"
 BANGUMI_CACHE_DB = DB_DIR / "bangumi_cache.db"
 TMDB_CACHE_DB = DB_DIR / "tmdb_cache.db"
 RSS_LIBRARY_ITEMS_DB = DB_DIR / "rss_library_items.db"
+VLIB_ITEMS_DB = DB_DIR / "vlib_items.db"
 
 
 class DBManager:
@@ -187,6 +189,55 @@ def init_databases():
 
     except Exception as e:
         print(f"Error updating rss_library_items table schema: {e}")
+
+    # 初始化虚拟库项目缓存数据库(封面生成素材来源,重启不丢)
+    vlib_items_db = DBManager(VLIB_ITEMS_DB)
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS vlib_items (
+        library_id TEXT PRIMARY KEY,
+        items_json TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """, commit=True)
+
+
+# --- 虚拟库项目缓存(内存 vlib_items_cache 的持久层) ---
+
+def save_vlib_items_cache(library_id: str, items: list) -> None:
+    """以整库为单位保存项目列表 JSON,覆盖旧值。"""
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "INSERT INTO vlib_items (library_id, items_json, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(library_id) DO UPDATE SET items_json = excluded.items_json, updated_at = CURRENT_TIMESTAMP",
+            (library_id, json.dumps(items, ensure_ascii=False)),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving vlib items cache for {library_id}: {e}")
+
+
+def load_vlib_items_cache(library_id: str):
+    """读取持久化的项目列表;未命中返回 None,解析失败视为未命中。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT items_json FROM vlib_items WHERE library_id = ?", (library_id,)
+        )
+        if not row or not row["items_json"]:
+            return None
+        items = json.loads(row["items_json"])
+        return items if isinstance(items, list) else None
+    except Exception as e:
+        print(f"Error loading vlib items cache for {library_id}: {e}")
+        return None
+
+
+def delete_vlib_items_cache(library_id: str) -> None:
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "DELETE FROM vlib_items WHERE library_id = ?", (library_id,), commit=True
+        )
+    except Exception as e:
+        print(f"Error deleting vlib items cache for {library_id}: {e}")
 
 
 # 在模块加载时执行初始化

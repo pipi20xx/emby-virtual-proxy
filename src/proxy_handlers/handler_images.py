@@ -30,6 +30,11 @@ PLACEHOLDER_RSSHUB_PATH = Path("/app/src/assets/images_placeholder/rsshubpost.jp
 PLACEHOLDER_EPISODE_PATH = Path("/app/src/assets/images_placeholder/placeholder.jpg")      # 缺失剧集 (tmdb_)
 
 
+def cover_file_exists(item_id: str) -> bool:
+    """检查某虚拟库的封面文件是否已生成(兼容静态 jpg 与动图 gif/webp/apng)。"""
+    return any((COVERS_DIR / f"{item_id}{ext}").is_file() for ext in COVER_EXTENSIONS)
+
+
 async def handle_virtual_library_image(request: Request, full_path: str) -> Response | None:
     match = IMAGE_PATH_REGEX.search(f"/{full_path}")
     if not match:

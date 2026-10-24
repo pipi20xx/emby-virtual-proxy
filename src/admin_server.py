@@ -14,9 +14,11 @@
 
 import asyncio
 import logging
+import os
 import sys
 from typing import List, Optional
 
+import aiohttp
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, Query, File, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -180,6 +182,7 @@ async def clear_all_covers():
         config = config_manager.load_config()
         for vlib in config.virtual_libraries:
             vlib.image_tag = None
+            vlib.cover_format = None
         config_manager.save_config(config)
         logger.info("所有封面及配置已成功清除。")
         return Response(status_code=204)
@@ -220,14 +223,43 @@ async def save_display_order(ordered_ids: List[str]):
     return Response(status_code=204)
 
 
+def _fire_autogen_cover(library_id: str) -> None:
+    """保存虚拟库后,通知代理核心后台补生成封面(尽力而为,不阻塞请求)。"""
+    proxy_core_url = os.getenv("PROXY_CORE_URL")
+    if not proxy_core_url:
+        logger.info(f"未配置 PROXY_CORE_URL,跳过库 {library_id} 的封面自动生成触发。")
+        return
+
+    async def _task():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_core_url.rstrip('/')}/api/internal/autogen-cover/{library_id}",
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    logger.info(f"封面自动生成触发完成 ({library_id}): Status {resp.status}")
+        except Exception as e:
+            logger.warning(f"触发封面自动生成失败 ({library_id}): {e}")
+
+    asyncio.create_task(_task())
+
+
 @api_router.post("/libraries", response_model=VirtualLibrary, tags=["Libraries"])
 async def create_library(library: VirtualLibrary):
-    return library_service.create_library(library)
+    saved = library_service.create_library(library)
+    # 新建库没有封面,主动触发一次后台生成(素材也由代理核心自行预热)
+    if not saved.image_tag:
+        _fire_autogen_cover(saved.id)
+    return saved
 
 
 @api_router.put("/libraries/{library_id}", response_model=VirtualLibrary, tags=["Libraries"])
 async def update_library(library_id: str, updated_library_data: VirtualLibrary):
-    return library_service.update_library(library_id, updated_library_data)
+    saved = library_service.update_library(library_id, updated_library_data)
+    # 仅对从未生成过封面的库触发,避免每次保存都重绘
+    if not saved.image_tag:
+        _fire_autogen_cover(saved.id)
+    return saved
 
 
 @api_router.delete("/libraries/{library_id}", status_code=204, tags=["Libraries"])

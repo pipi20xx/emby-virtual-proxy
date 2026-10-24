@@ -10,6 +10,7 @@ from pathlib import Path
 
 # 【新增】导入后台生成处理器和任务锁
 from . import handler_autogen
+from .handler_images import cover_file_exists
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,7 @@ def build_vlib_view_stub(vlib, server_id: str, user_id=None, api_key=None) -> di
         "ImageTags": {}
     }
 
-    image_file = COVERS_DIR / f"{vlib.id}.jpg"
-    if image_file.is_file():
+    if cover_file_exists(vlib.id):
         # 图片已存在, 注入真实的 ImageTag
         if vlib.image_tag:
             vlib_data["ImageTags"]["Primary"] = vlib.image_tag

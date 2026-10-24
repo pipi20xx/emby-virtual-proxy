@@ -24,10 +24,7 @@
       </div>
 
       <v-alert class="mt-3" density="compact" type="info" variant="tonal">
-        封面将从虚拟库内容中随机选取素材自动合成。
-      </v-alert>
-      <v-alert class="mt-2" density="compact" type="warning" variant="tonal">
-        生成依赖缓存数据:请先在 Emby 客户端访问一次该虚拟库,再点生成。
+        封面将从虚拟库内容中随机选取素材自动合成;素材缓存缺失时代理会主动向 Emby 拉取,无需先访问该库。
       </v-alert>
     </v-col>
 

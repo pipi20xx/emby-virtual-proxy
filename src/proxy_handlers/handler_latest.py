@@ -14,6 +14,7 @@ from . import handler_merger
 from . import handler_autogen
 from ._filter_translator import translate_rules
 from .handler_items import _apply_post_filter
+from .handler_images import cover_file_exists
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +101,7 @@ async def handle_home_latest_items(
     logger.info(f"HOME_LATEST_HANDLER: Intercepting request for latest items in vlib '{found_vlib.name}'.")
 
     # --- 【【【 核心修正：在这里也添加封面自动生成触发器 】】】 ---
-    image_file = COVERS_DIR / f"{found_vlib.id}.jpg"
-    if not image_file.is_file():
+    if not cover_file_exists(found_vlib.id):
         logger.info(f"首页最新项目：发现虚拟库 '{found_vlib.name}' ({found_vlib.id}) 缺少封面，触发自动生成。")
         if found_vlib.id not in handler_autogen.GENERATION_IN_PROGRESS:
             # 从当前请求中提取必要信息
