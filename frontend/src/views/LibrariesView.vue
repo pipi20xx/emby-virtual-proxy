@@ -131,12 +131,11 @@
           <v-card-actions>
             <v-spacer />
             <v-btn
-              v-if="lib.resource_type === 'rsshub'"
               icon="mdi-rss"
               variant="text"
               color="success"
               :loading="refreshingId === lib.id"
-              title="手动刷新 RSS 源"
+              :title="lib.resource_type === 'rsshub' ? '手动刷新 RSS 源' : '手动刷新项目缓存(预热)'"
               @click="refreshRss(lib)"
             />
             <v-btn
@@ -230,7 +229,11 @@ async function refreshRss(lib: VirtualLibrary) {
   refreshingId.value = lib.id
   try {
     await librariesApi.refreshRssLibrary(lib.id)
-    notify.info(`「${lib.name}」的 RSS 刷新已在后台开始处理`)
+    if (lib.resource_type === 'rsshub') {
+      notify.info(`「${lib.name}」的 RSS 刷新已在后台开始处理`)
+    } else {
+      notify.info(`「${lib.name}」的缓存预热已在后台开始处理`)
+    }
   } catch (error) {
     notify.error(error instanceof Error ? error.message : '刷新失败')
   } finally {

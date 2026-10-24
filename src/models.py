@@ -64,6 +64,12 @@ class AppConfig(BaseModel):
 
     # 新增：缓存开关
     enable_cache: bool = Field(default=True)
+
+    # 新增：API 响应缓存 TTL(秒),0 为禁用响应缓存
+    api_cache_ttl: int = Field(default=300)
+
+    # 新增：虚拟库列表本地直出开关(命中解析缓存时不请求 Emby,加速实际访问;过期后台刷新)
+    enable_vlib_local_serving: bool = Field(default=True)
     
     # 新增：自动生成封面的默认样式
     default_cover_style: str = Field(default='style_multi_1')
@@ -79,6 +85,12 @@ class AppConfig(BaseModel):
 
     # 新增：RSS 定时刷新间隔（小时），0为禁用
     rss_refresh_interval: Optional[int] = Field(default=0)
+
+    # 新增：虚拟库项目缓存总开关(内存 + SQLite 持久化 + 预热/定时刷新);关闭后封面生成按需实时向 Emby 取材
+    enable_vlib_cache: bool = Field(default=True)
+
+    # 新增：虚拟库项目缓存定时预热间隔（小时），0为禁用；启用后启动时也会全量预热一轮
+    vlib_cache_refresh_interval: Optional[int] = Field(default=0)
 
     # 新增：全局强制 TMDB ID 合并
     force_merge_by_tmdb_id: bool = Field(default=False)

@@ -9,10 +9,12 @@ from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, 
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List, Optional
 
 # 【【【 同时修改这一行，从 proxy_cache 导入两个缓存实例 】】】
-from proxy_cache import api_cache, vlib_items_cache
+# api_cache 经 proxy_cache.api_cache 间接访问(TTL 可配置时会重建实例)
+import proxy_cache
+from proxy_cache import vlib_items_cache, serving_items_cache
 import config_manager
 import db_manager
 from proxy_handlers import (
@@ -45,8 +47,10 @@ def get_cache_key(request: Request, full_path: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.aiohttp_session = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()); logger.info("Global AIOHTTP ClientSession created.")
-    # 启动预热:延迟到服务开始监听后,为缺少封面的虚拟库补生成
-    prewarm_task = asyncio.create_task(_prewarm_missing_covers())
+    # 按配置应用 API 响应缓存 TTL
+    proxy_cache.set_api_cache_ttl(config_manager.load_config().api_cache_ttl)
+    # 启动预热:延迟到服务开始监听后(回填缓存/补封面/按配置全量刷新)
+    prewarm_task = asyncio.create_task(_startup_warmup())
     yield
     prewarm_task.cancel()
     await app.state.aiohttp_session.close(); logger.info("Global AIOHTTP ClientSession closed.")
@@ -67,8 +71,12 @@ else:
 async def get_cached_items_for_admin(library_id: str):
     """
     一个内部API，专门用于给admin服务提供已缓存的虚拟库项目列表。
-    优先读内存,未命中回退 SQLite 持久层(重启不丢)。
+    优先读内存,未命中回退 SQLite 持久层(重启不丢);缓存功能关闭时直接返回未命中。
     """
+    config = config_manager.load_config()
+    if not config.enable_vlib_cache:
+        raise HTTPException(status_code=404, detail="虚拟库缓存功能已禁用,封面素材可改用上传图片或自定义图片目录。")
+
     cached_items = vlib_items_cache.get(library_id)
     if not cached_items:
         cached_items = db_manager.load_vlib_items_cache(library_id)
@@ -86,8 +94,8 @@ async def get_cached_items_for_admin(library_id: str):
     return JSONResponse(content={"Items": cached_items})
 
 
-async def _resolve_default_user_id(config) -> str | None:
-    """从 Emby 解析一个可用用户(取第一个),供内部请求模拟客户端身份。"""
+async def _list_emby_users(config) -> List[str]:
+    """从 Emby 获取全部用户 ID(封顶 10 个,家庭场景足够)。"""
     try:
         async with proxy_app.state.aiohttp_session.get(
             f"{config.emby_url.rstrip('/')}/emby/Users",
@@ -96,11 +104,17 @@ async def _resolve_default_user_id(config) -> str | None:
         ) as resp:
             if resp.status == 200:
                 users = await resp.json(content_type=None)
-                if isinstance(users, list) and users:
-                    return users[0].get("Id")
+                if isinstance(users, list):
+                    return [u.get("Id") for u in users if u.get("Id")][:10]
     except Exception as e:
         logger.warning(f"解析 Emby 用户列表失败: {e}")
-    return None
+    return []
+
+
+async def _resolve_default_user_id(config) -> Optional[str]:
+    """从 Emby 解析一个可用用户(取第一个),供内部请求模拟客户端身份。"""
+    users = await _list_emby_users(config)
+    return users[0] if users else None
 
 
 async def _fetch_vlib_items_via_self(config, user_id: str, library_id: str) -> list:
@@ -140,13 +154,11 @@ async def _fetch_vlib_items_via_self(config, user_id: str, library_id: str) -> l
     return []
 
 
-@proxy_app.post("/api/internal/refresh-vlib-items/{library_id}")
-async def refresh_vlib_items(library_id: str):
-    """主动预热虚拟库项目缓存(内存 + SQLite),不依赖客户端访问。
+async def _refresh_vlib_items_internal(config, library_id: str) -> list:
+    """主动向 Emby 拉取虚拟库项目并双写缓存(内存 + SQLite);失败抛 HTTPException。
 
-    admin 面板封面生成在缓存 miss 时调用;RSS 库同样适用(走 RssHandler)。
+    供内部端点与启动预热复用;RSS 库同样适用(经 RssHandler 读取其持久数据)。
     """
-    config = config_manager.load_config()
     vlib = next((v for v in config.virtual_libraries if v.id == library_id), None)
     if not vlib:
         raise HTTPException(status_code=404, detail="虚拟库不存在")
@@ -155,13 +167,68 @@ async def refresh_vlib_items(library_id: str):
     if not user_id:
         raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url / emby_api_key 配置")
 
+    internal_headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
+    items: List[dict] = []
+
+    if vlib.resource_type != "rsshub" and config.enable_vlib_local_serving:
+        # 规则库:全量解析一次,同一份结果同时喂直出缓存(按用户)与封面素材缓存
+        all_users = await _list_emby_users(config)
+        if user_id not in all_users:
+            all_users.insert(0, user_id)
+        for uid in all_users:
+            try:
+                user_items = await handler_items.resolve_full_vlib_items(
+                    config, vlib, uid, proxy_app.state.aiohttp_session,
+                    config.emby_url.rstrip('/'), internal_headers,
+                )
+                if not user_items:
+                    logger.warning(f"直出缓存预热:库 '{vlib.name}' 用户 {uid} 解析结果为空。")
+                    continue
+                if config.enable_vlib_cache:
+                    handler_items.store_serving_cache(vlib, uid, user_items)
+                    if uid == user_id:
+                        items = user_items
+                    logger.info(f"直出缓存预热:库 '{vlib.name}' 用户 {uid} 已解析 {len(user_items)} 个项目。")
+            except Exception as e:
+                logger.warning(f"直出缓存预热失败 ('{vlib.name}' 用户 {uid}): {e}")
+
+        if not items:
+            # 逐用户解析都失败或未启用缓存时,保底用默认用户的结果
+            items = await handler_items.resolve_full_vlib_items(
+                config, vlib, user_id, proxy_app.state.aiohttp_session,
+                config.emby_url.rstrip('/'), internal_headers,
+            )
+        if not items:
+            raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则")
+        if config.enable_vlib_cache:
+            # 封面素材缓存沿用全量结果前 100 项,省一次独立查询
+            cover_items = items[:100]
+            vlib_items_cache[library_id] = cover_items
+            db_manager.save_vlib_items_cache(library_id, cover_items)
+        logger.info(f"主动预热完成:库 '{vlib.name}' ({library_id}) 解析 {len(items)} 个项目。")
+        return items
+
+    # RSS 库(或直出关闭):沿用内部自调用拉取,仅维护封面素材缓存
     items = await _fetch_vlib_items_via_self(config, user_id, library_id)
     if not items:
         raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则或 RSS 数据")
 
-    vlib_items_cache[library_id] = items
-    db_manager.save_vlib_items_cache(library_id, items)
-    logger.info(f"主动预热完成:库 '{vlib.name}' ({library_id}) 已缓存 {len(items)} 个项目。")
+    # 缓存功能关闭时只返回结果供封面生成按需取材,不落任何缓存
+    if config.enable_vlib_cache:
+        vlib_items_cache[library_id] = items
+        db_manager.save_vlib_items_cache(library_id, items)
+        logger.info(f"主动预热完成:库 '{vlib.name}' ({library_id}) 已缓存 {len(items)} 个项目。")
+    else:
+        logger.info(f"缓存功能已禁用:库 '{vlib.name}' ({library_id}) 按需获取 {len(items)} 个项目(未缓存)。")
+
+    return items
+
+
+@proxy_app.post("/api/internal/refresh-vlib-items/{library_id}")
+async def refresh_vlib_items(library_id: str):
+    """主动预热虚拟库项目缓存(内存 + SQLite),不依赖客户端访问。"""
+    config = config_manager.load_config()
+    items = await _refresh_vlib_items_internal(config, library_id)
     return JSONResponse(content={"Items": items, "TotalRecordCount": len(items)})
 
 
@@ -188,14 +255,48 @@ async def autogen_cover_for_library(library_id: str):
     return await _trigger_autogen_cover(library_id)
 
 
-async def _prewarm_missing_covers():
-    """启动预热:等待本服务开始监听后,为缺少封面文件的虚拟库逐个补生成。"""
+@proxy_app.post("/api/internal/clear-vlib-cache")
+async def clear_vlib_cache():
+    """清空代理核心内存中的虚拟库项目缓存(admin 侧同时清 SQLite 持久层)。"""
+    vlib_items_cache.clear()
+    serving_items_cache.clear()
+    logger.info("已清空内存中的虚拟库项目缓存与直出解析缓存。")
+    return {"success": True}
+
+
+@proxy_app.post("/api/internal/apply-cache-ttl/{ttl_seconds:int}")
+async def apply_cache_ttl(ttl_seconds: int):
+    """按配置重建 API 响应缓存(保存设置时由 admin 调用,即时生效)。"""
+    proxy_cache.set_api_cache_ttl(ttl_seconds)
+    logger.info(f"API 响应缓存 TTL 已应用: {ttl_seconds}s")
+    return {"success": True}
+
+
+async def _startup_warmup():
+    """启动预热,三段式:
+
+    1. SQLite -> 内存回填(零 Emby 开销,重启后缓存即刻可用);
+    2. 为缺少封面文件的虚拟库补触发自动生成;
+    3. 启用 vlib_cache_refresh_interval 时,先全量刷新一轮项目缓存。
+    """
     await asyncio.sleep(10)
     try:
         config = config_manager.load_config()
     except Exception as e:
         logger.warning(f"启动预热:读取配置失败,跳过: {e}")
         return
+
+    # 1. 持久缓存回填内存(缓存功能关闭时跳过)
+    if config.enable_vlib_cache:
+        for vlib in config.virtual_libraries:
+            if vlib_items_cache.get(vlib.id):
+                continue
+            persisted = db_manager.load_vlib_items_cache(vlib.id)
+            if persisted:
+                vlib_items_cache[vlib.id] = persisted
+                logger.info(f"启动预热:已从 SQLite 恢复库 '{vlib.name}' 的 {len(persisted)} 条项目缓存。")
+
+    # 2. 缺封面的库补生成
     for vlib in config.virtual_libraries:
         try:
             if handler_images.cover_file_exists(vlib.id):
@@ -204,6 +305,18 @@ async def _prewarm_missing_covers():
             await _trigger_autogen_cover(vlib.id)
         except Exception as e:
             logger.warning(f"启动预热:为库 {vlib.id} 触发生成失败: {e}")
+
+    # 3. 启用定时预热时,启动先全量刷新一轮(缓存功能关闭时跳过)
+    if config.enable_vlib_cache and config.vlib_cache_refresh_interval and config.vlib_cache_refresh_interval > 0:
+        logger.info("启动预热:开始全量刷新虚拟库项目缓存...")
+        for vlib in config.virtual_libraries:
+            try:
+                items = await _refresh_vlib_items_internal(config, vlib.id)
+                logger.info(f"启动预热:库 '{vlib.name}' 已刷新 {len(items)} 个项目。")
+            except HTTPException as e:
+                logger.warning(f"启动预热:刷新库 '{vlib.name}' 失败: {e.detail}")
+            except Exception as e:
+                logger.warning(f"启动预热:刷新库 '{vlib.id}' 出错: {e}")
 # --- 【【【 核心修复：重写 WebSocket 代理 】】】 ---
 @proxy_app.websocket("/{full_path:path}")
 async def websocket_proxy(client_ws: WebSocket, full_path: str):
@@ -258,10 +371,10 @@ async def reverse_proxy(request: Request, full_path: str):
     real_emby_url = config.emby_url.rstrip('/')
     
     cache_key = None
-    if config.enable_cache:
+    if config.enable_cache and not proxy_cache.api_cache_disabled:
         cache_key = get_cache_key(request, full_path)
-        if cache_key and cache_key in api_cache:
-            cached_response_data = api_cache.get(cache_key)
+        if cache_key and cache_key in proxy_cache.api_cache:
+            cached_response_data = proxy_cache.api_cache.get(cache_key)
             if cached_response_data:
                 content, status, headers = cached_response_data
                 logger.info(f"✅ Cache HIT for key: {cache_key}")
@@ -285,7 +398,7 @@ async def reverse_proxy(request: Request, full_path: str):
     if not response: response = await handler_views.handle_view_injection(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_default.forward_request(request, full_path, request.method, real_emby_url, session)
 
-    if config.enable_cache and cache_key and response and response.status_code == 200 and not isinstance(response, StreamingResponse):
+    if config.enable_cache and not proxy_cache.api_cache_disabled and cache_key and response and response.status_code == 200 and not isinstance(response, StreamingResponse):
         content_type = response.headers.get("Content-Type", "")
         if "application/json" in content_type:
             # For aiohttp responses, we need to read the body before caching
@@ -295,7 +408,7 @@ async def reverse_proxy(request: Request, full_path: str):
                 response_body = await response.body()
 
             response_to_cache: Tuple[bytes, int, Dict] = (response_body, response.status_code, dict(response.headers))
-            api_cache[cache_key] = response_to_cache
+            proxy_cache.api_cache[cache_key] = response_to_cache
             logger.info(f"📝 Cache SET for key: {cache_key}")
             
             # Since body is already read, return a new Response object

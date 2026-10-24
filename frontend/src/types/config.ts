@@ -67,11 +67,19 @@ export interface AppConfig {
   library: VirtualLibrary[]
   advanced_filters: AdvancedFilter[]
   enable_cache: boolean
+  /** 虚拟库项目缓存总开关(内存 + SQLite + 预热/定时);关闭后封面生成按需实时向 Emby 取材 */
+  enable_vlib_cache: boolean
+  /** 虚拟库列表本地直出:命中解析缓存时不请求 Emby,加速实际访问 */
+  enable_vlib_local_serving: boolean
+  /** API 响应缓存 TTL(秒),0 = 禁用 */
+  api_cache_ttl: number
   default_cover_style: string
   show_missing_episodes: boolean
   tmdb_api_key: string
   tmdb_proxy: string
   rss_refresh_interval: number | null
+  /** 虚拟库项目缓存定时预热间隔(小时),0 = 禁用 */
+  vlib_cache_refresh_interval: number | null
   force_merge_by_tmdb_id: boolean
   custom_zh_font_path: string
   custom_en_font_path: string
@@ -173,11 +181,15 @@ export function createDefaultConfig(): AppConfig {
     library: [],
     advanced_filters: [],
     enable_cache: true,
+    enable_vlib_cache: true,
+    enable_vlib_local_serving: true,
+    api_cache_ttl: 300,
     default_cover_style: 'style_multi_1',
     show_missing_episodes: false,
     tmdb_api_key: '',
     tmdb_proxy: '',
     rss_refresh_interval: 0,
+    vlib_cache_refresh_interval: 0,
     force_merge_by_tmdb_id: false,
     custom_zh_font_path: '',
     custom_en_font_path: '',

@@ -200,6 +200,17 @@ def init_databases():
     )
     """, commit=True)
 
+    # 初始化虚拟库完整解析列表数据库(本地直出/访问加速,按 用户+库 维度)
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS vlib_serving_items (
+        user_id TEXT,
+        library_id TEXT,
+        items_json TEXT,
+        updated_at INTEGER,
+        PRIMARY KEY (user_id, library_id)
+    )
+    """, commit=True)
+
 
 # --- 虚拟库项目缓存(内存 vlib_items_cache 的持久层) ---
 
@@ -238,6 +249,57 @@ def delete_vlib_items_cache(library_id: str) -> None:
         )
     except Exception as e:
         print(f"Error deleting vlib items cache for {library_id}: {e}")
+
+
+def clear_vlib_items_cache() -> int:
+    """清空全部虚拟库项目持久化缓存,返回删除的库数量。"""
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_items", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing vlib items cache: {e}")
+        return 0
+
+
+def save_vlib_serving_items(user_id: str, library_id: str, items: list, updated_at: int) -> None:
+    """保存虚拟库完整解析列表(本地直出),按 用户+库 覆盖。"""
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "INSERT INTO vlib_serving_items (user_id, library_id, items_json, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, library_id) DO UPDATE SET items_json = excluded.items_json, updated_at = excluded.updated_at",
+            (user_id, library_id, json.dumps(items, ensure_ascii=False), updated_at),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving vlib serving items for {library_id}/{user_id}: {e}")
+
+
+def load_vlib_serving_items(user_id: str, library_id: str):
+    """读取持久化的完整解析列表,返回 (items, updated_at) 或 None。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT items_json, updated_at FROM vlib_serving_items WHERE user_id = ? AND library_id = ?",
+            (user_id, library_id),
+        )
+        if not row or not row["items_json"]:
+            return None
+        items = json.loads(row["items_json"])
+        if not isinstance(items, list):
+            return None
+        return items, int(row["updated_at"] or 0)
+    except Exception as e:
+        print(f"Error loading vlib serving items for {library_id}/{user_id}: {e}")
+        return None
+
+
+def clear_vlib_serving_cache() -> int:
+    """清空全部虚拟库完整解析列表,返回删除的行数。"""
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_serving_items", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing vlib serving cache: {e}")
+        return 0
 
 
 # 在模块加载时执行初始化

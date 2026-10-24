@@ -26,7 +26,7 @@ from pydantic import BaseModel
 import app_paths
 import config_manager
 from models import AppConfig, VirtualLibrary, AdvancedFilter
-from services import auth_service, cover_service, library_service, rss_service, system_service
+from services import auth_service, cover_service, library_service, rss_service, system_service, vlib_cache_service
 from services.emby_client import fetch_items
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -105,9 +105,27 @@ async def get_config():
 @api_router.post("/config", response_model=AppConfig, response_model_by_alias=True, tags=["Configuration"])
 async def update_config(config: AppConfig):
     config_manager.save_config(config)
-    # 配置变化可能影响 RSS 定时刷新间隔,重建定时任务
+    # 配置变化可能影响各定时刷新间隔,重建定时任务
     rss_service.reschedule_refresh_job(config)
+    vlib_cache_service.reschedule_refresh_job(config)
+    # 响应缓存 TTL 变化需即时应用到代理核心
+    await _apply_api_cache_ttl(config)
     return config
+
+
+async def _apply_api_cache_ttl(config: AppConfig) -> None:
+    proxy_core_url = os.getenv("PROXY_CORE_URL")
+    if not proxy_core_url:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{proxy_core_url.rstrip('/')}/api/internal/apply-cache-ttl/{int(config.api_cache_ttl)}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ):
+                pass
+    except Exception as e:
+        logger.warning(f"应用响应缓存 TTL 失败: {e}")
 
 
 # --- 高级筛选器(存储于 config.json;规则翻译见 advanced_filters/) ---
@@ -191,23 +209,35 @@ async def clear_all_covers():
         raise HTTPException(status_code=500, detail=f"清空封面时发生内部错误: {e}")
 
 
+@api_router.post("/vlib-cache/clear", tags=["Libraries"])
+async def clear_vlib_cache():
+    """清空虚拟库项目缓存与直出解析缓存(SQLite 持久层 + 代理核心内存)"""
+    try:
+        counts = await vlib_cache_service.clear_all_caches()
+        return {"success": True, **counts}
+    except Exception as e:
+        logger.error(f"清空虚拟库缓存时出错: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"清空虚拟库缓存时发生内部错误: {e}")
+
+
 # --- RSS 虚拟库刷新 ---
 
 @api_router.post("/libraries/{library_id}/refresh", status_code=202, tags=["Libraries"])
-async def refresh_rss_library(library_id: str):
-    """手动触发 RSS 虚拟库的刷新"""
+async def refresh_library_cache(library_id: str):
+    """手动触发虚拟库刷新:RSS 库刷新源数据,其余库预热项目缓存(顺带补封面)"""
     config = config_manager.load_config()
     vlib = next((lib for lib in config.virtual_libraries if lib.id == library_id), None)
 
     if not vlib:
         raise HTTPException(status_code=404, detail="Virtual library not found")
-    if vlib.resource_type != "rsshub":
-        raise HTTPException(status_code=400, detail="This library is not an RSSHUB library")
 
-    # 在后台任务中运行刷新,避免阻塞 API
-    asyncio.create_task(rss_service.refresh_library(vlib))
+    if vlib.resource_type == "rsshub":
+        # 在后台任务中运行刷新,避免阻塞 API
+        asyncio.create_task(rss_service.refresh_library(vlib))
+        return {"message": "RSS library refresh process has been started."}
 
-    return {"message": "RSS library refresh process has been started."}
+    asyncio.create_task(vlib_cache_service.refresh_vlib_cache(library_id))
+    return {"message": "Vlib cache refresh process has been started."}
 
 
 # --- 虚拟库 CRUD / 显示顺序 ---
@@ -348,8 +378,11 @@ admin_app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="st
 async def startup_event():
     rss_service.start_scheduler()
     rss_service.reschedule_refresh_job(config_manager.load_config())
+    vlib_cache_service.start_scheduler()
+    vlib_cache_service.reschedule_refresh_job(config_manager.load_config())
 
 
 @admin_app.on_event("shutdown")
 async def shutdown_event():
     rss_service.shutdown_scheduler()
+    vlib_cache_service.shutdown_scheduler()

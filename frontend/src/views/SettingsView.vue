@@ -108,7 +108,58 @@
         </v-row>
 
         <v-row>
-          <v-col cols="12" md="6">
+          <v-col cols="12" md="4">
+            <!-- 缓存与访问加速 -->
+            <v-card class="fill-height">
+              <v-card-title class="d-flex align-center ga-2">
+                <v-icon icon="mdi-database-refresh" size="small" /> 缓存与访问加速
+              </v-card-title>
+              <v-card-text class="d-flex flex-column ga-3">
+                <v-switch
+                  v-model="draft.enable_vlib_cache"
+                  color="primary"
+                  label="启用项目缓存"
+                  hide-details
+                />
+                <v-switch
+                  v-model="draft.enable_vlib_local_serving"
+                  color="primary"
+                  label="虚拟库列表本地直出"
+                  :disabled="!draft.enable_vlib_cache"
+                  hide-details
+                />
+                <v-text-field
+                  :model-value="String(draft.vlib_cache_refresh_interval ?? 0)"
+                  label="预热间隔(小时)"
+                  type="number"
+                  min="0"
+                  step="1"
+                  suffix="小时"
+                  :disabled="!draft.enable_vlib_cache"
+                  hint="定时主动向 Emby 拉取各虚拟库的项目缓存并补齐缺失封面;启用后代理重启时也会先全量预热一轮,0 表示禁用"
+                  persistent-hint
+                  @update:model-value="setVlibCacheInterval"
+                />
+                <v-text-field
+                  :model-value="String(draft.api_cache_ttl ?? 0)"
+                  label="响应缓存 TTL(秒)"
+                  type="number"
+                  min="0"
+                  step="30"
+                  suffix="秒"
+                  :disabled="!draft.enable_cache"
+                  hint="相同请求在此时间内直接返回缓存响应,0 表示禁用;保存后即时生效"
+                  persistent-hint
+                  @update:model-value="setApiCacheTtl"
+                />
+                <div class="text-caption text-medium-emphasis">
+                  本地直出开启后,浏览虚拟库直接由代理返回解析好的列表(不请求 Emby),数据随预热刷新,过期自动回退实时查询。
+                </div>
+              </v-card-text>
+            </v-card>
+          </v-col>
+
+          <v-col cols="12" md="4">
             <!-- RSS -->
             <v-card class="fill-height">
               <v-card-title class="d-flex align-center ga-2">
@@ -130,7 +181,7 @@
             </v-card>
           </v-col>
 
-          <v-col cols="12" md="6">
+          <v-col cols="12" md="4">
             <!-- 封面默认 -->
             <v-card class="fill-height">
               <v-card-title class="d-flex align-center ga-2">
@@ -195,6 +246,14 @@
               清空所有本地封面
             </v-btn>
             <v-btn
+              color="error"
+              prepend-icon="mdi-database-remove-outline"
+              :loading="clearingVlibCache"
+              @click="clearVlibCache"
+            >
+              清空虚拟库项目缓存
+            </v-btn>
+            <v-btn
               color="warning"
               prepend-icon="mdi-restart"
               :loading="restarting"
@@ -227,6 +286,7 @@ import { computed, onMounted, ref } from 'vue'
 import type { VForm } from 'vuetify/components'
 
 import * as coversApi from '@/api/covers'
+import * as librariesApi from '@/api/libraries'
 import * as systemApi from '@/api/emby'
 import { useConfirm } from '@/composables/useConfirm'
 import { useNotification } from '@/composables/useNotification'
@@ -246,6 +306,7 @@ const draft = ref<AppConfig>(createDefaultConfig())
 const ready = ref(false)
 const initialSnapshot = ref('')
 const clearingCovers = ref(false)
+const clearingVlibCache = ref(false)
 const restarting = ref(false)
 
 const dirty = computed(() => Boolean(draft.value) && JSON.stringify(draft.value) !== initialSnapshot.value)
@@ -274,6 +335,18 @@ function setRefreshInterval(value: unknown) {
   if (!draft.value) return
   const parsed = Math.max(0, Math.floor(Number(value) || 0))
   draft.value.rss_refresh_interval = parsed
+}
+
+function setVlibCacheInterval(value: unknown) {
+  if (!draft.value) return
+  const parsed = Math.max(0, Math.floor(Number(value) || 0))
+  draft.value.vlib_cache_refresh_interval = parsed
+}
+
+function setApiCacheTtl(value: unknown) {
+  if (!draft.value) return
+  const parsed = Math.max(0, Math.floor(Number(value) || 0))
+  draft.value.api_cache_ttl = parsed
 }
 
 async function saveAll() {
@@ -311,6 +384,27 @@ async function clearCovers() {
     notify.error(error instanceof Error ? error.message : '清空封面失败')
   } finally {
     clearingCovers.value = false
+  }
+}
+
+async function clearVlibCache() {
+  const yes = await confirm({
+    title: '清空虚拟库项目缓存',
+    message: '将删除 SQLite 中持久化的项目列表,并清空代理核心内存缓存。\n封面不受影响,缓存会在下次浏览或预热时重建。确定继续吗?',
+    confirmText: '清空',
+    cancelText: '再想想',
+    color: 'error',
+    icon: 'mdi-database-remove-outline',
+  })
+  if (!yes) return
+  clearingVlibCache.value = true
+  try {
+    const counts = await librariesApi.clearVlibCache()
+    notify.success(`虚拟库缓存已清空(项目缓存 ${counts.vlib_items} 库 / 解析列表 ${counts.serving_rows} 行)`)
+  } catch (error) {
+    notify.error(error instanceof Error ? error.message : '清空缓存失败')
+  } finally {
+    clearingVlibCache.value = false
   }
 }
 
