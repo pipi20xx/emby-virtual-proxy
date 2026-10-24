@@ -6,7 +6,7 @@ import logging
 import re
 from fastapi import Request, Response
 from aiohttp import ClientSession
-from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib # <-- 导入新函数
+from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +37,7 @@ async def handle_seasons_merge(request: Request, full_path: str, session: Client
     # --- 资格检查结束 ---
 
     try:
-        item_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{representative_id}"
-        item_params = {'Fields': 'ProviderIds', **auth_token_param}
-        async with session.get(item_url, params=item_params, headers=headers) as resp:
-            tmdb_id = (await resp.json()).get("ProviderIds", {}).get("Tmdb")
+        tmdb_id = await resolve_tmdb_id_for_item(session, real_emby_url, user_id, representative_id, headers, auth_token_param)
     except Exception as e:
         logger.error(f"SEASONS_HANDLER: 获取TMDB ID失败: {e}"); return None
 

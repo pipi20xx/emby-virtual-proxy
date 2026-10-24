@@ -108,6 +108,7 @@ async def update_config(config: AppConfig):
     # 配置变化可能影响各定时刷新间隔,重建定时任务
     rss_service.reschedule_refresh_job(config)
     vlib_cache_service.reschedule_refresh_job(config)
+    vlib_cache_service.reschedule_tmdb_index_job(config)
     # 响应缓存 TTL 变化需即时应用到代理核心
     await _apply_api_cache_ttl(config)
     return config
@@ -378,8 +379,10 @@ admin_app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="st
 async def startup_event():
     rss_service.start_scheduler()
     rss_service.reschedule_refresh_job(config_manager.load_config())
+    config = config_manager.load_config()
     vlib_cache_service.start_scheduler()
-    vlib_cache_service.reschedule_refresh_job(config_manager.load_config())
+    vlib_cache_service.reschedule_refresh_job(config)
+    vlib_cache_service.reschedule_tmdb_index_job(config)
 
 
 @admin_app.on_event("shutdown")

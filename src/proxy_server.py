@@ -17,6 +17,7 @@ import proxy_cache
 from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
 import config_manager
 import db_manager
+from services import tmdb_index_service
 from proxy_handlers import (
     handler_system,
     handler_views,
@@ -271,6 +272,17 @@ async def apply_cache_ttl(ttl_seconds: int):
     return {"success": True}
 
 
+@proxy_app.post("/api/internal/rebuild-tmdb-index")
+async def rebuild_tmdb_index():
+    """按配置重建 TMDB 索引(定时任务/预热调用;内部自判开关与新鲜度,仍新鲜则跳过)。"""
+    config = config_manager.load_config()
+    result = await tmdb_index_service.rebuild_if_stale(
+        proxy_app.state.aiohttp_session, config.emby_url.rstrip('/'),
+        {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""},
+    )
+    return {"success": True, **result}
+
+
 async def _startup_warmup():
     """启动预热,三段式:
 
@@ -324,6 +336,21 @@ async def _startup_warmup():
                 logger.warning(f"启动预热:刷新库 '{vlib.name}' 失败: {e.detail}")
             except Exception as e:
                 logger.warning(f"启动预热:刷新库 '{vlib.id}' 出错: {e}")
+
+    # 4. TMDB 索引:按配置判定(为空/超重建间隔时重建;开关关闭则跳过)
+    try:
+        result = await tmdb_index_service.rebuild_if_stale(
+            proxy_app.state.aiohttp_session, config.emby_url.rstrip('/'),
+            {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""},
+        )
+        if result.get("rebuilt"):
+            logger.info(f"启动预热:TMDB 索引已重建,共 {result['count']} 条。")
+        elif result.get("reason") == "disabled":
+            logger.info("启动预热:TMDB 索引功能已禁用,跳过。")
+        else:
+            logger.info(f"启动预热:TMDB 索引仍然新鲜({result['count']} 条),跳过重建。")
+    except Exception as e:
+        logger.warning(f"启动预热:TMDB 索引重建失败: {e}")
 # --- 【【【 核心修复：重写 WebSocket 代理 】】】 ---
 @proxy_app.websocket("/{full_path:path}")
 async def websocket_proxy(client_ws: WebSocket, full_path: str):

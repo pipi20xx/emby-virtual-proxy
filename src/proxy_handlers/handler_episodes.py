@@ -6,7 +6,7 @@ import logging
 import re
 from fastapi import Request, Response
 from aiohttp import ClientSession
-from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib # <-- 导入新函数
+from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 from config_manager import load_config
 
 logger = logging.getLogger(__name__)
@@ -39,11 +39,8 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     # --- 资格检查结束 ---
 
     try:
-        item_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{series_id_from_path}"
-        item_params = {'Fields': 'ProviderIds', **auth_token_param}
-        async with session.get(item_url, params=item_params, headers=headers) as resp:
-            tmdb_id = (await resp.json()).get("ProviderIds", {}).get("Tmdb")
-            
+        tmdb_id = await resolve_tmdb_id_for_item(session, real_emby_url, user_id, series_id_from_path, headers, auth_token_param)
+
         season_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{season_id}"
         season_params = {'Fields': 'IndexNumber', **auth_token_param}
         async with session.get(season_url, params=season_params, headers=headers) as resp:

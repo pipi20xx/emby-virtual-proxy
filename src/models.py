@@ -70,6 +70,12 @@ class AppConfig(BaseModel):
 
     # 新增：虚拟库列表本地直出开关(命中解析缓存时不请求 Emby,加速实际访问;过期后台刷新)
     enable_vlib_local_serving: bool = Field(default=True)
+
+    # 新增：TMDB 全库索引开关(季/集合并加速);关闭后退回旧的全库遍历方案
+    enable_tmdb_index: bool = Field(default=True)
+
+    # 新增：TMDB 索引重建间隔(小时),0 表示仅启动时构建一次、之后靠查询自愈回写维持
+    tmdb_index_refresh_interval: int = Field(default=24)
     
     # 新增：自动生成封面的默认样式
     default_cover_style: str = Field(default='style_multi_1')

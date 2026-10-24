@@ -71,6 +71,10 @@ export interface AppConfig {
   enable_vlib_cache: boolean
   /** 虚拟库列表本地直出:命中解析缓存时不请求 Emby,加速实际访问 */
   enable_vlib_local_serving: boolean
+  /** TMDB 全库索引开关(季/集合并加速);关闭后退回全库遍历方案 */
+  enable_tmdb_index: boolean
+  /** TMDB 索引重建间隔(小时),0 = 仅启动时构建一次 */
+  tmdb_index_refresh_interval: number
   /** API 响应缓存 TTL(秒),0 = 禁用 */
   api_cache_ttl: number
   default_cover_style: string
@@ -183,6 +187,8 @@ export function createDefaultConfig(): AppConfig {
     enable_cache: true,
     enable_vlib_cache: true,
     enable_vlib_local_serving: true,
+    enable_tmdb_index: true,
+    tmdb_index_refresh_interval: 24,
     api_cache_ttl: 300,
     default_cover_style: 'style_multi_1',
     show_missing_episodes: false,

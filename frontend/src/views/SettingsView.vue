@@ -172,6 +172,44 @@
           </v-col>
 
           <v-col cols="12" md="4">
+            <!-- TMDB 索引(合并加速) -->
+            <v-card class="fill-height">
+              <v-card-title class="d-flex align-center ga-2">
+                <v-icon icon="mdi-movie-search" size="small" /> TMDB 索引(合并加速)
+              </v-card-title>
+              <v-card-text class="d-flex flex-column ga-4">
+                <v-switch
+                  v-model="draft.enable_tmdb_index"
+                  color="primary"
+                  label="启用 TMDB 索引"
+                  hint="把全库「媒体条目 → TMDB ID」的对应关系建成一张本地查找表(管理员视角)。开启后,进入剧集详情页合并季/集时直接查索引定位关联剧集,不再全库遍历 Emby —— 这是详情页打开速度的最大瓶颈。关闭后退回旧的遍历方案,功能不变但每次进详情页都会全库扫描。"
+                  persistent-hint
+                />
+                <v-text-field
+                  :model-value="String(draft.tmdb_index_refresh_interval ?? 0)"
+                  label="重建间隔(小时)"
+                  type="number"
+                  min="0"
+                  step="1"
+                  suffix="小时"
+                  :disabled="!draft.enable_tmdb_index"
+                  hint="每 N 小时全量重建一次索引(只拉条目 ID 清单,负载很小);0 表示仅启动时构建一次,之后靠查询自愈回写维持。索引里已删除的媒体不会造成错误 —— 每次查询都会实时校验条目存活与可见性。"
+                  persistent-hint
+                  @update:model-value="setTmdbIndexInterval"
+                />
+
+                <div class="text-caption text-medium-emphasis">
+                  <div class="font-weight-medium text-high-emphasis mb-1">工作原理</div>
+                  <div>① 索引构建:定时以管理员身份拉取全库带 TMDB ID 的条目清单,一次性重建查找表;</div>
+                  <div>② 查询:进详情页合并季/集时,按 TMDB ID 查索引得到候选剧集,再一次批量校验条目存活与当前账号可见性;</div>
+                  <div>③ 自愈:新入库的剧集还没进索引时,自动回退一次全库遍历并把结果回写索引,下一次起走索引;</div>
+                  <div>④ 多用户安全:索引是全库视角,返回给每个账号前都会实时校验该账号的可见性,不会串数据。</div>
+                </div>
+              </v-card-text>
+            </v-card>
+          </v-col>
+
+          <v-col cols="12" md="4">
             <!-- RSS -->
             <v-card class="fill-height">
               <v-card-title class="d-flex align-center ga-2">
@@ -359,6 +397,12 @@ function setApiCacheTtl(value: unknown) {
   if (!draft.value) return
   const parsed = Math.max(0, Math.floor(Number(value) || 0))
   draft.value.api_cache_ttl = parsed
+}
+
+function setTmdbIndexInterval(value: unknown) {
+  if (!draft.value) return
+  const parsed = Math.max(0, Math.floor(Number(value) || 0))
+  draft.value.tmdb_index_refresh_interval = parsed
 }
 
 async function saveAll() {

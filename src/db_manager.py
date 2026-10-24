@@ -10,7 +10,9 @@ import json
 import sqlite3
 import threading
 import datetime
+import time
 from pathlib import Path
+from typing import Dict, List, Optional
 
 # 数据库文件都存放在 config 目录下
 DB_DIR = Path(__file__).parent.parent / "config"
@@ -61,6 +63,15 @@ class DBManager:
             conn = self.get_conn()
             cursor = conn.cursor()
             cursor.execute(query, params)
+            if commit:
+                conn.commit()
+            return cursor
+
+    def executemany(self, query, seq_of_params, commit=False):
+        with self._locks[self.db_path]:
+            conn = self.get_conn()
+            cursor = conn.cursor()
+            cursor.executemany(query, seq_of_params)
             if commit:
                 conn.commit()
             return cursor
@@ -230,6 +241,21 @@ def init_databases():
         PRIMARY KEY (user_id, library_id)
     )
     """, commit=True)
+
+    # TMDB 索引:全库 媒体项 → TMDB ID 快速查找表(消灭季/集合并时的全库遍历)
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS emby_tmdb_index (
+        emby_item_id TEXT PRIMARY KEY,
+        tmdb_id TEXT,
+        media_type TEXT,
+        title TEXT,
+        updated_at INTEGER
+    )
+    """, commit=True)
+    vlib_items_db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_emby_tmdb_index_lookup ON emby_tmdb_index (tmdb_id, media_type)",
+        commit=True,
+    )
 
 
 # --- 虚拟库项目缓存(内存 vlib_items_cache 的持久层) ---
@@ -417,6 +443,105 @@ def delete_vlib_user_overlay(library_id: str) -> None:
         )
     except Exception as e:
         print(f"Error deleting vlib user overlay for {library_id}: {e}")
+
+
+# --- TMDB 索引(全库 媒体项 → TMDB ID 快速查找表) ---
+
+def replace_tmdb_index(entries: List[Dict[str, str]]) -> int:
+    """全量重建索引:清空后批量写入。entries: [{tmdb_id, media_type, emby_item_id, title}]"""
+    now = int(time.time())
+    try:
+        with DBManager._locks[VLIB_ITEMS_DB]:
+            conn = DBManager(VLIB_ITEMS_DB).get_conn()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM emby_tmdb_index")
+            cursor.executemany(
+                "INSERT OR REPLACE INTO emby_tmdb_index (emby_item_id, tmdb_id, media_type, title, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (e["emby_item_id"], str(e["tmdb_id"]), e.get("media_type", ""), e.get("title", ""), now)
+                    for e in entries if e.get("emby_item_id")
+                ],
+            )
+            conn.commit()
+            return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else len(entries)
+    except Exception as e:
+        print(f"Error replacing tmdb index: {e}")
+        return -1
+
+
+def upsert_tmdb_index_entries(entries: List[Dict[str, str]]) -> None:
+    """自愈回写:INSERT OR REPLACE(条目数少,用于遍历/直查时发现的新条目)。"""
+    if not entries:
+        return
+    now = int(time.time())
+    try:
+        DBManager(VLIB_ITEMS_DB).executemany(
+            "INSERT OR REPLACE INTO emby_tmdb_index (emby_item_id, tmdb_id, media_type, title, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (e["emby_item_id"], str(e["tmdb_id"]), e.get("media_type", ""), e.get("title", ""), now)
+                for e in entries if e.get("emby_item_id")
+            ],
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error upserting tmdb index entries: {e}")
+
+
+def find_items_by_tmdb(tmdb_id: str, media_type: str) -> List[Dict[str, str]]:
+    """按 TMDB ID + 类型查索引,返回 [{emby_item_id, title}]。"""
+    try:
+        rows = DBManager(VLIB_ITEMS_DB).fetchall(
+            "SELECT emby_item_id, title FROM emby_tmdb_index WHERE tmdb_id = ? AND media_type = ?",
+            (str(tmdb_id), media_type),
+        )
+        return [{"emby_item_id": r["emby_item_id"], "title": r["title"]} for r in rows]
+    except Exception as e:
+        print(f"Error finding tmdb index for {tmdb_id}: {e}")
+        return []
+
+
+def get_tmdb_id_for_item(emby_item_id: str) -> Optional[str]:
+    """反查:条目 ID → TMDB ID(未索引返回 None)。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT tmdb_id FROM emby_tmdb_index WHERE emby_item_id = ?", (emby_item_id,)
+        )
+        return row["tmdb_id"] if row else None
+    except Exception as e:
+        print(f"Error reverse-looking up tmdb index for {emby_item_id}: {e}")
+        return None
+
+
+def count_tmdb_index() -> int:
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone("SELECT COUNT(*) AS c FROM emby_tmdb_index")
+        return int(row["c"]) if row else 0
+    except Exception as e:
+        print(f"Error counting tmdb index: {e}")
+        return 0
+
+
+def get_tmdb_index_age_seconds() -> Optional[int]:
+    """索引年龄(当前时间 - 最新 updated_at);空表返回 None。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone("SELECT MAX(updated_at) AS m FROM emby_tmdb_index")
+        if not row or not row["m"]:
+            return None
+        return max(0, int(time.time()) - int(row["m"]))
+    except Exception as e:
+        print(f"Error getting tmdb index age: {e}")
+        return None
+
+
+def clear_tmdb_index() -> int:
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM emby_tmdb_index", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing tmdb index: {e}")
+        return 0
 
 
 # 在模块加载时执行初始化

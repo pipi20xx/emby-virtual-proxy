@@ -85,6 +85,50 @@ async def refresh_all_vlib_caches() -> None:
     logger.info(f"Scheduled vlib cache refresh finished ({ok}/{len(config.virtual_libraries)} succeeded).")
 
 
+# --- TMDB 索引定时重建(独立任务,间隔独立于列表预热) ---
+
+_TMDB_INDEX_JOB_ID = "tmdb_index_refresh_job"
+
+
+async def refresh_tmdb_index() -> None:
+    """触发代理核心重建 TMDB 索引(端点内部自判开关与新鲜度,仍新鲜则跳过)。"""
+    proxy_core_url = _proxy_core_url()
+    if not proxy_core_url:
+        return
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{proxy_core_url.rstrip('/')}/api/internal/rebuild-tmdb-index",
+                timeout=aiohttp.ClientTimeout(total=600),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if data.get("skipped"):
+                        logger.info("TMDB 索引仍新鲜或已禁用,本轮跳过重建。")
+                    else:
+                        logger.info(f"TMDB 索引定时重建完成,共 {data.get('count')} 条。")
+                else:
+                    logger.warning(f"TMDB 索引定时重建失败 (Status: {resp.status})")
+    except Exception as e:
+        logger.warning(f"TMDB 索引定时重建出错: {e}")
+
+
+def reschedule_tmdb_index_job(config: AppConfig) -> None:
+    """按配置重建 TMDB 索引定时任务(开关关闭或间隔 0 均不调度)。"""
+    if scheduler.get_job(_TMDB_INDEX_JOB_ID):
+        scheduler.remove_job(_TMDB_INDEX_JOB_ID)
+
+    if config.enable_tmdb_index and config.tmdb_index_refresh_interval and config.tmdb_index_refresh_interval > 0:
+        scheduler.add_job(
+            refresh_tmdb_index,
+            'interval',
+            hours=config.tmdb_index_refresh_interval,
+            id=_TMDB_INDEX_JOB_ID,
+            replace_existing=True
+        )
+        logger.info(f"TMDB index refresh job scheduled to run every {config.tmdb_index_refresh_interval} hours.")
+
+
 def reschedule_refresh_job(config: AppConfig) -> None:
     """按配置重建定时任务(缓存功能关闭或间隔 0/空均视为禁用)。"""
     if scheduler.get_job(_REFRESH_JOB_ID):
@@ -107,6 +151,7 @@ async def clear_all_caches() -> dict:
     removed_libraries = db_manager.clear_vlib_items_cache()
     removed_meta = db_manager.clear_vlib_metadata()
     removed_overlay = db_manager.clear_vlib_user_overlay()
+    removed_index = db_manager.clear_tmdb_index()
     # 旧版按用户全量缓存表一并清理(历史数据)
     db_manager.clear_vlib_serving_cache()
 
@@ -123,7 +168,10 @@ async def clear_all_caches() -> dict:
         except Exception as e:
             logger.warning(f"通知代理核心清空内存缓存时出错: {e}")
 
-    logger.info(f"虚拟库缓存已清空(项目缓存 {removed_libraries} 库,共享元数据 {removed_meta},用户叠加层 {removed_overlay},内存已通知清空)。")
+    logger.info(
+        f"虚拟库缓存已清空(项目缓存 {removed_libraries} 库,共享元数据 {removed_meta},"
+        f"用户叠加层 {removed_overlay},TMDB 索引 {removed_index},内存已通知清空)。"
+    )
     return {"vlib_items": removed_libraries, "serving_rows": removed_meta + removed_overlay}
 
 
