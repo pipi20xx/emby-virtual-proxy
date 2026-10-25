@@ -51,6 +51,13 @@ FIELD_MAP = {
     # 存在性检查(实测 true/false 均有效)
     "ProviderIds.Tmdb": "HasTmdbId",
     "ProviderIds.Imdb": "HasImdbId",
+    "ProviderIds.Tvdb": "HasTvdbId",
+    "Overview": "HasOverview",
+}
+
+# 等值取反的专用排除参数(实测有效):not_equals 用原生排除参数,而不是降级后筛选
+EXCLUDE_PARAM_MAP = {
+    "Tags": "ExcludeTags",
 }
 
 
@@ -90,6 +97,11 @@ def translate_rules(rules: List[AdvancedFilterRule]) -> Tuple[Dict[str, Any], Li
             if field in FIELD_MAP and isinstance(FIELD_MAP[field], str) and FIELD_MAP[field].startswith("Has"):
                 emby_native_params[FIELD_MAP[field]] = "false"
                 translated = True
+
+        elif field in EXCLUDE_PARAM_MAP and operator == "not_equals":
+            # 有专用排除参数的字段:不等于也原生执行(实测 ExcludeTags=值 与 Tags 互补)
+            emby_native_params[EXCLUDE_PARAM_MAP[field]] = value
+            translated = True
 
         elif field in FIELD_MAP:
             param_template = FIELD_MAP[field]
