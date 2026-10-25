@@ -2,7 +2,7 @@
   <div class="evp-page">
     <SectionHeader
       title="主页布局"
-      subtitle="拖拽调整各媒体库在客户端首页『我的媒体』中的显示与顺序"
+      subtitle="拖拽或点击箭头按钮,调整各媒体库在客户端首页『我的媒体』中的显示与顺序"
     >
       <template #actions>
         <v-chip v-if="dirty" color="warning" size="small" variant="tonal" class="mr-1">有未保存修改</v-chip>
@@ -31,19 +31,47 @@
               v-bind="dragOptions"
               class="d-flex flex-column ga-2"
             >
-              <template #item="{ element }">
-                <div class="lib-item pa-2 d-flex align-center ga-2 rounded-lg">
+              <template #item="{ element, index }">
+                <div class="lib-item pa-1 pl-2 d-flex align-center ga-1 rounded-lg">
                   <v-icon class="drag-handle" icon="mdi-drag-vertical" size="small" />
-                  <span class="text-caption text-medium-emphasis">{{ indexLabel(element) }}</span>
+                  <span class="order-index text-caption text-medium-emphasis">{{ index + 1 }}</span>
                   <v-chip :color="chipColor(element)" size="small" variant="tonal">
                     {{ chipText(element) }}
                   </v-chip>
-                  <span class="text-body-2 text-truncate">{{ element.name }}</span>
+                  <span class="text-body-2 text-truncate flex-grow-1">{{ element.name }}</span>
+                  <div class="lib-actions d-flex align-center">
+                    <v-btn
+                      class="lib-action"
+                      icon="mdi-arrow-up"
+                      size="x-small"
+                      variant="text"
+                      aria-label="上移"
+                      :disabled="index === 0"
+                      @click="moveDisplayed(index, index - 1)"
+                    />
+                    <v-btn
+                      class="lib-action"
+                      icon="mdi-arrow-down"
+                      size="x-small"
+                      variant="text"
+                      aria-label="下移"
+                      :disabled="index === displayed.length - 1"
+                      @click="moveDisplayed(index, index + 1)"
+                    />
+                    <v-btn
+                      class="lib-action"
+                      icon="mdi-eye-off-outline"
+                      size="x-small"
+                      variant="text"
+                      aria-label="隐藏"
+                      @click="hideLibrary(element)"
+                    />
+                  </div>
                 </div>
               </template>
             </draggable>
             <div v-if="!displayed.length" class="text-caption text-medium-emphasis text-center py-6">
-              从右侧拖入库,或直接把库拖到此处调整顺序
+              从右侧拖入库,或点击右侧库的『显示』按钮
             </div>
           </v-card-text>
         </v-card>
@@ -62,12 +90,20 @@
               class="d-flex flex-column ga-2"
             >
               <template #item="{ element }">
-                <div class="lib-item pa-2 d-flex align-center ga-2 rounded-lg">
+                <div class="lib-item pa-1 pl-2 d-flex align-center ga-1 rounded-lg">
                   <v-icon class="drag-handle" icon="mdi-drag-vertical" size="small" />
                   <v-chip :color="chipColor(element)" size="small" variant="tonal">
                     {{ chipText(element) }}
                   </v-chip>
-                  <span class="text-body-2 text-truncate">{{ element.name }}</span>
+                  <span class="text-body-2 text-truncate flex-grow-1">{{ element.name }}</span>
+                  <v-btn
+                    class="lib-action"
+                    icon="mdi-eye-outline"
+                    size="x-small"
+                    variant="text"
+                    aria-label="显示"
+                    @click="showLibrary(element)"
+                  />
                 </div>
               </template>
             </draggable>
@@ -122,9 +158,24 @@ function idsSnapshot(): [string[], string[]] {
   return [displayed.value.map((item) => item.id), undisplayed.value.map((item) => item.id)]
 }
 
-function indexLabel(element: LibraryBrief): string {
+function moveDisplayed(from: number, to: number) {
+  if (to < 0 || to >= displayed.value.length || from === to) return
+  const [item] = displayed.value.splice(from, 1)
+  displayed.value.splice(to, 0, item)
+}
+
+function showLibrary(element: LibraryBrief) {
+  const index = undisplayed.value.findIndex((item) => item.id === element.id)
+  if (index < 0) return
+  undisplayed.value.splice(index, 1)
+  displayed.value.push(element)
+}
+
+function hideLibrary(element: LibraryBrief) {
   const index = displayed.value.findIndex((item) => item.id === element.id)
-  return index >= 0 ? String(index + 1) : ''
+  if (index < 0) return
+  displayed.value.splice(index, 1)
+  undisplayed.value.push(element)
 }
 
 function chipText(element: LibraryBrief): string {
@@ -173,15 +224,38 @@ onMounted(initialize)
 <style scoped>
 .lib-item {
   background: rgba(var(--v-theme-surface-variant), 0.4);
-  cursor: grab;
+  transition: background-color 0.15s ease;
 }
 
-.lib-item:active {
-  cursor: grabbing;
+.lib-item:hover {
+  background: rgba(var(--v-theme-surface-variant), 0.65);
 }
 
 .drag-handle {
   cursor: grab;
+  padding: 6px 4px;
+  margin: -6px -4px;
   color: rgb(var(--v-theme-on-surface-variant));
+}
+
+.drag-handle:active {
+  cursor: grabbing;
+}
+
+.order-index {
+  width: 18px;
+  text-align: center;
+  flex: none;
+}
+
+/* 拖拽视觉反馈:被拖起的项半透明,原位置留虚线占位 */
+.drag-ghost {
+  opacity: 0.45;
+  border: 1px dashed rgb(var(--v-theme-primary));
+  background: rgba(var(--v-theme-primary), 0.06);
+}
+
+.drag-chosen {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 </style>

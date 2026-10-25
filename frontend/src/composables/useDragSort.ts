@@ -5,5 +5,9 @@ export function useDragSort(group = 'evp-libraries') {
     animation: 150,
     handle: '.drag-handle',
     ghostClass: 'drag-ghost',
+    chosenClass: 'drag-chosen',
+    /** 触屏时按住 180ms 才开始拖拽,避免滚动列表时误触发 */
+    delay: 180,
+    delayOnTouchOnly: true,
   }
 }
