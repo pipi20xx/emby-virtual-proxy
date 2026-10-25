@@ -9,6 +9,11 @@ import type { ValueControl } from './nativeFields'
 /** 后筛选字段的分组名(高效对照表会排除该组) */
 export const POST_FILTER_GROUP = '代理端后筛选(较慢)'
 
+const BOOLEAN_ENUM = [
+  { title: 'true', value: 'true' },
+  { title: 'false', value: 'false' },
+]
+
 export interface PostFilterFieldMeta {
   group: string
   title: string
@@ -23,6 +28,13 @@ export interface PostFilterFieldMeta {
 }
 
 export const POST_FILTER_FIELDS: Record<string, PostFilterFieldMeta> = {
+  CriticRating: {
+    group: POST_FILTER_GROUP,
+    title: '影评人评分',
+    post: 'Emby 无可用原生参数(实测 Min/MaxCriticRating 均被忽略),代理逐条比对',
+    postOps: ['equals', 'not_equals', 'greater_than', 'less_than', 'is_empty', 'is_not_empty'],
+    valueControl: { kind: 'number', min: 0, max: 100, step: 1 },
+  },
   VideoRange: {
     group: POST_FILTER_GROUP,
     title: '视频范围',
@@ -36,5 +48,29 @@ export const POST_FILTER_FIELDS: Record<string, PostFilterFieldMeta> = {
     title: '名称',
     post: '对条目名称做字符串比对,支持包含/不包含',
     postOps: ['equals', 'not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
+  },
+  IsMovie: {
+    group: POST_FILTER_GROUP,
+    title: '是否为电影',
+    post: '按条目类型(Type)逐条比对(实测 Emby 忽略 IsMovie 参数)',
+    postOps: ['equals', 'not_equals', 'is_empty', 'is_not_empty'],
+    valueHint: '只能选 true / false',
+    valueControl: { kind: 'enum', options: BOOLEAN_ENUM },
+  },
+  IsSeries: {
+    group: POST_FILTER_GROUP,
+    title: '是否为剧集',
+    post: '按条目类型(Type)逐条比对(实测 Emby 忽略 IsSeries 参数)',
+    postOps: ['equals', 'not_equals', 'is_empty', 'is_not_empty'],
+    valueHint: '只能选 true / false',
+    valueControl: { kind: 'enum', options: BOOLEAN_ENUM },
+  },
+  IsUnplayed: {
+    group: POST_FILTER_GROUP,
+    title: '未播放',
+    post: '按条目的 UserData.Played 逐条比对(实测 Emby 忽略 IsUnplayed 参数)',
+    postOps: ['equals', 'not_equals', 'is_empty', 'is_not_empty'],
+    valueHint: '只能选 true / false',
+    valueControl: { kind: 'enum', options: BOOLEAN_ENUM },
   },
 }

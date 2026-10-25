@@ -73,12 +73,13 @@ export function buildFieldSelectItems(): FieldSelectItem[] {
 export function buildFieldHint(field: string): string {
   const meta = FIELD_META[field]
   if (!meta) return '选择字段后,这里会显示该字段的执行方式与填写说明'
+  const titleOf = (op: string) => OPERATOR_TITLES[op] ?? op
   const parts: string[] = []
   if (meta.native) parts.push(`原生执行(Emby 服务端处理,最快):生成参数 ${meta.native}`)
   else if (meta.post) parts.push(`代理端后筛选(逐条比对,较慢):${meta.post}`)
-  if (meta.ops?.length) parts.push(`高效操作符:${meta.ops.join(' / ')}`)
+  if (meta.ops?.length) parts.push(`高效操作符:${meta.ops.map(titleOf).join(' / ')}`)
   if (meta.native && meta.postOps?.length) {
-    parts.push(`「${meta.postOps.map((op) => OPERATOR_TITLES[op] ?? op).join(' / ')}」降级为后筛选(慢)`)
+    parts.push(`「${meta.postOps.map(titleOf).join(' / ')}」降级为后筛选(慢)`)
   }
   if (meta.valueHint) parts.push(meta.valueHint)
   return parts.join(';')

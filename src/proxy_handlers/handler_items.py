@@ -88,20 +88,45 @@ def _check_condition(item_value: Any, operator: str, rule_value: str) -> bool:
             except (ValueError, TypeError): return False
         item_value_str = str(item_value).lower()
         rule_value_str = str(rule_value).lower()
-        if operator == "equals": return item_value_str == rule_value_str
-        if operator == "not_equals": return item_value_str != rule_value_str
+        if operator in ("equals", "not_equals"):
+            # 数值字段(如评分)按数值比较,避免 '8.0' != '8' 的字符串误判
+            try:
+                equal = float(item_value) == float(rule_value)
+            except (ValueError, TypeError):
+                equal = item_value_str == rule_value_str
+            return equal if operator == "equals" else not equal
         if operator == "contains": return rule_value_str in item_value_str
         if operator == "not_contains": return rule_value_str not in item_value_str
     if operator == "is_empty": return item_value is None or item_value == '' or item_value == []
     if operator == "is_not_empty": return item_value is not None and item_value != '' and item_value != []
     return False
 
+def _resolve_post_filter_field(item: Dict[str, Any], field: str) -> Any:
+    """伪字段/非常规字段 -> 条目实际属性(按 Emby 4.10 实际返回结构取值)"""
+    if field == "IsMovie": return item.get("Type") == "Movie"
+    if field == "IsSeries": return item.get("Type") == "Series"
+    if field == "IsPlayed": return (item.get("UserData") or {}).get("Played") is True
+    if field == "IsUnplayed": return (item.get("UserData") or {}).get("Played") is not True
+    if field == "HasSubtitles": return item.get("HasSubtitles") is True
+    if field == "HasOfficialRating": return item.get("OfficialRating") is not None
+    if field == "Tags":
+        # 实测 Emby 4.10 条目 DTO 不返回 Tags 数组,标签在 TagItems 对象里
+        tags = item.get("Tags")
+        if not tags:
+            tags = [t.get("Name") for t in (item.get("TagItems") or []) if isinstance(t, dict) and t.get("Name")]
+        return tags or []
+    if field == "Studios":
+        # Studios 在 DTO 里是 {Name, Id} 对象数组,后筛选按名称比较
+        return [s.get("Name") if isinstance(s, dict) else s for s in (item.get("Studios") or [])]
+    return _get_nested_value(item, field)
+
+
 def _apply_post_filter(items: List[Dict[str, Any]], post_filter_rules: List[Dict]) -> List[Dict[str, Any]]:
     if not post_filter_rules: return items
     logger.info(f"在 {len(items)} 个项目上应用 {len(post_filter_rules)} 条后筛选规则。")
     filtered_items = []
     for item in items:
-        if all(_check_condition(_get_nested_value(item, rule.field), rule.operator, rule.value) for rule in post_filter_rules):
+        if all(_check_condition(_resolve_post_filter_field(item, rule.field), rule.operator, rule.value) for rule in post_filter_rules):
             filtered_items.append(item)
     return filtered_items
 

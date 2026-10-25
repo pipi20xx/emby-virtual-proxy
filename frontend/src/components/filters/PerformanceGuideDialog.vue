@@ -127,7 +127,7 @@
 </template>
 
 <script setup lang="ts">
-import { FIELD_META, GROUP_ORDER, POST_FILTER_GROUP } from './fieldMeta'
+import { FIELD_META, GROUP_ORDER, OPERATOR_TITLES, POST_FILTER_GROUP } from './fieldMeta'
 
 defineProps<{
   modelValue: boolean
@@ -156,17 +156,17 @@ const efficientGroups: EfficientGroup[] = GROUP_ORDER.filter((group) => group !=
       .filter(([, meta]) => meta.group === group && meta.native)
       .map(([value, meta]) => ({
         field: `${meta.title} (${value})`,
-        ops: meta.ops ?? [],
+        ops: (meta.ops ?? []).map((op) => OPERATOR_TITLES[op] ?? op),
         param: meta.paramExample ?? meta.native ?? '',
       })),
   }))
   .filter((group) => group.rows.length)
 
 const inefficientRules = [
-  '字段为「名称 (Name)」(无论使用什么操作符)',
-  '字段为「视频范围 (VideoRange)」(无论使用什么操作符)',
+  '字段为「名称 (Name)」「视频范围 (VideoRange)」「影评人评分 (CriticRating)」「是否为电影 (IsMovie)」「是否为剧集 (IsSeries)」「未播放 (IsUnplayed)」(无论使用什么操作符)',
   '操作符为「不等于 / 包含 / 不包含」(任意字段)',
-  '操作符为「为空 / 不为空」,但字段不是「拥有 TMDB/IMDB ID」(例如:社区评分为空)',
+  '操作符为「为空 / 不为空」,但字段不是 Has 类字段(拥有 TMDB/IMDB ID、有字幕、有官方评级)',
+  '「社区评分 (CommunityRating)」的「等于 / 小于」(实测 Emby 忽略 MaxCommunityRating)',
 ]
 </script>
 

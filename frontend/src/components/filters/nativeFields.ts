@@ -41,9 +41,9 @@ export const OPERATOR_TITLES: Record<string, string> = {
 export interface NativeFieldMeta {
   group: string
   title: string
-  /** 高效操作符 */
+  /** 高效操作符(操作符 key,展示用 OPERATOR_TITLES 映射) */
   ops: string[]
-  /** 可用但会降级为代理端后筛选的操作符(未列出的操作符对该字段无意义,不应提供) */
+  /** 可用但会降级为代理端后筛选的操作符 key(未列出的操作符对该字段无意义,不应提供) */
   postOps?: string[]
   /** 生成参数(简洁描述,编辑器提示用) */
   native: string
@@ -64,26 +64,17 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   CommunityRating: {
     group: '评分',
     title: '社区评分',
-    ops: ['等于', '大于', '小于'],
-    postOps: ['不等于', '为空', '不为空'],
-    native: 'Min/MaxCommunityRating(等于时两者同值)',
-    paramExample: 'MinCommunityRating=7.5 / MaxCommunityRating=7.5(等于时两者同值)',
+    ops: ['greater_than'],
+    postOps: ['equals', 'less_than', 'not_equals', 'is_empty', 'is_not_empty'],
+    native: 'MinCommunityRating(实测 Emby 忽略 Max,仅大于可原生)',
+    paramExample: 'MinCommunityRating=8',
     valueControl: { kind: 'number', min: 0, max: 10, step: 0.1 },
-  },
-  CriticRating: {
-    group: '评分',
-    title: '影评人评分',
-    ops: ['等于', '大于', '小于'],
-    postOps: ['不等于', '为空', '不为空'],
-    native: 'Min/MaxCriticRating(等于时两者同值)',
-    paramExample: 'MinCriticRating=80 / MaxCriticRating=80(等于时两者同值)',
-    valueControl: { kind: 'number', min: 0, max: 100, step: 1 },
   },
   ProductionYear: {
     group: '时间',
     title: '发行年份',
-    ops: ['等于', '大于', '小于'],
-    postOps: ['不等于', '为空', '不为空'],
+    ops: ['equals', 'greater_than', 'less_than'],
+    postOps: ['not_equals', 'is_empty', 'is_not_empty'],
     native: '年份转为日期范围(含端点:大于 2022 会命中 2022 全年)',
     paramExample: 'MinPremiereDate=2023-01-01T00:00:00.000Z 等(年份转为日期范围)',
     valueControl: { kind: 'number', min: 1900, max: 2100, step: 1 },
@@ -91,8 +82,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   PremiereDate: {
     group: '时间',
     title: '首播日期',
-    ops: ['等于', '大于', '小于'],
-    postOps: ['为空', '不为空'],
+    ops: ['equals', 'greater_than', 'less_than'],
+    postOps: ['is_empty', 'is_not_empty'],
     native: 'Min/MaxPremiereDate,支持最近N天(含第 N 天)',
     paramExample: 'MinPremiereDate / MaxPremiereDate,支持最近N天',
     valueHint: '选日期或填最近N天',
@@ -100,8 +91,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   DateCreated: {
     group: '时间',
     title: '添加日期',
-    ops: ['等于', '大于', '小于'],
-    postOps: ['为空', '不为空'],
+    ops: ['equals', 'greater_than', 'less_than'],
+    postOps: ['is_empty', 'is_not_empty'],
     native: 'Min/MaxDateCreated,支持最近N天(含第 N 天)',
     paramExample: 'MinDateCreated / MaxDateCreated,支持最近N天',
     valueHint: '选日期或填最近N天',
@@ -109,8 +100,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   OfficialRating: {
     group: '分类与标签',
     title: '官方分级',
-    ops: ['等于'],
-    postOps: ['不等于', '包含', '不包含', '为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
     native: 'OfficialRatings',
     paramExample: 'OfficialRatings=R',
     valueHint: '随地区不同,常见如 R / PG-13 / TV-MA',
@@ -119,8 +110,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   Genres: {
     group: '分类与标签',
     title: '类型',
-    ops: ['等于'],
-    postOps: ['不等于', '包含', '不包含', '为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
     native: 'Genres',
     paramExample: 'Genres=科幻',
     valueHint: '取决于媒体库内容,如 科幻;多值任一满足用 | 分隔,如 科幻|动画',
@@ -128,8 +119,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   Tags: {
     group: '分类与标签',
     title: '标签',
-    ops: ['等于'],
-    postOps: ['不等于', '包含', '不包含', '为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
     native: 'Tags',
     paramExample: 'Tags=肉番(多值任一满足:Tags=后宫|肉番)',
     valueHint: '取决于媒体库内容,如 肉番;多值任一满足用 | 分隔,如 后宫|肉番',
@@ -137,8 +128,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   Studios: {
     group: '分类与标签',
     title: '工作室',
-    ops: ['等于'],
-    postOps: ['不等于', '包含', '不包含', '为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
     native: 'Studios',
     paramExample: 'Studios=Netflix',
     valueHint: '取决于媒体库内容,如 Netflix',
@@ -146,8 +137,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   Container: {
     group: '媒体与文件',
     title: '文件容器',
-    ops: ['等于'],
-    postOps: ['不等于', '包含', '不包含', '为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
     native: 'Containers',
     paramExample: 'Containers=mkv',
     valueHint: '常见如 mkv / mp4',
@@ -156,8 +147,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   NameStartsWith: {
     group: '媒体与文件',
     title: '名称以…开头',
-    ops: ['等于'],
-    postOps: ['为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['is_empty', 'is_not_empty'],
     native: 'NameStartsWith',
     paramExample: 'NameStartsWith=A',
     valueHint: '填名称首字符,如 A',
@@ -165,8 +156,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   SeriesStatus: {
     group: '媒体与文件',
     title: '剧集状态',
-    ops: ['等于'],
-    postOps: ['不等于', '包含', '不包含', '为空', '不为空'],
+    ops: ['equals'],
+    postOps: ['not_equals', 'contains', 'not_contains', 'is_empty', 'is_not_empty'],
     native: 'SeriesStatus',
     paramExample: 'SeriesStatus=Continuing / Ended',
     valueHint: '只能选连载中或已完结',
@@ -178,17 +169,14 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
       ],
     },
   },
-  IsMovie: { group: '布尔条件', title: '是否为电影', ops: ['等于'], postOps: ['不等于', '为空', '不为空'], native: 'IsMovie', paramExample: 'IsMovie=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
-  IsSeries: { group: '布尔条件', title: '是否为剧集', ops: ['等于'], postOps: ['不等于', '为空', '不为空'], native: 'IsSeries', paramExample: 'IsSeries=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
-  IsPlayed: { group: '布尔条件', title: '已播放', ops: ['等于'], postOps: ['不等于', '为空', '不为空'], native: 'IsPlayed', paramExample: 'IsPlayed=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
-  IsUnplayed: { group: '布尔条件', title: '未播放', ops: ['等于'], postOps: ['不等于', '为空', '不为空'], native: 'IsUnplayed', paramExample: 'IsUnplayed=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
-  HasSubtitles: { group: '布尔条件', title: '有字幕', ops: ['等于'], postOps: ['不等于', '为空', '不为空'], native: 'HasSubtitles', paramExample: 'HasSubtitles=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
-  HasOfficialRating: { group: '布尔条件', title: '有官方评级', ops: ['等于'], postOps: ['不等于', '为空', '不为空'], native: 'HasOfficialRating', paramExample: 'HasOfficialRating=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
+  IsPlayed: { group: '布尔条件', title: '已播放', ops: ['equals'], postOps: ['not_equals'], native: 'IsPlayed(按请求用户过滤)', paramExample: 'IsPlayed=true', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
+  HasSubtitles: { group: '布尔条件', title: '有字幕', ops: ['equals', 'is_empty', 'is_not_empty'], postOps: ['not_equals'], native: 'HasSubtitles', paramExample: 'HasSubtitles=true / HasSubtitles=false(为空/不为空)', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
+  HasOfficialRating: { group: '布尔条件', title: '有官方评级', ops: ['equals', 'is_empty', 'is_not_empty'], postOps: ['not_equals'], native: 'HasOfficialRating', paramExample: 'HasOfficialRating=true / HasOfficialRating=false(为空/不为空)', valueHint: '只能选 true / false', valueControl: { kind: 'enum', options: BOOLEAN_VALUES } },
   'ProviderIds.Tmdb': {
     group: '存在性检查',
     title: '拥有 TMDB ID',
-    ops: ['不为空', '为空', '等于'],
-    postOps: ['不等于'],
+    ops: ['is_not_empty', 'is_empty', 'equals'],
+    postOps: ['not_equals'],
     native: 'HasTmdbId=true / false',
     paramExample: 'HasTmdbId=true / HasTmdbId=false,无需填值',
     valueHint: '通常用「为空/不为空」,无需填值',
@@ -197,8 +185,8 @@ export const NATIVE_FIELDS: Record<string, NativeFieldMeta> = {
   'ProviderIds.Imdb': {
     group: '存在性检查',
     title: '拥有 IMDB ID',
-    ops: ['不为空', '为空', '等于'],
-    postOps: ['不等于'],
+    ops: ['is_not_empty', 'is_empty', 'equals'],
+    postOps: ['not_equals'],
     native: 'HasImdbId=true / false',
     paramExample: 'HasImdbId=true / HasImdbId=false,无需填值',
     valueHint: '通常用「为空/不为空」,无需填值',

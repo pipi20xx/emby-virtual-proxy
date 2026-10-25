@@ -27,10 +27,11 @@ OPERATOR_MAP = {
 
 # 映射我们的字段到 Emby API 的查询参数
 # Key 是我们在前端定义的 field, Value 是对应的 Emby API 参数 (或元组)
-# 对于 'greater_than'/'less_than'，我们使用 (Min-Param, Max-Param) 的元组
+# 以下映射均经 Emby 4.10.2 实测验证;实测被忽略的参数不在此映射,一律走代理端后筛选:
+#   - MaxCommunityRating / MinCriticRating / MaxCriticRating 被忽略
+#   - IsMovie / IsSeries(参数与 Filters 形式均被忽略)
 FIELD_MAP = {
-    "CommunityRating": ("MinCommunityRating", "MaxCommunityRating"),
-    "CriticRating": ("MinCriticRating", "MaxCriticRating"),
+    "CommunityRating": ("MinCommunityRating", None),  # 仅 greater_than 可原生(见下方分支)
     "OfficialRating": "OfficialRatings",
     "ProductionYear": ("MinPremiereDate", "MaxPremiereDate"),  # 将年份转换为日期
     "PremiereDate": ("MinPremiereDate", "MaxPremiereDate"),    # 首播日期
@@ -43,14 +44,11 @@ FIELD_MAP = {
     "Container": "Containers",
     "NameStartsWith": "NameStartsWith",
     "SeriesStatus": "SeriesStatus",
-    # 布尔类型的特殊字段
-    "IsMovie": "IsMovie",
-    "IsSeries": "IsSeries",
+    # 播放状态:实测 IsPlayed 参数有效;IsUnplayed 参数与 Filters 形式均被忽略,走后筛选
     "IsPlayed": "IsPlayed",
-    "IsUnplayed": "IsUnplayed",
     "HasSubtitles": "HasSubtitles",
     "HasOfficialRating": "HasOfficialRating",
-    # 存在性检查
+    # 存在性检查(实测 true/false 均有效)
     "ProviderIds.Tmdb": "HasTmdbId",
     "ProviderIds.Imdb": "HasImdbId",
 }
@@ -96,45 +94,35 @@ def translate_rules(rules: List[AdvancedFilterRule]) -> Tuple[Dict[str, Any], Li
         elif field in FIELD_MAP:
             param_template = FIELD_MAP[field]
 
-            # 处理范围查询 (Min/Max)
+            # 处理范围查询 (Min/Max);均经 Emby 4.10.2 实测验证
             if isinstance(param_template, tuple):
                 min_param, max_param = param_template
-                if operator == "greater_than":
-                    param_name = min_param
-                elif operator == "less_than":
-                    param_name = max_param
-                elif operator == "equals":
-                    # 对于年份的精确匹配，需要设置Min和Max为同一年
-                    if field == "ProductionYear":
-                        emby_native_params[min_param] = f"{value}-01-01T00:00:00.000Z"
-                        emby_native_params[max_param] = f"{value}-12-31T23:59:59.999Z"
-                        translated = True
-                    # 对首播日期和添加日期的精确匹配
-                    elif field in ["PremiereDate", "DateCreated"]:
-                        emby_native_params[min_param] = f"{value}T00:00:00.000Z"
-                        emby_native_params[max_param] = f"{value}T23:59:59.999Z"
-                        translated = True
-                    else:
-                        # CommunityRating/CriticRating 的等于:Emby 无对应等值参数,
-                        # 用 Min=Max 同值区间近似表达,而不是生成无效参数
-                        emby_native_params[min_param] = value
-                        emby_native_params[max_param] = value
-                        translated = True
-                else:
-                    param_name = None
 
-                if not translated and param_name:
-                    # 对年份特殊处理，转换为完整的日期时间格式
+                def _range_value(op: str) -> str:
                     if field == "ProductionYear":
-                        # aiohttp 会自动编码，这里不需要手动处理
-                        emby_native_params[param_name] = f"{value}-01-01T00:00:00.000Z" if operator == "greater_than" else f"{value}-12-31T23:59:59.999Z"
-                    # 对日期字段的处理
-                    elif field in ["PremiereDate", "DateCreated"]:
-                        # 假设 value 是 'YYYY-MM-DD' 格式
-                        emby_native_params[param_name] = f"{value}T00:00:00.000Z" if operator == "greater_than" else f"{value}T23:59:59.999Z"
-                    else:
-                        emby_native_params[param_name] = value
+                        return f"{value}-01-01T00:00:00.000Z" if op == "greater_than" else f"{value}-12-31T23:59:59.999Z"
+                    if field in ("PremiereDate", "DateCreated"):
+                        return f"{value}T00:00:00.000Z" if op == "greater_than" else f"{value}T23:59:59.999Z"
+                    return str(value)
+
+                if field == "CommunityRating":
+                    # 实测 Emby 4.10 只认 MinCommunityRating,MaxCommunityRating 被忽略:
+                    # 仅「大于」可原生,等于/小于一律走后筛选
+                    if operator == "greater_than":
+                        emby_native_params[min_param] = value
+                        translated = True
+                elif operator == "greater_than":
+                    emby_native_params[min_param] = _range_value("greater_than")
                     translated = True
+                elif operator == "less_than":
+                    emby_native_params[max_param] = _range_value("less_than")
+                    translated = True
+                elif operator == "equals" and field in ("ProductionYear", "PremiereDate", "DateCreated"):
+                    # 年份/日期的精确匹配:Min/Max 日期范围
+                    emby_native_params[min_param] = _range_value("greater_than")
+                    emby_native_params[max_param] = _range_value("less_than")
+                    translated = True
+                # 其余情况不翻译,走后筛选
 
             # 处理直接映射的字段
             # 仅 equals 翻译为原生参数;not_equals/contains/not_contains 等语义
