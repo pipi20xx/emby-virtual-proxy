@@ -43,6 +43,12 @@ class VirtualLibrary(BaseModel):
     cover_custom_zh_font_path: Optional[str] = Field(default=None) # <-- 【新增】海报自定义中文字体
     cover_custom_en_font_path: Optional[str] = Field(default=None) # <-- 【新增】海报自定义英文字体
     cover_custom_image_path: Optional[str] = Field(default=None) # <-- 【新增】海报自定义图片目录
+    # --- 封面自动刷新配方:手动生成时固化,内容变化后自动重绘沿用同样外观 ---
+    cover_style: Optional[str] = Field(default=None) # <-- 【新增】上次生成使用的样式
+    cover_title_zh: Optional[str] = Field(default=None) # <-- 【新增】上次生成的中文标题
+    cover_title_en: Optional[str] = Field(default=None) # <-- 【新增】上次生成的英文标题
+    cover_animation_format: Optional[str] = Field(default=None) # <-- 【新增】上次生成的动图格式(gif/webp/png)
+    cover_source_hash: Optional[str] = Field(default=None) # <-- 【新增】上次生成时的内容指纹(条目 Id 集合),未变化则不重绘
 
 class AppConfig(BaseModel):
     emby_url: str = Field(default="http://127.0.0.1:8096")

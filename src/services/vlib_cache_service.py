@@ -5,8 +5,9 @@
 /api/internal/refresh-vlib-items 端点,由代理核心以模拟客户端身份走完整
 规则解析并向 Emby 拉取项目列表(内存 + SQLite 双写)。
 
-预热完成后顺带检查缺封面的库并触发自动生成,形成
-"数据刷新 -> 缓存就绪 -> 封面补齐" 的流水线,全程不依赖客户端访问。
+预热完成后顺势触发封面自动刷新,形成
+"数据刷新 -> 缓存就绪 -> 封面按需重绘" 的流水线,全程不依赖客户端访问。
+封面生成端点按内容指纹判断,库内容未变化时自动跳过,不会反复重绘。
 """
 
 import asyncio
@@ -57,7 +58,7 @@ async def refresh_vlib_cache(library_id: str) -> bool:
         logger.error(f"预热虚拟库 {library_id} 缓存时出错: {e}")
         return False
 
-    # 缓存就绪后,缺封面的库顺势补生成(端点内部自带运行中去重)
+    # 缓存就绪后顺势触发封面自动刷新(端点按内容指纹判断,未变化则跳过)
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -65,9 +66,9 @@ async def refresh_vlib_cache(library_id: str) -> bool:
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status == 200:
-                    logger.info(f"已为虚拟库 {library_id} 触发缺封面自动生成检查。")
+                    logger.info(f"已为虚拟库 {library_id} 触发封面自动刷新检查。")
     except Exception as e:
-        logger.warning(f"触发虚拟库 {library_id} 封面自动生成失败: {e}")
+        logger.warning(f"触发虚拟库 {library_id} 封面自动刷新失败: {e}")
 
     return True
 

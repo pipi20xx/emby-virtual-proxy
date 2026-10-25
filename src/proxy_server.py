@@ -241,6 +241,25 @@ async def refresh_vlib_items(library_id: str):
     return JSONResponse(content={"Items": items, "TotalRecordCount": len(items)})
 
 
+@proxy_app.get("/api/internal/vlib-source-hash/{library_id}")
+async def get_vlib_source_hash(library_id: str):
+    """计算虚拟库当前内容指纹(条目 Id 集合 md5),供手动生成封面时锚定自动刷新基线。"""
+    config = config_manager.load_config()
+    vlib = next((v for v in config.virtual_libraries if v.id == library_id), None)
+    if not vlib:
+        raise HTTPException(status_code=404, detail="虚拟库不存在")
+
+    user_id = await _resolve_default_user_id(config)
+    if not user_id:
+        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url / emby_api_key 配置")
+
+    items = await handler_autogen.fetch_vlib_items_internal(vlib, user_id, config.emby_api_key)
+    if not items:
+        raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,无法计算内容指纹")
+
+    return {"source_hash": handler_autogen.compute_source_hash(items), "item_count": len(items)}
+
+
 async def _trigger_autogen_cover(library_id: str) -> dict:
     """为虚拟库触发一次后台封面自动生成(带运行中去重)。"""
     config = config_manager.load_config()
@@ -342,6 +361,8 @@ async def _startup_warmup():
             try:
                 items = await _refresh_vlib_items_internal(config, vlib.id)
                 logger.info(f"启动预热:库 '{vlib.name}' 已刷新 {len(items)} 个项目。")
+                # 数据刷新后顺势触发封面自动刷新(内容指纹未变化时内部会跳过)
+                await _trigger_autogen_cover(vlib.id)
             except HTTPException as e:
                 logger.warning(f"启动预热:刷新库 '{vlib.name}' 失败: {e.detail}")
             except Exception as e:

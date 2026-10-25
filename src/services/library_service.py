@@ -67,6 +67,14 @@ def update_library(library_id: str, updated_library_data: VirtualLibrary) -> Vir
     if lib_to_update.image_tag and not update_data.get('image_tag'):
         update_data['image_tag'] = lib_to_update.image_tag
 
+    # 封面生成配方由生成动作维护;编辑表单不携带时保留,避免自动刷新外观回退到默认样式
+    for cover_field in ("cover_format", "cover_style", "cover_title_zh", "cover_title_en",
+                        "cover_animation_format", "cover_source_hash"):
+        if not update_data.get(cover_field):
+            old_value = getattr(lib_to_update, cover_field, None)
+            if old_value is not None:
+                update_data[cover_field] = old_value
+
     updated_lib = lib_to_update.model_copy(update=update_data)
 
     for i, lib in enumerate(config.virtual_libraries):

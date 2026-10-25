@@ -182,19 +182,44 @@ async def generate_cover(body: CoverRequest):
     if not image_tag:
         raise HTTPException(status_code=500, detail="封面生成失败，详见后端日志。")
 
-    # 生成成功后把 image_tag / cover_format 写回对应虚拟库
+    # 生成成功后把生成配方与 image_tag / cover_format 写回对应虚拟库:
+    # 配方(样式/标题/动图格式)供内容变化后的自动重绘沿用同样外观
     config = config_manager.load_config()
     vlib = next((lib for lib in config.virtual_libraries if lib.id == body.library_id), None)
     if not vlib:
         raise HTTPException(status_code=404, detail="未找到要更新封面的虚拟库。")
     vlib.image_tag = image_tag
     vlib.cover_format = cover_format
+    vlib.cover_style = body.style_name
+    vlib.cover_title_zh = body.title_zh
+    vlib.cover_title_en = body.title_en
+    vlib.cover_animation_format = body.animation_format
+    vlib.cover_source_hash = await _fetch_vlib_source_hash(body.library_id)
     config_manager.save_config(config)
     return {
         "success": True,
         "image_tag": image_tag,
         "image_url": f"/covers/{body.library_id}.{cover_format}?t={image_tag}",
     }
+
+
+async def _fetch_vlib_source_hash(library_id: str) -> Optional[str]:
+    """向代理核心查询虚拟库当前内容指纹(失败返回 None,下次自动刷新会重建基线)。"""
+    proxy_core_url = os.getenv("PROXY_CORE_URL")
+    if not proxy_core_url:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{proxy_core_url.rstrip('/')}/api/internal/vlib-source-hash/{library_id}",
+                timeout=aiohttp.ClientTimeout(total=90),
+            ) as resp:
+                if resp.status == 200:
+                    return (await resp.json(content_type=None)).get("source_hash")
+                logger.warning(f"获取虚拟库 {library_id} 内容指纹失败 (Status: {resp.status})")
+    except Exception as e:
+        logger.warning(f"获取虚拟库 {library_id} 内容指纹时出错: {e}")
+    return None
 
 
 @api_router.post("/covers/clear", status_code=204, tags=["Cover Generator"])
@@ -291,9 +316,8 @@ async def create_library(library: VirtualLibrary):
 @api_router.put("/libraries/{library_id}", response_model=VirtualLibrary, tags=["Libraries"])
 async def update_library(library_id: str, updated_library_data: VirtualLibrary):
     saved = library_service.update_library(library_id, updated_library_data)
-    # 仅对从未生成过封面的库触发,避免每次保存都重绘
-    if not saved.image_tag:
-        _fire_autogen_cover(saved.id)
+    # 规则变化会改变库内容;由自动生成端点按内容指纹判断,未变化则自动跳过不重绘
+    _fire_autogen_cover(saved.id)
     return saved
 
 
