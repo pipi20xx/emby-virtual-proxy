@@ -82,7 +82,7 @@ async def handle_home_sections(
 
     key = _section_key(full_path)
     if key in ("smalllibrarytiles", "librarybuttons"):
-        return await _handle_small_library_tiles(request, full_path, real_emby_url, session, config)
+        return await _handle_small_library_tiles(request, full_path, real_emby_url, session, config, key)
 
     if key and key.startswith("latestmedia_"):
         vlib_id = key[len("latestmedia_"):]
@@ -255,7 +255,7 @@ async def _handle_home_sections_layout(
 # --- 2. smalllibrarytiles:"我的媒体"磁贴 ---
 
 async def _handle_small_library_tiles(
-    request: Request, full_path: str, real_emby_url: str, session: ClientSession, config: AppConfig
+    request: Request, full_path: str, real_emby_url: str, session: ClientSession, config: AppConfig, key: str
 ) -> Response | None:
     target_url = f"{real_emby_url}/{full_path}"
 
