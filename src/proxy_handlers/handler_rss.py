@@ -1,4 +1,5 @@
 from db_manager import DBManager
+from emby_net import emby_proxy_from_config
 from pathlib import Path
 import requests
 import json
@@ -65,7 +66,7 @@ class RssHandler:
             headers["X-Emby-Token"] = request_params.get("X-Emby-Token")
 
         try:
-            async with session.get(url, params=params, headers=headers) as resp:
+            async with session.get(url, params=params, headers=headers, proxy=emby_proxy_from_config(self.config)) as resp:
                 if resp.status == 200:
                     return (await resp.json()).get("Items", [])
                 return []

@@ -26,7 +26,7 @@ async def handle_system_and_playback_info(
     # 关键功能 1: 欺骗客户端，使其始终通过代理通信
     if ("/System/Info" in full_path or "/system/info/public" in full_path) and method == "GET":
         logger.info(f"Intercepting /System/Info to rewrite URLs for path: {full_path}")
-        async with session.get(target_url, params=params, headers=headers) as resp:
+        async with session.get(target_url, params=params, headers=headers, proxy=emby_proxy_of(request)) as resp:
             if resp.status == 200:
                 content_text = await resp.text()
                 modified_content_text = content_text.replace(real_emby_url, proxy_address)

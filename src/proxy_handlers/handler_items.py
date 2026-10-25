@@ -15,6 +15,7 @@ from . import handler_merger, handler_views
 from ._filter_translator import translate_rules
 from .handler_rss import RssHandler
 from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
+from emby_net import emby_proxy_of
 import db_manager
 logger = logging.getLogger(__name__)
 
@@ -129,7 +130,8 @@ def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) 
 
 
 async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                  real_emby_url: str, headers: Dict[str, str]) -> List[Dict[str, Any]]:
+                                  real_emby_url: str, headers: Dict[str, str],
+                                  proxy: Optional[str] = None) -> List[Dict[str, Any]]:
     """解析虚拟库共享元数据(规则过滤 + 高级筛选 + TMDB 合并),并剥离 UserData。
 
     共享元数据与用户无关,所有用户共用一份;可见性差异由用户叠加层在服务时裁剪。
@@ -145,7 +147,7 @@ async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session
             fetch_params = new_params.copy()
             fetch_params["StartIndex"] = str(start_index)
             fetch_params["Limit"] = str(limit)
-            async with session.get(search_url, params=fetch_params, headers=headers) as resp:
+            async with session.get(search_url, params=fetch_params, headers=headers, proxy=proxy) as resp:
                 if resp.status != 200:
                     logger.warning(f"全量解析 '{vlib.name}' 批次请求失败, Status: {resp.status}")
                     return []
@@ -191,7 +193,8 @@ def store_shared_metadata(vlib, items: List[Dict[str, Any]]) -> None:
 
 
 async def build_user_overlay_data(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                  real_emby_url: str, headers: Dict[str, str]) -> Optional[Dict[str, dict]]:
+                                  real_emby_url: str, headers: Dict[str, str],
+                                  proxy: Optional[str] = None) -> Optional[Dict[str, dict]]:
     """基于共享元数据的条目 Id 分批拉取该用户的 UserData,返回 {条目ID: UserData}。
 
     返回 None 表示构建失败(调用方不应落盘);叠加层缺失的 Id 即该用户不可见的条目。
@@ -214,7 +217,7 @@ async def build_user_overlay_data(config: AppConfig, vlib, user_id: str, session
         if token:
             params["X-Emby-Token"] = token
         try:
-            async with session.get(url, params=params, headers=headers) as resp:
+            async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
                 if resp.status != 200:
                     logger.warning(f"叠加层构建失败:'{vlib.name}' 用户 {user_id} 批次 Status={resp.status}")
                     return None
@@ -246,9 +249,10 @@ def store_user_overlay(vlib, user_id: str, data: Dict[str, dict]) -> None:
 
 
 async def build_and_store_user_overlay(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                       real_emby_url: str, headers: Dict[str, str]) -> Optional[int]:
+                                       real_emby_url: str, headers: Dict[str, str],
+                                       proxy: Optional[str] = None) -> Optional[int]:
     """重建并持久化用户叠加层(预热链路使用),返回叠加条目数;失败返回 None。"""
-    data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers)
+    data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
     if data is None:
         return None
     store_user_overlay(vlib, user_id, data)
@@ -260,7 +264,7 @@ _refreshing_overlay_keys = set()
 
 
 def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                 real_emby_url: str) -> None:
+                                 real_emby_url: str, proxy: Optional[str] = None) -> None:
     """后台重建共享元数据(带去重锁;以管理员 api_key 身份,可见性最全)。"""
     if vlib.id in _refreshing_meta_keys:
         return
@@ -269,7 +273,7 @@ def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session:
     async def _task():
         try:
             headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
-            items = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers)
+            items = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
             if items:
                 store_shared_metadata(vlib, items)
                 logger.info(f"后台重建共享元数据完成:'{vlib.name}' 共 {len(items)} 项。")
@@ -284,7 +288,8 @@ def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session:
 
 
 def _refresh_overlay_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
-                                real_emby_url: str, headers: Dict[str, str]) -> None:
+                                real_emby_url: str, headers: Dict[str, str],
+                                proxy: Optional[str] = None) -> None:
     """后台重建用户叠加层(带去重锁;以该用户身份拉取其 UserData)。"""
     key = (user_id, vlib.id)
     if key in _refreshing_overlay_keys:
@@ -293,7 +298,7 @@ def _refresh_overlay_background(config: AppConfig, vlib, user_id: str, session: 
 
     async def _task():
         try:
-            data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers)
+            data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
             if data is None:
                 logger.warning(f"后台重建用户叠加层失败 ('{vlib.name}' 用户 {user_id})。")
                 return
@@ -331,7 +336,7 @@ def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: s
 
 async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, method: str,
                             session: ClientSession, real_emby_url: str,
-                            request_headers) -> Optional[Response]:
+                            request_headers, proxy: Optional[str] = None) -> Optional[Response]:
     """本地直出:命中分层缓存时在代理端叠加用户状态、排序、分页后直接返回,不再请求 Emby。
 
     共享元数据未命中/硬过期 → 回退实时查询并后台重建;
@@ -354,19 +359,19 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     meta = get_shared_metadata(vlib.id)
     if meta is None:
         logger.info(f"直出元数据未命中('{vlib.name}'),本次实时查询并后台构建共享元数据。")
-        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url)
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
     meta_age = now - int(meta["updated_at"])
     if meta_age > _SERVING_HARD_TTL:
         logger.info(f"直出元数据已硬过期({meta_age // 3600}h),回退实时查询并后台重建。")
-        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url)
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
 
     overlay = get_user_overlay(vlib.id, user_id)
     if overlay is None:
         logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, '{vlib.name}'),本次实时查询并后台构建。")
         headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
-        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers)
+        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
         return None
     overlay_age = now - int(overlay["updated_at"])
 
@@ -383,11 +388,11 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
 
     if meta_age > _SERVING_SOFT_TTL:
         logger.info(f"直出元数据已软过期({meta_age // 3600}h),照常返回并后台重建。")
-        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url)
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
     if overlay_age > _SERVING_SOFT_TTL:
         logger.info(f"用户叠加层已软过期({overlay_age // 3600}h),照常返回并后台重建。")
         headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
-        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers)
+        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
 
     logger.info(f"本地直出:'{vlib.name}' 命中分层缓存(元数据 {len(meta['items'])} 项 / 用户可见 {len(items)} 项)。")
 
@@ -530,7 +535,7 @@ async def handle_virtual_library_items(
     # --- 【【【 RSS 逻辑结束 】】】 ---
 
     # --- 【【【 本地直出：命中解析缓存时不再请求 Emby（访问加速） 】】】 ---
-    served = await try_serve_locally(config, found_vlib, user_id, params, method, session, real_emby_url, request.headers)
+    served = await try_serve_locally(config, found_vlib, user_id, params, method, session, real_emby_url, request.headers, proxy=emby_proxy_of(request))
     if served is not None:
         return served
 
@@ -579,7 +584,7 @@ async def handle_virtual_library_items(
         if is_tmdb_merge_enabled and post_filter_rules:
             logger.warning("TMDB合并已启用，但存在无法翻译的后筛选规则，合并将在当前页进行，可能不完整。")
 
-        async with session.request(method, search_url, params=new_params, headers=headers_to_forward) as resp:
+        async with session.request(method, search_url, params=new_params, headers=headers_to_forward, proxy=emby_proxy_of(request)) as resp:
             if resp.status != 200:
                 content = await resp.read()
                 return Response(content=content, status_code=resp.status, headers=resp.headers)
@@ -631,7 +636,7 @@ async def handle_virtual_library_items(
             fetch_params["Limit"] = str(limit)
             
             logger.debug(f"正在获取批次: StartIndex={start_index}, Limit={limit}")
-            async with session.request(method, search_url, params=fetch_params, headers=headers_to_forward) as resp:
+            async with session.request(method, search_url, params=fetch_params, headers=headers_to_forward, proxy=emby_proxy_of(request)) as resp:
                 if resp.status != 200:
                     logger.error(f"获取批次失败，状态码: {resp.status}")
                     # 返回错误或一个空的成功响应

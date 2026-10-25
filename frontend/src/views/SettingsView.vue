@@ -37,6 +37,13 @@
               placeholder="在 Emby 控制台 -> 高级 -> API 密钥 中生成"
               :rules="[rules.required('Emby API 密钥')]"
             />
+            <v-text-field
+              v-model="draft.emby_proxy"
+              label="Emby 连接代理(可选)"
+              placeholder="留空直连;例如 http://user:pass@127.0.0.1:7890"
+              hint="代理核心与管理后台访问 Emby 的所有请求(浏览转发、季/集合并、封面素材下载等)都会经由该代理,适合 Emby 与代理不在同一网络的环境。仅支持 HTTP 代理;保存后即时生效,无需重启。"
+              persistent-hint
+            />
           </v-card-text>
         </v-card>
 

@@ -45,6 +45,7 @@ def _read_from_disk():
                 data.setdefault('show_missing_episodes', False)
                 data.setdefault('tmdb_api_key', "")
                 data.setdefault('tmdb_proxy', "")
+                data.setdefault('emby_proxy', "")
             return AppConfig.model_validate(data)
 
     except Exception as e:

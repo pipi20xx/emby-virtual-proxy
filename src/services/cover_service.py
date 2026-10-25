@@ -40,6 +40,7 @@ from PIL import Image
 
 import app_paths
 import config_manager
+from emby_net import emby_proxy_from_config
 from models import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -81,10 +82,12 @@ def save_temp_image(file: UploadFile) -> Path:
 async def _download_materials(selected_items: List[dict], temp_dir: Path, config: AppConfig, headers: Dict) -> None:
     """并发下载项目主封面到临时目录,全部失败则抛错。"""
 
+    proxy = emby_proxy_from_config(config)
+
     async def download_image(session: aiohttp.ClientSession, item: dict, index: int) -> bool:
         image_url = f"{config.emby_url.rstrip('/')}/emby/Items/{item['Id']}/Images/Primary"
         try:
-            async with session.get(image_url, headers=headers, timeout=20) as response:
+            async with session.get(image_url, headers=headers, timeout=20, proxy=proxy) as response:
                 if response.status == 200:
                     content = await response.read()
                     with open(temp_dir / f"{index}.jpg", "wb") as f:

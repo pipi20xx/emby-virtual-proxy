@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 _INDEX_FETCH_PAGE = 500
 
 
-async def rebuild_index_from_emby(session, real_emby_url: str, headers: Dict[str, str]) -> int:
+async def rebuild_index_from_emby(session, real_emby_url: str, headers: Dict[str, str],
+                                  proxy: str | None = None) -> int:
     """从 Emby 全量拉取带 TMDB ID 的媒体项并重建索引,返回条目数;失败抛异常。"""
     entries: List[Dict[str, str]] = []
     start, limit = 0, _INDEX_FETCH_PAGE
@@ -37,7 +38,8 @@ async def rebuild_index_from_emby(session, real_emby_url: str, headers: Dict[str
             "StartIndex": str(start),
             "Limit": str(limit),
         }
-        async with session.get(f"{real_emby_url}/emby/Items", params=params, headers=headers) as resp:
+        async with session.get(f"{real_emby_url}/emby/Items", params=params, headers=headers,
+                               proxy=proxy) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"索引重建批次请求失败 Status={resp.status}")
             batch = (await resp.json(content_type=None)).get("Items", [])
@@ -90,5 +92,6 @@ async def rebuild_if_stale(session, real_emby_url: str, headers: Dict[str, str])
     if not need:
         return {"rebuilt": False, "count": count_now}
 
-    count = await rebuild_index_from_emby(session, real_emby_url, headers)
+    count = await rebuild_index_from_emby(session, real_emby_url, headers,
+                                          proxy=(config.emby_proxy or "").strip() or None)
     return {"rebuilt": True, "count": count}

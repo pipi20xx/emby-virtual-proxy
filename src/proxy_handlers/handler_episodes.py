@@ -7,6 +7,7 @@ import re
 from fastapi import Request, Response
 from aiohttp import ClientSession
 from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
+from emby_net import emby_proxy_of
 from config_manager import load_config
 
 logger = logging.getLogger(__name__)
@@ -32,18 +33,19 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     
     # --- 【【【 新增的资格检查 】】】 ---
     should_merge = await is_item_in_a_merge_enabled_vlib(
-        session, real_emby_url, user_id, series_id_from_path, headers, auth_token_param
+        session, real_emby_url, user_id, series_id_from_path, headers, auth_token_param,
+        proxy=emby_proxy_of(request)
     )
     if not should_merge:
         return None
     # --- 资格检查结束 ---
 
     try:
-        tmdb_id = await resolve_tmdb_id_for_item(session, real_emby_url, user_id, series_id_from_path, headers, auth_token_param)
+        tmdb_id = await resolve_tmdb_id_for_item(session, real_emby_url, user_id, series_id_from_path, headers, auth_token_param, proxy=emby_proxy_of(request))
 
         season_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{season_id}"
         season_params = {'Fields': 'IndexNumber', **auth_token_param}
-        async with session.get(season_url, params=season_params, headers=headers) as resp:
+        async with session.get(season_url, params=season_params, headers=headers, proxy=emby_proxy_of(request)) as resp:
             target_season_number = (await resp.json()).get("IndexNumber")
 
     except Exception as e:
@@ -57,7 +59,7 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     tmdb_api_key = config.tmdb_api_key
     tmdb_proxy = config.tmdb_proxy
 
-    original_series_ids = await find_all_series_by_tmdb_id(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param)
+    original_series_ids = await find_all_series_by_tmdb_id(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=emby_proxy_of(request))
     
     # 如果不显示缺失剧集，并且只有一个库，那么就没必要继续执行了
     if not show_missing and len(original_series_ids) < 2:
@@ -68,7 +70,7 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     async def fetch_episodes(series_id: str):
         seasons_url = f"{real_emby_url}/emby/Shows/{series_id}/Seasons"
         try:
-            async with session.get(seasons_url, params=auth_token_param, headers=headers) as resp:
+            async with session.get(seasons_url, params=auth_token_param, headers=headers, proxy=emby_proxy_of(request)) as resp:
                 seasons = (await resp.json()).get("Items", [])
             
             # 找到这个剧集里，与我们目标季号相同的那个季的ID
@@ -82,7 +84,7 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
             episode_params.pop("Limit", None)
             episode_params.pop("StartIndex", None)
             
-            async with session.get(episodes_url, params=episode_params, headers=headers) as resp:
+            async with session.get(episodes_url, params=episode_params, headers=headers, proxy=emby_proxy_of(request)) as resp:
                 return (await resp.json()).get("Items", []) if resp.status == 200 else []
         except Exception: return []
 
@@ -106,7 +108,7 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
             # 获取当前剧集信息以用于填充缺失剧集
             series_info_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{series_id_from_path}"
             series_info_params = {**auth_token_param}
-            async with session.get(series_info_url, params=series_info_params, headers=headers) as resp:
+            async with session.get(series_info_url, params=series_info_params, headers=headers, proxy=emby_proxy_of(request)) as resp:
                 series_info = await resp.json()
 
             for tmdb_episode in tmdb_episodes:

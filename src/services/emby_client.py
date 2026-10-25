@@ -13,6 +13,7 @@ import aiohttp
 from fastapi import HTTPException
 
 import config_manager
+from emby_net import emby_proxy_from_config
 from models import AppConfig
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,8 @@ async def fetch_items(endpoint: str, params: Dict = None, config: Optional[AppCo
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
+            async with session.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT_SECONDS,
+                                   proxy=emby_proxy_from_config(cfg)) as response:
                 if response.status != 200:
                     error_text = await response.text()
                     msg = f"从Emby获取数据失败 (Endpoint: {endpoint}, Status: {response.status}): {error_text}"

@@ -15,6 +15,7 @@ from . import handler_autogen
 from ._filter_translator import translate_rules
 from .handler_items import _apply_post_filter
 from .handler_images import cover_file_exists
+from emby_net import emby_proxy_of
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +175,7 @@ async def handle_home_latest_items(
     target_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
     logger.debug(f"HOME_LATEST_HANDLER: Forwarding to URL={target_url}, Params={new_params}")
 
-    async with session.get(target_url, params=new_params, headers=headers_to_forward) as resp:
+    async with session.get(target_url, params=new_params, headers=headers_to_forward, proxy=emby_proxy_of(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             content = await resp.read(); return Response(content=content, status_code=resp.status, headers={"Content-Type": resp.headers.get("Content-Type")})
 

@@ -59,6 +59,8 @@ export interface VirtualLibrary {
 export interface AppConfig {
   emby_url: string
   emby_api_key: string
+  /** 访问 Emby 上游的 HTTP 代理(http://[user:pass@]host:port),留空直连 */
+  emby_proxy: string
   emby_server_id: string | null
   log_level: string
   display_order: string[]
@@ -178,6 +180,7 @@ export function createDefaultConfig(): AppConfig {
   return {
     emby_url: '',
     emby_api_key: '',
+    emby_proxy: '',
     emby_server_id: null,
     log_level: 'info',
     display_order: [],

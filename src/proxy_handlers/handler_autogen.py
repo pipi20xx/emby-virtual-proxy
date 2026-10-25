@@ -10,6 +10,7 @@ from pathlib import Path
 import aiohttp
 
 import config_manager
+from emby_net import emby_proxy_from_config
 from services import cover_service
 
 logger = logging.getLogger(__name__)
@@ -95,13 +96,14 @@ async def generate_poster_in_background(library_id: str, user_id: str, api_key: 
             image_url = f"{config.emby_url.rstrip('/')}/emby/Items/{item['Id']}/Images/Primary"
             download_headers = {'X-Emby-Token': api_key} # 使用正确的api_key
             try:
-                async with session.get(image_url, headers=download_headers, timeout=20) as response:
+                async with session.get(image_url, headers=download_headers, timeout=20, proxy=proxy) as response:
                     if response.status == 200:
                         with open(temp_dir / f"{index}.jpg", "wb") as f: f.write(await response.read())
                         return True
             except Exception: return False
             return False
 
+        proxy = emby_proxy_from_config(config)
         async with aiohttp.ClientSession() as session:
             tasks = [download_image(session, item, i + 1) for i, item in enumerate(selected_items)]
             results = await asyncio.gather(*tasks)

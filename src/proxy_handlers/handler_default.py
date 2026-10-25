@@ -4,6 +4,8 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse, Response
 from aiohttp import ClientSession, ClientError
 
+from emby_net import emby_proxy_of
+
 logger = logging.getLogger(__name__)
 
 async def forward_request(
@@ -34,7 +36,8 @@ async def forward_request(
             params=request.query_params,
             headers=headers,
             data=request.stream(),
-            allow_redirects=False # 让客户端自己处理重定向，这是反向代理的标准行为
+            allow_redirects=False, # 让客户端自己处理重定向，这是反向代理的标准行为
+            proxy=emby_proxy_of(request)
         )
 
         # 定义一个异步生成器，用于逐块读取来自 Emby 服务器的响应体并将其 yield 出去。

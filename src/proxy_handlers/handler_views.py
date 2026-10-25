@@ -11,6 +11,7 @@ from pathlib import Path
 # 【新增】导入后台生成处理器和任务锁
 from . import handler_autogen
 from .handler_images import cover_file_exists
+from emby_net import emby_proxy_of
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ async def handle_view_injection(
     target_url = f"{real_emby_url}/{full_path}"
     params = request.query_params
 
-    async with session.get(target_url, params=params, headers=_forward_headers(request)) as resp:
+    async with session.get(target_url, params=params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             return None
 
@@ -154,7 +155,7 @@ async def legacy_handle_view_injection(request: Request, full_path: str, method:
     target_url = f"{real_emby_url}/{full_path}"
     params = request.query_params
 
-    async with session.get(target_url, params=params, headers=_forward_headers(request)) as resp:
+    async with session.get(target_url, params=params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status == 200 and "application/json" in resp.headers.get("Content-Type", ""):
             content_json = await resp.json()
             if content_json.get("Items"):

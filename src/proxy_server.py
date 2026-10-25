@@ -4,6 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 import aiohttp
+from emby_net import emby_proxy_from_config
 # 【【【 修改这一行 】】】
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -102,6 +103,7 @@ async def _list_emby_users(config) -> List[str]:
             f"{config.emby_url.rstrip('/')}/emby/Users",
             headers={"X-Emby-Token": config.emby_api_key or ""},
             timeout=aiohttp.ClientTimeout(total=15),
+            proxy=emby_proxy_from_config(config),
         ) as resp:
             if resp.status == 200:
                 users = await resp.json(content_type=None)
@@ -177,6 +179,7 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
         items = await handler_items.resolve_shared_metadata(
             config, vlib, user_id, proxy_app.state.aiohttp_session,
             config.emby_url.rstrip('/'), internal_headers,
+            proxy=emby_proxy_from_config(config),
         )
         if not items:
             raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则")
@@ -196,6 +199,7 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
                     count = await handler_items.build_and_store_user_overlay(
                         config, vlib, uid, proxy_app.state.aiohttp_session,
                         config.emby_url.rstrip('/'), internal_headers,
+                        proxy=emby_proxy_from_config(config),
                     )
                     if count is None:
                         logger.warning(f"叠加层预热失败:库 '{vlib.name}' 用户 {uid}。")
@@ -361,8 +365,9 @@ async def websocket_proxy(client_ws: WebSocket, full_path: str):
     session = proxy_app.state.aiohttp_session
     try:
         headers = {k: v for k, v in client_ws.headers.items() if k.lower() not in ['host', 'connection', 'upgrade', 'sec-websocket-key', 'sec-websocket-version']}
-        
-        async with session.ws_connect(target_url, params=client_ws.query_params, headers=headers) as server_ws:
+
+        async with session.ws_connect(target_url, params=client_ws.query_params, headers=headers,
+                                      proxy=emby_proxy_from_config(config)) as server_ws:
 
             async def forward_client_to_server():
                 try:
@@ -403,6 +408,9 @@ async def websocket_proxy(client_ws: WebSocket, full_path: str):
 async def reverse_proxy(request: Request, full_path: str):
     config = config_manager.load_config()
     real_emby_url = config.emby_url.rstrip('/')
+    # 本请求访问 Emby 上游应使用的代理(留空直连);handler 内通过 emby_proxy_of(request) 读取
+    request.state.emby_proxy = emby_proxy_from_config(config)
+    request.state.real_emby_url = real_emby_url
     
     cache_key = None
     if config.enable_cache and not proxy_cache.api_cache_disabled:

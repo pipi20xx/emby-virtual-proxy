@@ -7,6 +7,7 @@ from aiohttp import ClientSession
 
 import config_manager
 import db_manager
+from emby_net import emby_proxy_of
 from proxy_cache import vlib_metadata_cache
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,8 @@ def _is_item_in_merge_vlib_via_metadata(item_id: str) -> Optional[bool]:
 
 
 async def is_item_in_a_merge_enabled_vlib(
-    session: ClientSession, real_emby_url: str, user_id: str, item_id: str, headers: Dict, auth_token_param: Dict
+    session: ClientSession, real_emby_url: str, user_id: str, item_id: str, headers: Dict, auth_token_param: Dict,
+    proxy: Optional[str] = None
 ) -> bool:
     """
     检查给定的 item_id 是否属于任何一个启用了 TMDB 合并功能的虚拟库。
@@ -67,7 +69,7 @@ async def is_item_in_a_merge_enabled_vlib(
 
     item = None
     try:
-        async with session.get(item_details_url, params=item_params, headers=headers) as resp:
+        async with session.get(item_details_url, params=item_params, headers=headers, proxy=proxy) as resp:
             if resp.status != 200:
                 logger.warning(f"MERGE_CHECK: 无法获取项目 {item_id} 的详情。状态码: {resp.status}")
                 return False
@@ -123,7 +125,8 @@ async def is_item_in_a_merge_enabled_vlib(
 
 
 async def _validate_ids_visible(
-    session: ClientSession, real_emby_url: str, user_id: str, ids: List[str], headers: Dict, auth_token_param: Dict
+    session: ClientSession, real_emby_url: str, user_id: str, ids: List[str], headers: Dict, auth_token_param: Dict,
+    proxy: Optional[str] = None
 ) -> List[str]:
     """批量校验条目对当前用户是否可见,返回实际可见的 Id 列表。"""
     visible: List[str] = []
@@ -137,7 +140,7 @@ async def _validate_ids_visible(
             **auth_token_param,
         }
         try:
-            async with session.get(f"{real_emby_url}/emby/Users/{user_id}/Items", params=params, headers=headers) as resp:
+            async with session.get(f"{real_emby_url}/emby/Users/{user_id}/Items", params=params, headers=headers, proxy=proxy) as resp:
                 if resp.status != 200:
                     logger.warning(f"TMDB_INDEX: Ids 校验批次失败 Status={resp.status}。")
                     return []
@@ -151,7 +154,8 @@ async def _validate_ids_visible(
 
 
 async def find_all_series_by_tmdb_id(
-    session: ClientSession, real_emby_url: str, user_id: str, tmdb_id: str, headers: Dict, auth_token_param: Dict
+    session: ClientSession, real_emby_url: str, user_id: str, tmdb_id: str, headers: Dict, auth_token_param: Dict,
+    proxy: Optional[str] = None
 ) -> List[str]:
     """按 TMDB ID 查找全部关联剧集。
 
@@ -160,19 +164,19 @@ async def find_all_series_by_tmdb_id(
     索引关闭时:直接走旧的全局遍历方案(不读写索引)。
     """
     if not config_manager.load_config().enable_tmdb_index:
-        return await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param)
+        return await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=proxy)
 
     entries = db_manager.find_items_by_tmdb(tmdb_id, "Series")
     if entries:
         candidate_ids = [e["emby_item_id"] for e in entries]
-        visible_ids = await _validate_ids_visible(session, real_emby_url, user_id, candidate_ids, headers, auth_token_param)
+        visible_ids = await _validate_ids_visible(session, real_emby_url, user_id, candidate_ids, headers, auth_token_param, proxy=proxy)
         if visible_ids:
             logger.info(f"TMDB_INDEX: 索引命中 tmdb_id={tmdb_id},候选 {len(candidate_ids)},用户可见 {len(visible_ids)}。")
             return list(set(visible_ids))
         # 索引有但校验全失效:可能索引过期,回退遍历兜底(下一轮预热会重建索引)
         logger.info(f"TMDB_INDEX: 索引条目全部校验失效 (tmdb_id={tmdb_id}),回退全局遍历。")
 
-    found_ids = await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param)
+    found_ids = await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=proxy)
 
     if found_ids:
         # 自愈回写:把遍历结果写进索引,后续请求直接走索引
@@ -186,7 +190,8 @@ async def find_all_series_by_tmdb_id(
 
 
 async def _find_all_series_by_tmdb_id_traversal(
-    session: ClientSession, real_emby_url: str, user_id: str, tmdb_id: str, headers: Dict, auth_token_param: Dict
+    session: ClientSession, real_emby_url: str, user_id: str, tmdb_id: str, headers: Dict, auth_token_param: Dict,
+    proxy: Optional[str] = None
 ) -> List[str]:
     """旧方案兜底:全库遍历所有剧集后按 TMDB ID 过滤(仅索引未命中时使用)。"""
     search_url = f"{real_emby_url}/emby/Items"
@@ -200,7 +205,7 @@ async def _find_all_series_by_tmdb_id_traversal(
     }
     logger.info(f"TMDB_INDEX: 执行全局剧集遍历兜底搜索 (TMDB ID: {tmdb_id})")
     try:
-        async with session.get(search_url, params=search_params, headers=headers, timeout=120) as resp:
+        async with session.get(search_url, params=search_params, headers=headers, timeout=120, proxy=proxy) as resp:
             if resp.status == 200:
                 data = await resp.json()
                 all_series = data.get("Items", [])
@@ -218,7 +223,8 @@ async def _find_all_series_by_tmdb_id_traversal(
 
 
 async def resolve_tmdb_id_for_item(
-    session: ClientSession, real_emby_url: str, user_id: str, item_id: str, headers: Dict, auth_token_param: Dict
+    session: ClientSession, real_emby_url: str, user_id: str, item_id: str, headers: Dict, auth_token_param: Dict,
+    proxy: Optional[str] = None
 ) -> Optional[str]:
     """获取条目的 TMDB ID:索引开启时优先反查索引(零网络请求),未索引时回退详情请求并回写;
     索引关闭时直接走详情请求。"""
@@ -232,7 +238,7 @@ async def resolve_tmdb_id_for_item(
 
     item_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{item_id}"
     try:
-        async with session.get(item_url, params={'Fields': 'ProviderIds', **auth_token_param}, headers=headers) as resp:
+        async with session.get(item_url, params={'Fields': 'ProviderIds', **auth_token_param}, headers=headers, proxy=proxy) as resp:
             if resp.status != 200:
                 return None
             item = await resp.json()

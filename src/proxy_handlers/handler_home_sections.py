@@ -24,6 +24,7 @@ from aiohttp import ClientSession
 from models import AppConfig, VirtualLibrary
 
 from . import handler_merger, handler_views
+from emby_net import emby_proxy_of
 from .handler_views import apply_full_layout, apply_legacy_layout
 from ._filter_translator import translate_rules
 from .handler_items import _apply_post_filter
@@ -117,7 +118,7 @@ async def _handle_home_sections_layout(
 ) -> Response | None:
     target_url = f"{real_emby_url}/{full_path}"
 
-    async with session.get(target_url, params=request.query_params, headers=_forward_headers(request)) as resp:
+    async with session.get(target_url, params=request.query_params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             return None
         sections = await resp.json()
@@ -160,7 +161,7 @@ async def _handle_small_library_tiles(
 ) -> Response | None:
     target_url = f"{real_emby_url}/{full_path}"
 
-    async with session.get(target_url, params=request.query_params, headers=_forward_headers(request)) as resp:
+    async with session.get(target_url, params=request.query_params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             return None
         data = await resp.json()
@@ -239,7 +240,7 @@ async def _handle_vlib_latest_media(
     # 'all' 类型不加资源过滤,即取全库最新
 
     target_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
-    async with session.get(target_url, params=new_params, headers=_forward_headers(request)) as resp:
+    async with session.get(target_url, params=new_params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             return None
 

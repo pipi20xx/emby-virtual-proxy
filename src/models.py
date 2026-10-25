@@ -48,6 +48,7 @@ class AppConfig(BaseModel):
     emby_url: str = Field(default="http://127.0.0.1:8096")
     emby_api_key: Optional[str] = Field(default="")
     emby_server_id: Optional[str] = Field(default=None) # 新增：用于TMDB缓存占位符的备用服务器ID
+    emby_proxy: Optional[str] = Field(default="") # 新增：访问 Emby 上游的 HTTP 代理(留空直连)
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info")
     display_order: List[str] = Field(default_factory=list)
     hide: List[str] = Field(default_factory=list)
