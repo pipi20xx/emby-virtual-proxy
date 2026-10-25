@@ -19,6 +19,7 @@ CONFIG_DIR = PROJECT_ROOT / "config"           # 容器内 /app/config (docker-c
 CONFIG_FILE_PATH = CONFIG_DIR / "config.json"
 COVERS_DIR = CONFIG_DIR / "images"             # 生成的虚拟库封面
 TEMP_IMAGE_DIR = CONFIG_DIR / "temp_images"    # 前端上传的临时封面素材
+LOG_DIR = CONFIG_DIR / "logs"                  # 运行日志(按天滚动,随 config 卷持久化到宿主机)
 
 ASSETS_DIR = SRC_DIR / "assets"
 FONTS_DIR = ASSETS_DIR / "fonts"

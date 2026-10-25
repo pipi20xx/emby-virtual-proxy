@@ -94,6 +94,7 @@ const navItems = [
   { routeName: 'libraries', icon: 'mdi-library-shelves', title: '虚拟媒体库' },
   { routeName: 'filters', icon: 'mdi-filter-cog-outline', title: '高级筛选器' },
   { routeName: 'layout', icon: 'mdi-view-dashboard-edit-outline', title: '主页布局' },
+  { routeName: 'logs', icon: 'mdi-console-line', title: '运行日志' },
   { routeName: 'settings', icon: 'mdi-cog-outline', title: '系统设置' },
 ]
 

@@ -33,6 +33,7 @@ export default defineConfig({
     proxy: {
       '/api': { target: DEV_PROXY_TARGET, changeOrigin: true },
       '/covers': { target: DEV_PROXY_TARGET, changeOrigin: true },
+      '/ws': { target: DEV_PROXY_TARGET, ws: true, changeOrigin: true },
     },
   },
   build: {

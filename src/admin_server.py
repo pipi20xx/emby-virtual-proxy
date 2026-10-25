@@ -19,17 +19,21 @@ import sys
 from typing import List, Optional
 
 import aiohttp
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, Query, File, UploadFile
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Response, Query, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+from logger import init_logging, LogBroadcaster
+
+# 日志初始化须先于下方项目模块导入,导入期的日志才能进入文件与实时流
+init_logging("admin", level=logging.INFO, console_format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 import app_paths
 import config_manager
 from models import AppConfig, VirtualLibrary, AdvancedFilter
-from services import auth_service, cover_service, library_service, rss_service, system_service, vlib_cache_service
+from services import auth_service, cover_service, library_service, log_service, rss_service, system_service, vlib_cache_service
 from services.emby_client import fetch_items
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 admin_app = FastAPI(title="Emby Virtual Proxy - Admin API")
@@ -355,6 +359,44 @@ async def restart_proxy_container():
     return await system_service.restart_proxy_container()
 
 
+# --- 运行日志实时流(WebSocket;必须注册在 "/" 静态挂载之前) ---
+
+@admin_app.websocket("/ws/system/logs")
+async def websocket_logs(websocket: WebSocket):
+    """实时日志推送:连接后先回填内存历史,再持续转发广播。
+
+    浏览器 WS 握手无法携带自定义 header,鉴权走 ?token=;
+    管理密码未启用时直接放行;鉴权失败以 4401 关闭,前端据此不重试。
+    """
+    await websocket.accept()
+    config = config_manager.load_config()
+    if auth_service.is_enabled(config) and not auth_service.verify(websocket.query_params.get("token") or ""):
+        await websocket.close(code=4401)
+        return
+
+    queue = LogBroadcaster.subscribe()
+
+    async def _forward():
+        try:
+            for message in LogBroadcaster.history_snapshot():
+                await websocket.send_text(message)
+            while True:
+                message = await queue.get()
+                await websocket.send_text(message)
+        except Exception:
+            pass
+
+    forward_task = asyncio.create_task(_forward())
+    try:
+        while True:
+            await websocket.receive_text()  # 保活排空;客户端断开在此抛出
+    except WebSocketDisconnect:
+        pass
+    finally:
+        forward_task.cancel()
+        LogBroadcaster.unsubscribe(queue)
+
+
 admin_app.include_router(api_router)
 
 # --- 静态资源:前端构建产物与生成的封面 ---
@@ -377,6 +419,9 @@ admin_app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="st
 
 @admin_app.on_event("startup")
 async def startup_event():
+    # 记录主事件循环(工作线程日志回投用),并启动 proxy 日志文件尾随转发
+    LogBroadcaster.set_loop(asyncio.get_running_loop())
+    admin_app.state.log_tail_task = asyncio.create_task(log_service.tail_proxy_logs())
     rss_service.start_scheduler()
     rss_service.reschedule_refresh_job(config_manager.load_config())
     config = config_manager.load_config()
@@ -387,5 +432,6 @@ async def startup_event():
 
 @admin_app.on_event("shutdown")
 async def shutdown_event():
+    admin_app.state.log_tail_task.cancel()
     rss_service.shutdown_scheduler()
     vlib_cache_service.shutdown_scheduler()

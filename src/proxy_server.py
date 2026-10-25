@@ -12,6 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Tuple, Dict, List, Optional
 
+from logger import init_logging, LogBroadcaster
+
+# 日志初始化须先于下方项目模块导入,导入期的日志才能进入文件与实时流
+init_logging("proxy", level=logging.DEBUG)
+
 # 【【【 同时修改这一行，从 proxy_cache 导入两个缓存实例 】】】
 # api_cache 经 proxy_cache.api_cache 间接访问(TTL 可配置时会重建实例)
 import proxy_cache
@@ -33,7 +38,6 @@ from proxy_handlers import (
     handler_autogen
 )
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 def get_cache_key(request: Request, full_path: str) -> str:
@@ -48,6 +52,8 @@ def get_cache_key(request: Request, full_path: str) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 记录主事件循环,后台工作线程产生的日志经此回投进实时广播
+    LogBroadcaster.set_loop(asyncio.get_running_loop())
     app.state.aiohttp_session = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()); logger.info("Global AIOHTTP ClientSession created.")
     # 按配置应用 API 响应缓存 TTL
     proxy_cache.set_api_cache_ttl(config_manager.load_config().api_cache_ttl)

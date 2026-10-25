@@ -50,6 +50,12 @@ const router = createRouter({
       component: () => import('@/views/SettingsView.vue'),
       meta: { title: '系统设置' },
     },
+    {
+      path: '/logs',
+      name: 'logs',
+      component: () => import('@/views/LogsView.vue'),
+      meta: { title: '运行日志' },
+    },
     { path: '/:pathMatch(.*)*', redirect: { name: 'libraries' } },
   ],
 })
