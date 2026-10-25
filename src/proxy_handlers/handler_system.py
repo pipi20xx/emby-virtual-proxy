@@ -4,6 +4,8 @@ import logging
 from fastapi import Request, Response
 from aiohttp import ClientSession
 
+from emby_net import emby_proxy_of
+
 logger = logging.getLogger(__name__)
 
 async def handle_system_and_playback_info(
