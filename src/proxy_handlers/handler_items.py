@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from fastapi import Request, Response
 from aiohttp import ClientSession
@@ -102,7 +103,30 @@ def _apply_post_filter(items: List[Dict[str, Any]], post_filter_rules: List[Dict
 # ================= 本地直出(访问加速) =================
 
 def _extract_token(headers: Dict[str, str]) -> Optional[str]:
-    return headers.get("X-Emby-Token") or headers.get("x-emby-token")
+    for key, value in headers.items():
+        if key.lower() == "x-emby-token" and value:
+            return value
+    # 部分客户端只在 X-Emby-Authorization 里携带令牌(Token="...")
+    for key, value in headers.items():
+        if key.lower() == "x-emby-authorization" and value:
+            m = re.search(r'Token="([^"]+)"', value)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _build_user_forward_headers(request_headers, params) -> Dict[str, str]:
+    """按白名单收集用户请求头,并在缺失时从查询参数补齐令牌。
+
+    Emby Web 等客户端把令牌放在 URL 查询参数(X-Emby-Token / api_key)而非请求头,
+    只转发请求头会让后台请求无凭证,被 Emby 以 401 拒绝。
+    """
+    headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
+    if not _extract_token(headers):
+        token = next((v for k, v in params.items() if k.lower() in ("x-emby-token", "api_key")), None)
+        if token:
+            headers["X-Emby-Token"] = token
+    return headers
 
 
 def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) -> Tuple[Dict[str, Any], List[Dict]]:
@@ -219,7 +243,8 @@ async def build_user_overlay_data(config: AppConfig, vlib, user_id: str, session
         try:
             async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
                 if resp.status != 200:
-                    logger.warning(f"叠加层构建失败:'{vlib.name}' 用户 {user_id} 批次 Status={resp.status}")
+                    body_snippet = (await resp.text())[:200].replace("\n", " ")
+                    logger.warning(f"叠加层构建失败:'{vlib.name}' 用户 {user_id} 批次 Status={resp.status} Body={body_snippet}")
                     return None
                 for it in (await resp.json(content_type=None)).get("Items", []):
                     if it.get("Id"):
@@ -370,7 +395,7 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     overlay = get_user_overlay(vlib.id, user_id)
     if overlay is None:
         logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, '{vlib.name}'),本次实时查询并后台构建。")
-        headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
+        headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
         return None
     overlay_age = now - int(overlay["updated_at"])
@@ -391,7 +416,7 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
     if overlay_age > _SERVING_SOFT_TTL:
         logger.info(f"用户叠加层已软过期({overlay_age // 3600}h),照常返回并后台重建。")
-        headers = {k: v for k, v in request_headers.items() if k.lower() in _FORWARDABLE_HEADERS}
+        headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
 
     logger.info(f"本地直出:'{vlib.name}' 命中分层缓存(元数据 {len(meta['items'])} 项 / 用户可见 {len(items)} 项)。")
@@ -450,14 +475,16 @@ async def handle_virtual_library_items(
     
     if not found_vlib:
         # 兼容Go版本的后备方案：处理非标准客户端（如网易爆米花）的请求
-        # 这些客户端通过 /Users/xxx/Items 获取根视图，且请求参数中不含任何 'Id'
-        has_id_param = any(key.lower().endswith('id') for key in params.keys())
-        
-        if not has_id_param:
-            logger.info("检测到非标准客户端请求 (无 'Id' 后缀参数)，作为后备方案返回媒体库视图。")
-            # 调用 handler_views 中的逻辑来返回一个伪造的根视图
-            return await handler_views.handle_view_injection(request, full_path, method, real_emby_url, session, config)
-        
+        # 这些客户端通过 /Users/xxx/Views 获取根视图，且请求参数中不含任何 'Id'
+        # 仅在视图类路径上触发;图片等其它无 Id 参数的请求直接放行转发
+        if method == "GET" and "Users" in full_path and "/Views" in full_path:
+            has_id_param = any(key.lower().endswith('id') for key in params.keys())
+
+            if not has_id_param:
+                logger.info("检测到非标准客户端请求 (无 'Id' 后缀参数)，作为后备方案返回媒体库视图。")
+                # 调用 handler_views 中的逻辑来返回一个伪造的根视图
+                return await handler_views.handle_view_injection(request, full_path, method, real_emby_url, session, config)
+
         # 如果有 'Id' 参数但不是虚拟库，则为正常请求，放行
         return None
 
