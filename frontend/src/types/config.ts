@@ -29,6 +29,8 @@ export interface AdvancedFilter {
   id: string
   name: string
   match_all: boolean
+  /** 执行模式:native = Emby 原生参数优先(历史行为);local = 代理裸拉全量后本地评估(新默认) */
+  execution_mode?: 'native' | 'local'
   rules: AdvancedFilterRule[]
 }
 

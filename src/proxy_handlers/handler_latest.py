@@ -12,7 +12,7 @@ from pathlib import Path
 from . import handler_merger
 # 【新增】导入后台生成处理器
 from . import handler_autogen
-from ._filter_translator import translate_rules
+from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
 from .handler_images import cover_file_exists
 from emby_net import emby_proxy_of
@@ -126,12 +126,13 @@ async def handle_home_latest_items(
     new_params["IncludeItemTypes"] = "Movie,Series,Video"
     
     post_filter_rules = []
+    match_all = True
     if found_vlib.advanced_filter_id:
-        adv_filter = next((f for f in config.advanced_filters if f.id == found_vlib.advanced_filter_id), None)
-        if adv_filter:
-            emby_native_params, post_filter_rules = translate_rules(adv_filter.rules)
-            new_params.update(emby_native_params)
-            logger.info(f"HOME_LATEST_HANDLER: 应用了 {len(emby_native_params)} 条原生筛选规则。")
+        # 原生模式:可翻译规则进查询参数;本地全量模式:全部规则本地评估
+        # (本路径以用户令牌查询,响应自带该用户的 UserData,用户态规则同样可评估)
+        emby_native_params, post_filter_rules, match_all = resolve_for_user_query(config, found_vlib)
+        new_params.update(emby_native_params)
+        logger.info(f"HOME_LATEST_HANDLER: 应用了 {len(emby_native_params)} 条原生筛选参数 / {len(post_filter_rules)} 条本地评估规则。")
     
     is_tmdb_merge_enabled = found_vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id
     if post_filter_rules or is_tmdb_merge_enabled:
@@ -183,7 +184,7 @@ async def handle_home_latest_items(
         items_list = data.get("Items", [])
 
         if post_filter_rules:
-            items_list = _apply_post_filter(items_list, post_filter_rules)
+            items_list = _apply_post_filter(items_list, post_filter_rules, match_all=match_all)
 
         if is_tmdb_merge_enabled:
             items_list = await handler_merger.merge_items_by_tmdb(items_list)

@@ -16,6 +16,9 @@
           <v-chip size="small" variant="tonal" :color="filter.match_all ? 'primary' : 'warning'">
             匹配{{ filter.match_all ? '所有' : '任意' }}条件
           </v-chip>
+          <v-chip size="small" variant="tonal" :color="isLocalMode(filter) ? 'success' : 'default'">
+            {{ isLocalMode(filter) ? '本地全量' : 'Emby 原生' }}
+          </v-chip>
           <span class="text-caption text-medium-emphasis">共 {{ filter.rules.length }} 条规则</span>
           <v-spacer />
           <v-btn icon="mdi-pencil-outline" variant="text" title="编辑" @click="openEdit(filter)" />
@@ -56,19 +59,64 @@
             :rules="[rules.required('筛选器名称')]"
           />
 
+          <!-- 执行模式:决定规则由谁评估 -->
+          <div>
+            <div class="text-caption text-medium-emphasis mb-1">执行模式</div>
+            <v-btn-toggle v-model="editing.execution_mode" mandatory color="primary" density="comfortable">
+              <v-btn value="native" prepend-icon="mdi-server">
+                Emby 原生
+              </v-btn>
+              <v-btn value="local" prepend-icon="mdi-filter-check-outline">
+                本地全量
+              </v-btn>
+            </v-btn-toggle>
+            <v-alert
+              class="mt-2"
+              :type="isLocalMode(editing) ? 'success' : 'info'"
+              variant="tonal"
+              density="compact"
+              :icon="isLocalMode(editing) ? 'mdi-filter-check-outline' : 'mdi-server'"
+            >
+              <span v-if="isLocalMode(editing)">
+                代理拉取完整数据后本地评估全部规则:同一字段多条规则真正「且」组合、「匹配任意 (OR)」生效、
+                计数与分页始终准确;配合虚拟库缓存预热使用,浏览时不再逐条请求 Emby。
+              </span>
+              <span v-else>
+                规则优先翻译为 Emby 查询参数由服务器执行,开销最小(历史行为)。
+                注意:同一字段多条规则仅最后一条生效;「匹配任意 (OR)」不参与执行,详见性能指南。
+              </span>
+            </v-alert>
+          </div>
+
           <v-radio-group v-model="editing.match_all" inline hide-details density="compact">
             <v-radio label="匹配所有条件 (AND)" :value="true" />
             <v-radio label="匹配任意条件 (OR)" :value="false" />
           </v-radio-group>
 
-          <v-alert type="warning" variant="tonal" density="compact" icon="mdi-snail">
-            「匹配任意 (OR)」当前不参与执行(一律按 AND 组合);部分操作符会降级为代理端后筛选,可能影响性能,详见性能指南。
+          <v-alert
+            v-if="!isLocalMode(editing)"
+            type="warning"
+            variant="tonal"
+            density="compact"
+            icon="mdi-snail"
+          >
+            原生模式下「匹配任意 (OR)」不参与执行(一律按 AND 组合);部分操作符会降级为代理端后筛选,可能影响性能,详见性能指南。
+          </v-alert>
+          <v-alert
+            v-else-if="!editing.match_all"
+            type="info"
+            variant="tonal"
+            density="compact"
+            icon="mdi-set-center"
+          >
+            本地全量模式下 OR 已生效:任一规则命中的条目都会保留。
           </v-alert>
 
           <FilterRuleEditor
             v-for="(rule, index) in editing.rules"
             :key="index"
             :rule="rule"
+            :execution-mode="editing.execution_mode ?? 'native'"
             @remove="editing.rules.splice(index, 1)"
           />
 
@@ -119,11 +167,17 @@ const rules = {
     Boolean(value && String(value).trim()) || `${label}不能为空`,
 }
 
+function isLocalMode(filter: AdvancedFilter): boolean {
+  return (filter.execution_mode ?? 'native') === 'local'
+}
+
 function createEmptyFilter(): AdvancedFilter {
   return {
     id: generateId(),
     name: '',
     match_all: true,
+    // 新建默认本地全量:语义完整(同字段 AND / OR 均可),配合缓存预热性能无忧
+    execution_mode: 'local',
     rules: [{ field: '', operator: 'equals', value: '', relative_days: null }],
   }
 }
@@ -134,7 +188,10 @@ function openCreate() {
 }
 
 function openEdit(filter: AdvancedFilter) {
-  editing.value = deepClone(filter)
+  const draft = deepClone(filter)
+  // 存量筛选器没有该字段,规范化为 native(后端默认一致),保证切换控件可用
+  if (!draft.execution_mode) draft.execution_mode = 'native'
+  editing.value = draft
   editorVisible.value = true
 }
 

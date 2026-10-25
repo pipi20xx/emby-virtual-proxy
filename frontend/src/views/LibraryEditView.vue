@@ -136,7 +136,10 @@ const resourceTypeOptions = (Object.keys(RESOURCE_TYPE_LABELS) as ResourceType[]
 
 const filterOptions = computed(() => [
   { title: '无(不使用筛选器)', value: null },
-  ...configStore.advancedFilters.map((filter) => ({ title: filter.name, value: filter.id })),
+  ...configStore.advancedFilters.map((filter) => ({
+    title: `${filter.name}(${(filter.execution_mode ?? 'native') === 'local' ? '本地全量' : 'Emby 原生'})`,
+    value: filter.id,
+  })),
 ])
 
 const rules = {

@@ -116,6 +116,8 @@ import { FIELD_META, OPERATOR_TITLES, buildFieldHint, buildFieldSelectItems } fr
 /** 编辑页草稿对象;本组件直接修改传入的 rule 字段(保存时才提交) */
 const props = defineProps<{
   rule: AdvancedFilterRule
+  /** 筛选器执行模式:local 下操作符不再区分原生/后筛选 */
+  executionMode?: 'native' | 'local'
 }>()
 
 const emit = defineEmits<{
@@ -124,7 +126,9 @@ const emit = defineEmits<{
 
 const fieldSelectItems = buildFieldSelectItems()
 
-const fieldHint = computed(() => buildFieldHint(props.rule.field))
+const isLocalMode = computed(() => (props.executionMode ?? 'native') === 'local')
+
+const fieldHint = computed(() => buildFieldHint(props.rule.field, props.executionMode ?? 'native'))
 
 const fieldMeta = computed(() => FIELD_META[props.rule.field])
 
@@ -143,7 +147,7 @@ const numberControl = computed(() => {
   return control?.kind === 'number' ? control : null
 })
 
-/** 操作符下拉:按当前字段过滤,原生操作符与后筛选操作符分组展示 */
+/** 操作符下拉:按当前字段过滤;原生模式下原生/后筛选分组展示,本地全量模式下全部平铺 */
 const operatorOptions = computed<Array<Record<string, unknown>>>(() => {
   const meta = fieldMeta.value
   const native = meta?.ops ?? []
@@ -152,6 +156,12 @@ const operatorOptions = computed<Array<Record<string, unknown>>>(() => {
   if (!native.length && !post.length) {
     // 未选择字段:给全量操作符,不分组
     return Object.entries(OPERATOR_TITLES).map(([value, title]) => ({ value, title }))
+  }
+
+  if (isLocalMode.value) {
+    // 本地全量模式:所有操作符同样由代理评估,无快慢之分
+    const all = [...native, ...post]
+    return all.map((value) => ({ value, title: OPERATOR_TITLES[value] ?? value }))
   }
 
   const items: Array<Record<string, unknown>> = []

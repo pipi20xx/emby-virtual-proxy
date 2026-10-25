@@ -19,6 +19,10 @@ class AdvancedFilter(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     match_all: bool = Field(default=True)
+    # 执行模式:native = 混合执行(能翻译的走 Emby 原生参数,其余后筛选兜底,与历史行为一致);
+    # local = 本地全量(裸拉全量数据,全部规则由代理端评估,支持同字段 AND 与 OR 匹配)。
+    # 存量配置无此字段,默认 native 保证行为不变;前端新建筛选器默认 local。
+    execution_mode: Literal["native", "local"] = Field(default="native")
     rules: List[AdvancedFilterRule] = Field(default_factory=list)
 
 class VirtualLibrary(BaseModel):

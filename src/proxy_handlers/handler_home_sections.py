@@ -30,7 +30,7 @@ from models import AppConfig, VirtualLibrary
 from . import handler_merger, handler_views
 from emby_net import emby_proxy_of
 from .handler_views import apply_full_layout, apply_legacy_layout
-from ._filter_translator import translate_rules
+from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
 
 logger = logging.getLogger(__name__)
@@ -304,11 +304,12 @@ async def _handle_vlib_latest_media(
     new_params["IncludeItemTypes"] = "Movie,Series,Video"
 
     post_filter_rules = []
+    match_all = True
     if vlib.advanced_filter_id:
-        adv_filter = next((f for f in config.advanced_filters if f.id == vlib.advanced_filter_id), None)
-        if adv_filter:
-            emby_native_params, post_filter_rules = translate_rules(adv_filter.rules)
-            new_params.update(emby_native_params)
+        # 原生模式:可翻译规则进查询参数;本地全量模式:全部规则本地评估
+        # (本路径以用户令牌查询,响应自带该用户的 UserData,用户态规则同样可评估)
+        emby_native_params, post_filter_rules, match_all = resolve_for_user_query(config, vlib)
+        new_params.update(emby_native_params)
 
     is_tmdb_merge_enabled = vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id
     try:
@@ -346,7 +347,7 @@ async def _handle_vlib_latest_media(
         items_list = data.get("Items", [])
 
         if post_filter_rules:
-            items_list = _apply_post_filter(items_list, post_filter_rules)
+            items_list = _apply_post_filter(items_list, post_filter_rules, match_all=match_all)
 
         if is_tmdb_merge_enabled:
             items_list = await handler_merger.merge_items_by_tmdb(items_list)

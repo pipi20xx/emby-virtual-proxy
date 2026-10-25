@@ -6,6 +6,7 @@ import logging
 import random
 import re
 import time
+from datetime import datetime, timezone
 from fastapi import Request, Response
 from aiohttp import ClientSession
 from models import AppConfig, AdvancedFilter
@@ -13,7 +14,14 @@ from typing import List, Any, Dict, Optional, Tuple
 
 from . import handler_merger, handler_views
 # 导入我们新的翻译器和旧的后筛选逻辑
-from ._filter_translator import translate_rules
+from ._filter_translator import (
+    find_vlib_filter,
+    is_local_mode,
+    materialize_local_rules,
+    resolve_for_serving,
+    resolve_for_user_query,
+    USER_STATE_FIELDS,
+)
 from .handler_rss import RssHandler
 from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
 from emby_net import emby_proxy_of
@@ -59,7 +67,7 @@ _FORWARDABLE_HEADERS = [
     'x-emby-token'
 ]
 
-# --- 后筛选逻辑 (保留用于处理无法翻译的规则) ---
+# --- 后筛选逻辑 (本地全量模式的执行引擎;原生模式下处理无法翻译的规则) ---
 def _get_nested_value(item: Dict[str, Any], field_path: str) -> Any:
     keys = field_path.split('.')
     value = item
@@ -67,6 +75,47 @@ def _get_nested_value(item: Dict[str, Any], field_path: str) -> Any:
         if isinstance(value, dict): value = value.get(key)
         else: return None
     return value
+
+def _parse_dt(value: Any) -> Optional[object]:
+    """尝试把值解析为 datetime;支持 'YYYY-MM-DD'(视为当日零点 UTC)与 ISO 8601 时间戳。"""
+    if not isinstance(value, str): return None
+    s = value.strip()
+    if len(s) == 10:
+        try: return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError: return None
+    try:
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+def _same_date(a, b) -> bool:
+    """日期粒度相等比较:一方是日期粒度(YYYY-MM-DD)时只比到天,兼容时区差。"""
+    if a.tzinfo is not None and b.tzinfo is not None:
+        return a.astimezone(timezone.utc).date() == b.astimezone(timezone.utc).date()
+    return a.date() == b.date()
+
+def _compare_ordered(item_value: Any, operator: str, rule_value: str) -> Optional[bool]:
+    """数值/日期感知的有序比较;无法比较时返回 None 交由字符串比较兜底。"""
+    # 数值优先(年份、评分等)
+    try:
+        num_a, num_b = float(item_value), float(rule_value)
+        if operator == "greater_than": return num_a > num_b
+        if operator == "less_than": return num_a < num_b
+        if operator == "equals": return num_a == num_b
+        if operator == "not_equals": return num_a != num_b
+    except (ValueError, TypeError):
+        pass
+    # 日期感知:Emby 的时间字段是 ISO 时间戳,规则值常是日期粒度
+    dt_a, dt_b = _parse_dt(item_value), _parse_dt(rule_value)
+    if dt_a is not None and dt_b is not None:
+        if operator == "greater_than": return dt_a > dt_b
+        if operator == "less_than": return dt_a < dt_b
+        if operator == "equals": return _same_date(dt_a, dt_b)
+        if operator == "not_equals": return not _same_date(dt_a, dt_b)
+    return None
 
 def _check_condition(item_value: Any, operator: str, rule_value: str) -> bool:
     if operator not in ["is_empty", "is_not_empty"]:
@@ -81,19 +130,13 @@ def _check_condition(item_value: Any, operator: str, rule_value: str) -> bool:
             if operator == "contains": return any(rule_value_str in m for m in members)
             if operator == "not_contains": return all(rule_value_str not in m for m in members)
             return False
-        if operator in ["greater_than", "less_than"]:
-            try:
-                if operator == "greater_than": return float(item_value) > float(rule_value)
-                if operator == "less_than": return float(item_value) < float(rule_value)
-            except (ValueError, TypeError): return False
+        ordered = _compare_ordered(item_value, operator, rule_value)
+        if ordered is not None:
+            return ordered
         item_value_str = str(item_value).lower()
         rule_value_str = str(rule_value).lower()
         if operator in ("equals", "not_equals"):
-            # 数值字段(如评分)按数值比较,避免 '8.0' != '8' 的字符串误判
-            try:
-                equal = float(item_value) == float(rule_value)
-            except (ValueError, TypeError):
-                equal = item_value_str == rule_value_str
+            equal = item_value_str == rule_value_str
             return equal if operator == "equals" else not equal
         if operator == "contains": return rule_value_str in item_value_str
         if operator == "not_contains": return rule_value_str not in item_value_str
@@ -121,12 +164,18 @@ def _resolve_post_filter_field(item: Dict[str, Any], field: str) -> Any:
     return _get_nested_value(item, field)
 
 
-def _apply_post_filter(items: List[Dict[str, Any]], post_filter_rules: List[Dict]) -> List[Dict[str, Any]]:
+def _apply_post_filter(items: List[Dict[str, Any]], post_filter_rules: List, match_all: bool = True) -> List[Dict[str, Any]]:
+    """对完整数据集逐条评估规则;match_all=True 取全部满足(AND),False 取任一满足(OR)。
+
+    注意:必须传入全量数据集再调用(本地全量模式的设计前提),
+    在分页后的子集上调用会导致计数与翻页漂移。
+    """
     if not post_filter_rules: return items
-    logger.info(f"在 {len(items)} 个项目上应用 {len(post_filter_rules)} 条后筛选规则。")
+    combine = all if match_all else any
+    logger.info(f"在 {len(items)} 个项目上应用 {len(post_filter_rules)} 条后筛选规则({('AND' if match_all else 'OR')})。")
     filtered_items = []
     for item in items:
-        if all(_check_condition(_resolve_post_filter_field(item, rule.field), rule.operator, rule.value) for rule in post_filter_rules):
+        if combine(_check_condition(_resolve_post_filter_field(item, rule.field), rule.operator, rule.value) for rule in post_filter_rules):
             filtered_items.append(item)
     return filtered_items
 
@@ -160,8 +209,14 @@ def _build_user_forward_headers(request_headers, params) -> Dict[str, str]:
     return headers
 
 
-def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) -> Tuple[Dict[str, Any], List[Dict]]:
-    """构建虚拟库解析请求参数(规则过滤 + 高级筛选翻译),供全量拉取复用。"""
+def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) -> Tuple[Dict[str, Any], List, List, bool]:
+    """构建虚拟库解析请求参数与本地评估规则,供全量拉取复用。
+
+    返回 (拉取参数, 元数据后筛选规则, 用户态规则, 匹配方式):
+    - 原生模式:可翻译规则进拉取参数,其余规则全部本地后筛选(历史行为);
+    - 本地全量模式:拉取不带任何筛选参数(裸拉),元数据规则本地全量评估,
+      用户态规则(IsPlayed/IsUnplayed)由直出服务时叠加用户状态后评估。
+    """
     new_params: Dict[str, Any] = {
         "Recursive": "true",
         "IncludeItemTypes": "Movie,Series,Video",
@@ -174,14 +229,10 @@ def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) 
     if vlib.resource_type in resource_map:
         new_params[resource_map[vlib.resource_type]] = vlib.resource_id
 
-    post_filter_rules: List[Dict] = []
-    if vlib.advanced_filter_id:
-        adv_filter = next((f for f in config.advanced_filters if f.id == vlib.advanced_filter_id), None)
-        if adv_filter:
-            emby_native_params, post_filter_rules = translate_rules(adv_filter.rules)
-            new_params.update(emby_native_params)
+    emby_native_params, post_filter_rules, user_state_rules, match_all = resolve_for_serving(config, vlib)
+    new_params.update(emby_native_params)
 
-    return new_params, post_filter_rules
+    return new_params, post_filter_rules, user_state_rules, match_all
 
 
 async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session: ClientSession,
@@ -191,9 +242,11 @@ async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session
 
     共享元数据与用户无关,所有用户共用一份;可见性差异由用户叠加层在服务时裁剪。
     以传入身份查询(预热时为管理员 api_key,可见性最全);失败返回空列表。
+    用户态规则(IsPlayed/IsUnplayed)在此不评估——共享元数据已剥离用户状态,
+    由 try_serve_locally 在叠加用户 UserData 后评估。
     """
     try:
-        new_params, post_filter_rules = _build_resolution_params(config, vlib, _extract_token(headers))
+        new_params, post_filter_rules, _user_state_rules, match_all = _build_resolution_params(config, vlib, _extract_token(headers))
         search_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
 
         all_items: List[Dict[str, Any]] = []
@@ -215,7 +268,7 @@ async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session
                     break
 
         if post_filter_rules:
-            all_items = _apply_post_filter(all_items, post_filter_rules)
+            all_items = _apply_post_filter(all_items, post_filter_rules, match_all=match_all)
 
         if vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id:
             all_items = await handler_merger.merge_items_by_tmdb(all_items)
@@ -442,6 +495,13 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
             item = {**item, "UserData": ud}
         items.append(item)
 
+    # 本地全量模式:用户态规则(已播放/未播放)在叠加该用户播放状态后评估,
+    # 每个用户看到的是自己的播放状态,而非管理员的
+    _p, _meta_rules, user_state_rules, match_all = resolve_for_serving(config, vlib)
+    if user_state_rules:
+        logger.info(f"直出评估用户态规则:'{vlib.name}' 在 {len(items)} 个可见项上应用 {len(user_state_rules)} 条。")
+        items = _apply_post_filter(items, user_state_rules, match_all=match_all)
+
     if meta_age > _SERVING_SOFT_TTL:
         logger.info(f"直出元数据已软过期({meta_age // 3600}h),照常返回并后台重建。")
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
@@ -545,7 +605,29 @@ async def handle_virtual_library_items(
     for key in safe_params_to_inherit:
         if key in params: new_params[key] = params[key]
 
-    required_fields = ["ProviderIds", "Genres", "Tags", "Studios", "People", "OfficialRatings", "CommunityRating", "ProductionYear", "VideoRange", "Container"]
+    # 【【【核心优化点 2】】】: 应用高级筛选器(按执行模式分流)
+    # 原生模式:可翻译规则进查询参数,其余规则当前页后筛选(历史行为);
+    # 本地全量模式:不带筛选参数裸拉,全部规则由代理端对全量数据评估(见下方全量拉取分支)。
+    # 实时路径携带用户令牌,响应自带该用户的 UserData,用户态规则同样可本地评估。
+    adv_filter = find_vlib_filter(config, found_vlib)
+    if found_vlib.advanced_filter_id and adv_filter is None:
+        logger.warning(f"虚拟库配置了高级筛选器ID '{found_vlib.advanced_filter_id}'，但未找到。")
+    post_filter_rules: List = []
+    match_all = True
+    is_local_exec = is_local_mode(adv_filter) if adv_filter is not None else False
+    if adv_filter is not None:
+        emby_native_params, post_filter_rules, match_all = resolve_for_user_query(config, found_vlib)
+        new_params.update(emby_native_params)
+        if is_local_exec:
+            logger.info(f"筛选器 '{adv_filter.name}' 为本地全量模式:裸拉全量后本地评估 {len(post_filter_rules)} 条规则。")
+        elif post_filter_rules:
+            logger.info(f"筛选器 '{adv_filter.name}' 有 {len(post_filter_rules)} 条规则需要在代理端后筛选。")
+
+    # 本地全量模式按共享元数据同款字段清单拉取,保证本地评估字段齐全
+    if is_local_exec:
+        required_fields = _SERVING_FETCH_FIELDS
+    else:
+        required_fields = ["ProviderIds", "Genres", "Tags", "Studios", "People", "OfficialRatings", "CommunityRating", "ProductionYear", "VideoRange", "Container"]
     if "Fields" in new_params:
         existing_fields = set(new_params["Fields"].split(','))
         missing_fields = [f for f in required_fields if f not in existing_fields]
@@ -597,18 +679,6 @@ async def handle_virtual_library_items(
     if served is not None:
         return served
 
-    # 【【【核心优化点 2】】】: 应用高级筛选器翻译
-    post_filter_rules = []
-    if found_vlib.advanced_filter_id:
-        adv_filter = next((f for f in config.advanced_filters if f.id == found_vlib.advanced_filter_id), None)
-        if adv_filter:
-            logger.info(f"正在为高级筛选器 '{adv_filter.name}' 翻译规则...")
-            emby_native_params, post_filter_rules = translate_rules(adv_filter.rules)
-            new_params.update(emby_native_params)
-            if post_filter_rules: logger.info(f"有 {len(post_filter_rules)} 条规则需要在代理端后筛选。")
-        else:
-            logger.warning(f"虚拟库配置了高级筛选器ID '{found_vlib.advanced_filter_id}'，但未找到。")
-
     # 修复：如果 IsMovie 为 true，则强制 IncludeItemTypes 为 Movie
     if new_params.get("IsMovie") == "true":
         new_params["IncludeItemTypes"] = "Movie"
@@ -637,8 +707,11 @@ async def handle_virtual_library_items(
     
     logger.debug(f"向真实 Emby 发起优化后的最终请求: URL={search_url}, Params={new_params}")
 
-    # 如果不启用TMDB合并，或者有无法翻译的后筛选规则，则走常规分页逻辑
-    if not is_tmdb_merge_enabled or post_filter_rules:
+    # 本地全量模式,或启用 TMDB 合并且无后筛选规则时,走全量拉取:
+    # 本地全量模式的全部规则必须对完整数据集评估,手动分页保证 TotalRecordCount 正确;
+    # 原生模式的行为保持不变(有后筛选规则时仍在当前页执行,历史兼容)。
+    use_full_fetch = is_local_exec or (is_tmdb_merge_enabled and not post_filter_rules)
+    if not use_full_fetch:
         if is_tmdb_merge_enabled and post_filter_rules:
             logger.warning("TMDB合并已启用，但存在无法翻译的后筛选规则，合并将在当前页进行，可能不完整。")
 
@@ -677,13 +750,13 @@ async def handle_virtual_library_items(
 
             return Response(content=content, status_code=resp.status, headers=response_headers)
 
-    # --- TMDB合并的全量获取逻辑 ---
+    # --- 全量拉取逻辑(本地全量模式 / TMDB合并) ---
     else:
-        logger.info("TMDB合并已启用，开始获取全量数据...")
+        logger.info(f"{'本地全量模式' if is_local_exec else 'TMDB合并已启用'},开始获取全量数据...")
         all_items = []
         start_index = 0
         limit = 200  # 每次请求200个
-        
+
         # 移除客户端的分页参数，因为我们要自己控制
         new_params.pop("StartIndex", None)
         new_params.pop("Limit", None)
@@ -717,23 +790,44 @@ async def handle_virtual_library_items(
         
         logger.info(f"全量数据获取完成，总共 {len(all_items)} 个项目。")
 
-        # 1. 应用TMDB合并
-        logger.info("正在对获取到的全量数据集执行TMDB合并...")
-        merged_items = await handler_merger.merge_items_by_tmdb(all_items)
-        
-        # 2. 对合并后的结果进行手动分页
-        total_record_count = len(merged_items)
-        start_idx = int(client_start_index)
-        limit_count = int(client_limit)
-        paginated_items = merged_items[start_idx : start_idx + limit_count]
-        
-        # 3. 构建最终的响应
+        # 1. 本地评估筛选规则:先筛后合并,避免合并主条目的字段遮蔽本应命中的版本
+        if post_filter_rules:
+            all_items = _apply_post_filter(all_items, post_filter_rules, match_all=match_all)
+
+        # 2. 本地全量模式:拉取固定为 Movie,Series,Video 全集,
+        #    客户端请求的条目类型在本地过滤(与本地直出路径行为一致)
+        if is_local_exec:
+            client_types = params.get("IncludeItemTypes")
+            if client_types:
+                allowed_types = {t.strip() for t in client_types.split(",") if t.strip()}
+                if allowed_types:
+                    all_items = [i for i in all_items if i.get("Type") in allowed_types]
+
+        # 3. 应用TMDB合并
+        if is_tmdb_merge_enabled:
+            logger.info("正在对获取到的全量数据集执行TMDB合并...")
+            all_items = await handler_merger.merge_items_by_tmdb(all_items)
+
+        # 4. 手动分页:TotalRecordCount 恒为筛选/合并后的真实总数
+        total_record_count = len(all_items)
+        try:
+            start_idx = max(0, int(client_start_index))
+        except (TypeError, ValueError):
+            start_idx = 0
+        limit_raw = params.get("Limit")
+        try:
+            limit_count = int(limit_raw) if limit_raw is not None else total_record_count
+        except (TypeError, ValueError):
+            limit_count = total_record_count
+        paginated_items = all_items[start_idx : start_idx + limit_count]
+
+        # 5. 构建最终的响应
         final_data = {
             "Items": paginated_items,
             "TotalRecordCount": total_record_count,
             "StartIndex": start_idx
         }
-        logger.info(f"合并后手动分页完成。总数: {total_record_count}, 返回页面项目数: {len(paginated_items)}")
+        logger.info(f"全量处理完成,手动分页返回。总数: {total_record_count}, 返回页面项目数: {len(paginated_items)}")
 
         if paginated_items and config.enable_vlib_cache:
             vlib_items_cache[found_vlib.id] = paginated_items
