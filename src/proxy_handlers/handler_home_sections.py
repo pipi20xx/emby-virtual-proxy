@@ -6,11 +6,15 @@
 latestmedia_{库Id} 分区。代理若不拦截这些接口,新版首页将永远只显示
 真实媒体库——这正是 Emby 4.10 升级后虚拟库"从首页消失"的原因。
 
+除注入虚拟库外,还必须按布局规则过滤真实库分区,否则被隐藏的真实库
+仍会以"最新{库名}"横排出现在首页:display_order 模式下,不在布局里的
+真实库分区一律剔除;旧版模式按 hide 的 CollectionType 剔除。
+
 本处理器只拦截 GET,且只处理三类请求:
-  1. /Users/{id}/HomeSections                     -> 为每个虚拟库补一个 latestmedia 分区
-  2. /Users/{id}/Sections/smalllibrarytiles/Items -> 注入虚拟库磁贴(与 /Views 同一套布局规则)
+  1. /Users/{id}/HomeSections                     -> 过滤隐藏库分区 + 为可见虚拟库补 latestmedia 分区(按 display_order 排序)
+  2. /Users/{id}/Sections/{smalllibrarytiles|librarybuttons}/Items -> 按布局规则重建库磁贴(与 /Views 同一套规则)
   3. /Users/{id}/Sections/latestmedia_{虚拟库Id}/Items -> 返回该虚拟库的最新项目
-其余分区(resume/onnow/真实库的 latestmedia)原样透传。
+其余全局分区(resume/nextup/onnow 等)与可见真实库分区原样透传。
 """
 
 import json
@@ -67,14 +71,17 @@ async def handle_home_sections(
     session: ClientSession,
     config: AppConfig
 ) -> Response | None:
-    if method != "GET" or not config.virtual_libraries:
+    if method != "GET":
+        return None
+    # 没有虚拟库也可能需要过滤:仅配置 display_order / hide 隐藏真实库时,新版首页同样会泄露
+    if not (config.virtual_libraries or config.display_order or config.hide):
         return None
 
     if _is_home_sections(full_path):
         return await _handle_home_sections_layout(request, full_path, real_emby_url, session, config)
 
     key = _section_key(full_path)
-    if key == "smalllibrarytiles":
+    if key in ("smalllibrarytiles", "librarybuttons"):
         return await _handle_small_library_tiles(request, full_path, real_emby_url, session, config)
 
     if key and key.startswith("latestmedia_"):
@@ -86,7 +93,84 @@ async def handle_home_sections(
     return None
 
 
-# --- 1. HomeSections:为虚拟库补充 latestmedia 分区 ---
+# --- 1. HomeSections:过滤隐藏库分区 + 为虚拟库补充 latestmedia 分区 ---
+
+def _section_lib_id(section) -> Optional[str]:
+    """分区绑定的库 Id:优先 ParentId / ParentItem.Id,latestmedia 分区兜底从 Id 前缀解析。
+
+    全局分区(resume/nextup/onnow 等)没有这些字段,返回 None。
+    """
+    if not isinstance(section, dict):
+        return None
+    lib_id = section.get("ParentId") or (section.get("ParentItem") or {}).get("Id")
+    if not lib_id:
+        section_id = str(section.get("Id") or "")
+        if section_id.startswith("latestmedia_"):
+            lib_id = section_id[len("latestmedia_"):]
+    return str(lib_id) if lib_id else None
+
+
+def _is_latest_section(section) -> bool:
+    if not isinstance(section, dict):
+        return False
+    return str(section.get("Id") or "").startswith("latestmedia_") or section.get("SectionType") == "latestmedia"
+
+
+def _is_hidden_section(section, config: AppConfig, vlib_ids: set) -> bool:
+    """判断一个真实库分区是否应按布局规则从首页隐藏。"""
+    lib_id = _section_lib_id(section)
+    if not lib_id or lib_id in vlib_ids:
+        return False
+    if config.display_order:
+        return lib_id not in set(config.display_order)
+    if config.hide:
+        parent = section.get("ParentItem") or {}
+        collection_type = parent.get("CollectionType") or section.get("CollectionType")
+        return collection_type in config.hide
+    return False
+
+
+def _rebuild_layout(sections: list, hidden_idx: set, vlib_sections: dict, display_order: list) -> list:
+    """按布局规则重建首页分区列表:剔除隐藏库分区,把 latestmedia 分区块
+    按 display_order 重排并把虚拟库分区插入对应库的位置。
+
+    display_order 为空(旧版 hide 模式)时,可见真实库分区保持原顺序、
+    虚拟库分区排在其后。插入位置按原始列表中第一个 latestmedia 分区计算,
+    保证真实库分区被剔光时虚拟库的"最新"行仍顶到原来的位置,而不是掉到
+    继续观看/正在播放之后。
+    """
+    by_lib = {}
+    for i, s in enumerate(sections):
+        if i in hidden_idx:
+            continue
+        if _is_latest_section(s):
+            by_lib.setdefault(_section_lib_id(s), s)
+    by_lib.update(vlib_sections)
+
+    ordered = []
+    for lib_id in display_order:
+        s = by_lib.pop(lib_id, None)
+        if s is not None:
+            ordered.append(s)
+    ordered.extend(by_lib.values())
+
+    out = []
+    insert_at = None
+    kept_count = 0
+    for i, s in enumerate(sections):
+        if _is_latest_section(s):
+            if insert_at is None:
+                insert_at = kept_count
+            continue
+        if i in hidden_idx:
+            continue
+        out.append(s)
+        kept_count += 1
+    if insert_at is None:
+        insert_at = len(out)
+    out[insert_at:insert_at] = ordered
+    return out
+
 
 def _build_vlib_latest_section(vlib: VirtualLibrary, server_id: str, user_id=None, api_key=None) -> dict:
     """仿照真实库的 latestmedia 分区结构,构造虚拟库的"最新"分区。"""
@@ -135,23 +219,37 @@ async def _handle_home_sections_layout(
     else:
         server_id = config.emby_server_id or "emby"
 
-    existing_ids = {s.get("Id") for s in sections if isinstance(s, dict)}
     user_id = _get_user_id(request.query_params, full_path)
     api_key = request.query_params.get("X-Emby-Token") or config.emby_api_key
+    vlib_ids = {v.id for v in config.virtual_libraries}
+    existing_ids = {str(s.get("Id")) for s in sections if isinstance(s, dict)}
 
-    added = 0
-    for vlib in config.virtual_libraries:
-        section_id = f"latestmedia_{vlib.id}"
-        if section_id in existing_ids:
-            continue
-        sections.append(_build_vlib_latest_section(vlib, server_id, user_id, api_key))
-        added += 1
+    # 1. 标记被隐藏真实库的分区(最新横排等一切绑定到隐藏库的分区)
+    hidden_idx = {i for i, s in enumerate(sections) if _is_hidden_section(s, config, vlib_ids)}
+    removed = len(hidden_idx)
 
-    if not added:
+    # 2. 注入虚拟库分区:display_order 模式下仅注入布局内的虚拟库,旧版模式全部注入
+    vlib_sections = {}
+    if config.display_order:
+        order_set = set(config.display_order)
+        for vlib in config.virtual_libraries:
+            # 与 /Views 磁贴同一套规则:不在 display_order 里的虚拟库同样不进首页
+            if vlib.id not in order_set or f"latestmedia_{vlib.id}" in existing_ids:
+                continue
+            vlib_sections[vlib.id] = _build_vlib_latest_section(vlib, server_id, user_id, api_key)
+    else:
+        for vlib in sorted(config.virtual_libraries, key=lambda v: v.order):
+            if f"latestmedia_{vlib.id}" in existing_ids:
+                continue
+            vlib_sections[vlib.id] = _build_vlib_latest_section(vlib, server_id, user_id, api_key)
+
+    added = len(vlib_sections)
+    if not removed and not added:
         return None
 
-    logger.info(f"HOME_SECTIONS: 已为 {added} 个虚拟库注入 latestmedia 首页分区。")
-    return Response(content=json.dumps(sections).encode('utf-8'), status_code=200, media_type="application/json")
+    kept = _rebuild_layout(sections, hidden_idx, vlib_sections, config.display_order)
+    logger.info(f"HOME_SECTIONS: 首页分区布局已调整(剔除隐藏库分区 {removed} 个,注入虚拟库分区 {added} 个)。")
+    return Response(content=json.dumps(kept).encode('utf-8'), status_code=200, media_type="application/json")
 
 
 # --- 2. smalllibrarytiles:"我的媒体"磁贴 ---
@@ -169,7 +267,7 @@ async def _handle_small_library_tiles(
     if not isinstance(data, dict):
         return None
 
-    logger.info("HOME_SECTIONS: 拦截首页『我的媒体』磁贴 (smalllibrarytiles),注入虚拟库。")
+    logger.info(f"HOME_SECTIONS: 拦截首页『我的媒体』磁贴 ({key}),按布局规则重建。")
     if config.display_order:
         data = apply_full_layout(data, config, request.query_params, full_path)
     else:
