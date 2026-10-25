@@ -6,7 +6,10 @@
         icon="mdi-menu"
         @click="drawer = !drawer"
       />
-      <v-app-bar-title class="font-weight-bold">Emby Virtual Proxy</v-app-bar-title>
+      <v-app-bar-title class="font-weight-bold">
+        Emby Virtual Proxy
+        <span class="app-version text-caption text-medium-emphasis">v{{ appVersion }}</span>
+      </v-app-bar-title>
 
       <template #append>
         <v-chip v-if="embyStore.loadState === 'loading'" size="small" variant="tonal" class="mr-1">
@@ -48,12 +51,6 @@
           :title="item.title"
         />
       </v-list>
-
-      <template #append>
-        <div class="pa-4 text-caption text-medium-emphasis text-center">
-          v{{ appVersion }}
-        </div>
-      </template>
     </v-navigation-drawer>
 
     <v-main>
@@ -103,3 +100,11 @@ function signOut() {
   router.push({ name: 'login' })
 }
 </script>
+
+<style scoped>
+/* 标题右侧的版本号小字 */
+.app-version {
+  font-weight: 400;
+  white-space: nowrap;
+}
+</style>

@@ -12,8 +12,11 @@
       <v-card class="login-card elevation-8">
         <div class="text-center mb-6">
           <v-icon icon="mdi-library-shelves" size="40" color="primary" class="mb-3" />
-          <div class="text-h5 font-weight-bold">Emby Virtual Proxy</div>
-          <div class="text-body-2 text-medium-emphasis mt-1">管理面板 · v{{ appVersion }}</div>
+          <div class="text-h5 font-weight-bold">
+            Emby Virtual Proxy
+            <span class="app-version text-caption text-medium-emphasis">v{{ appVersion }}</span>
+          </div>
+          <div class="text-body-2 text-medium-emphasis mt-1">管理面板</div>
         </div>
 
         <v-form @submit.prevent="submit">
@@ -115,5 +118,11 @@ onMounted(async () => {
   max-width: 420px;
   padding: 40px 36px 28px;
   border-radius: var(--evp-login-radius);
+}
+
+/* 标题右侧的版本号小字 */
+.app-version {
+  font-weight: 400;
+  white-space: nowrap;
 }
 </style>
