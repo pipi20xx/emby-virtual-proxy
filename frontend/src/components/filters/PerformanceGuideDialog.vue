@@ -14,18 +14,20 @@
         <p class="text-body-2 text-medium-emphasis mb-2">
           浏览绑定了筛选器的虚拟库时,代理会拦截客户端发出的库内容请求
           <code>GET /emby/Users/{userId}/Items?ParentId=&lt;虚拟库ID&gt;</code>,
-          把规则改写成对这个端点的查询参数后,转发给真实 Emby 服务器:
+          把筛选规则翻译成该请求的查询参数后,转发给真实 Emby 服务器:
         </p>
         <ul class="text-body-2 text-medium-emphasis mb-2">
           <li><b>能翻译的规则</b> → 变成 Emby 原生查询参数(见下方对照表),由 Emby 服务器执行,速度最快;</li>
           <li><b>不能翻译的规则</b> → 代理取回数据后,在本地对结果逐条比对(后筛选),规则越多越慢。</li>
         </ul>
         <div class="code-block">GET /emby/Users/{userId}/Items?Recursive=true&amp;IncludeItemTypes=Movie,Series,Video
-    &amp;GenreIds=&lt;库资源ID&gt;&amp;MinCommunityRating=8&amp;Tags=肉番
-    ↑ 规则「类型=某类型」「社区评分&gt;8」「标签=肉番」翻译后的原生参数</div>
+    &amp;GenreIds=&lt;虚拟库绑定的类型ID&gt;&amp;MinCommunityRating=8&amp;Tags=肉番</div>
+        <p class="text-caption text-medium-emphasis mb-2">
+          ↑ 其中 GenreIds 是虚拟库自身的资源绑定;MinCommunityRating=8、Tags=肉番 才是规则「社区评分 > 8」「标签 = 肉番」翻译出的原生参数。
+        </p>
 
         <!-- 二、查询语义 -->
-        <div class="text-subtitle-1 font-weight-bold mt-4 mb-2">二、Emby 查询语义:跨维度 AND,同维度永远 OR</div>
+        <div class="text-subtitle-1 font-weight-bold mt-4 mb-2">二、Emby 查询语义:不同维度之间 AND,同一维度内永远 OR</div>
         <p class="text-body-2 text-medium-emphasis mb-1">
           以下结论在 Emby 4.10.2 实测验证,写规则前务必理解:
         </p>
@@ -58,23 +60,31 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="row in efficientRules" :key="row.field">
-              <td>{{ row.field }}</td>
-              <td>
-                <v-chip
-                  v-for="op in row.ops"
-                  :key="op"
-                  size="x-small"
-                  variant="tonal"
-                  class="mr-1"
-                >
-                  {{ op }}
-                </v-chip>
-              </td>
-              <td class="text-medium-emphasis">{{ row.param }}</td>
-            </tr>
+            <template v-for="group in efficientGroups" :key="group.name">
+              <tr>
+                <td colspan="3" class="text-caption font-weight-bold text-medium-emphasis">{{ group.name }}</td>
+              </tr>
+              <tr v-for="row in group.rows" :key="row.field">
+                <td>{{ row.field }}</td>
+                <td>
+                  <v-chip
+                    v-for="op in row.ops"
+                    :key="op"
+                    size="x-small"
+                    variant="tonal"
+                    class="mr-1"
+                  >
+                    {{ op }}
+                  </v-chip>
+                </td>
+                <td class="text-medium-emphasis">{{ row.param }}</td>
+              </tr>
+            </template>
           </tbody>
         </v-table>
+        <p class="text-caption text-medium-emphasis mb-2">
+          注:Min/Max 类参数按含端点(≥ / ≤)处理,如「社区评分 大于 8」实际为 ≥ 8、「发行年份 大于 2022」会命中 2022 年及以后;「最近N天」含第 N 天。
+        </p>
 
         <!-- 四、参数陷阱 -->
         <div class="text-subtitle-1 font-weight-bold mt-4 mb-2 text-warning">
@@ -82,9 +92,9 @@
           四、参数陷阱
         </div>
         <v-list density="compact" class="mb-2">
-          <v-list-item subtitle="VideoTypes 参数的官方含义是介质类型(videofile / dvd / bluray / iso),与 HDR/SDR 画质无关 —— 「视频范围」规则会被翻译成该参数,但筛不出预期的画质结果;" />
-          <v-list-item subtitle="Tags 参数多值分隔符是管道符 |(如 后宫|肉番);逗号不拆分,Tags=A,B 会把 A,B 整串当成一个标签名;" />
-          <v-list-item subtitle="同一字段写多条规则时,生成的参数名相同,后写的覆盖先写的 —— 实际只有最后一条生效;" />
+          <v-list-item subtitle="「标签 / 类型」等规则的值支持多值:用管道符 | 分隔表示任一满足(如 后宫|肉番);逗号不会拆分,写 后宫,肉番 会把整串当成一个标签名;" />
+          <v-list-item subtitle="同一字段写多条「等于」类规则会翻译到同一个参数,后写的覆盖先写的,只有最后一条生效 —— 例如两条「标签 等于」只生效最后一条,想要任一满足请用一条规则写 后宫|肉番;" />
+          <v-list-item subtitle="「大于 + 小于」是两个不同参数(Min / Max),可以同时使用组合成区间,如「社区评分 大于 6」+「社区评分 小于 9」;" />
           <v-list-item subtitle="「匹配任意 (OR)」选项当前未参与执行:所有规则一律按「且」组合,选择 OR 不会改变结果,请勿依赖。" />
         </v-list>
 
@@ -117,6 +127,8 @@
 </template>
 
 <script setup lang="ts">
+import { FIELD_META, GROUP_ORDER, POST_FILTER_GROUP } from './fieldMeta'
+
 defineProps<{
   modelValue: boolean
 }>()
@@ -131,28 +143,29 @@ interface EfficientRuleRow {
   param: string
 }
 
-const efficientRules: EfficientRuleRow[] = [
-  { field: '社区评分 (CommunityRating)', ops: ['大于', '小于'], param: 'MinCommunityRating=7.5 / MaxCommunityRating=7.5' },
-  { field: '影评人评分 (CriticRating)', ops: ['大于', '小于'], param: 'MinCriticRating=80 / MaxCriticRating=80' },
-  { field: '发行年份 (ProductionYear)', ops: ['大于', '小于', '等于'], param: 'MinPremiereDate=2023-01-01T00:00:00.000Z 等(年份转为日期范围)' },
-  { field: '首播日期 (PremiereDate)', ops: ['大于', '小于', '等于'], param: 'MinPremiereDate / MaxPremiereDate,支持最近N天' },
-  { field: '添加日期 (DateCreated)', ops: ['大于', '小于', '等于'], param: 'MinDateCreated / MaxDateCreated,支持最近N天' },
-  { field: '官方分级 (OfficialRating)', ops: ['等于'], param: 'OfficialRatings=R' },
-  { field: '类型 (Genres)', ops: ['等于'], param: 'Genres=科幻' },
-  { field: '标签 (Tags)', ops: ['等于'], param: 'Tags=肉番(多值任一满足:Tags=后宫|肉番)' },
-  { field: '工作室 (Studios)', ops: ['等于'], param: 'Studios=Netflix' },
-  { field: '视频范围 (VideoRange)', ops: ['等于'], param: 'VideoTypes=<值> ⚠ 该参数实为介质类型,见陷阱' },
-  { field: '文件容器 (Container)', ops: ['等于'], param: 'Containers=mkv' },
-  { field: '名称以…开头 (NameStartsWith)', ops: ['等于'], param: 'NameStartsWith=A' },
-  { field: '剧集状态 (SeriesStatus)', ops: ['等于'], param: 'SeriesStatus=Continuing / Ended' },
-  { field: '是否为电影/剧集、已/未播放、有字幕、有官方评级', ops: ['等于'], param: 'IsMovie=true / IsSeries=true / IsPlayed=true / IsUnplayed=true / HasSubtitles=true / HasOfficialRating=true' },
-  { field: '拥有 TMDB ID (ProviderIds.Tmdb)', ops: ['不为空', '为空'], param: 'HasTmdbId=true / HasTmdbId=false,无需填值' },
-  { field: '拥有 IMDB ID (ProviderIds.Imdb)', ops: ['不为空', '为空'], param: 'HasImdbId=true / HasImdbId=false,无需填值' },
-]
+interface EfficientGroup {
+  name: string
+  rows: EfficientRuleRow[]
+}
+
+/** 高效对照表由 fieldMeta.ts 的唯一字段元数据生成(与规则编辑器的下拉和提示同源) */
+const efficientGroups: EfficientGroup[] = GROUP_ORDER.filter((group) => group !== POST_FILTER_GROUP)
+  .map((group) => ({
+    name: group,
+    rows: Object.entries(FIELD_META)
+      .filter(([, meta]) => meta.group === group && meta.native)
+      .map(([value, meta]) => ({
+        field: `${meta.title} (${value})`,
+        ops: meta.ops ?? [],
+        param: meta.paramExample ?? meta.native ?? '',
+      })),
+  }))
+  .filter((group) => group.rows.length)
 
 const inefficientRules = [
   '字段为「名称 (Name)」(无论使用什么操作符)',
-  '操作符为「不等于 / 包含 / 不包含」',
+  '字段为「视频范围 (VideoRange)」(无论使用什么操作符)',
+  '操作符为「不等于 / 包含 / 不包含」(任意字段)',
   '操作符为「为空 / 不为空」,但字段不是「拥有 TMDB/IMDB ID」(例如:社区评分为空)',
 ]
 </script>

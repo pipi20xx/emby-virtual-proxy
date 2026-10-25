@@ -38,7 +38,8 @@ FIELD_MAP = {
     "Genres": "Genres",
     "Tags": "Tags",
     "Studios": "Studios",
-    "VideoRange": "VideoTypes",  # 例如 'HDR', 'SDR'
+    # VideoRange(画质)不映射:Emby 查询参数 VideoTypes 实为介质类型(videofile/dvd/bluray/iso),
+    # 与 HDR/SDR 画质无关,原生翻译会得到错误结果,该字段一律走代理端后筛选
     "Container": "Containers",
     "NameStartsWith": "NameStartsWith",
     "SeriesStatus": "SeriesStatus",
@@ -113,8 +114,12 @@ def translate_rules(rules: List[AdvancedFilterRule]) -> Tuple[Dict[str, Any], Li
                         emby_native_params[min_param] = f"{value}T00:00:00.000Z"
                         emby_native_params[max_param] = f"{value}T23:59:59.999Z"
                         translated = True
-                    else:  # 其他字段的 equals
-                        param_name = f"{param_template[0].replace('Min','')}"  # 假设是 CommunityRating
+                    else:
+                        # CommunityRating/CriticRating 的等于:Emby 无对应等值参数,
+                        # 用 Min=Max 同值区间近似表达,而不是生成无效参数
+                        emby_native_params[min_param] = value
+                        emby_native_params[max_param] = value
+                        translated = True
                 else:
                     param_name = None
 
@@ -132,9 +137,12 @@ def translate_rules(rules: List[AdvancedFilterRule]) -> Tuple[Dict[str, Any], Li
                     translated = True
 
             # 处理直接映射的字段
+            # 仅 equals 翻译为原生参数;not_equals/contains/not_contains 等语义
+            # 与原生参数(等值匹配)不一致,一律降级后筛选,避免排除类条件被反向翻译。
             elif isinstance(param_template, str):
-                emby_native_params[param_template] = value
-                translated = True
+                if operator == "equals":
+                    emby_native_params[param_template] = value
+                    translated = True
 
         if not translated:
             logger.info(f"高级筛选规则无法翻译，将进行后筛选: {rule.field} {rule.operator} {rule.value}")

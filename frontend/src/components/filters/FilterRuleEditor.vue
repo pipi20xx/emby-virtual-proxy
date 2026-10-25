@@ -4,7 +4,7 @@
       <v-col cols="12" sm="4">
         <v-select
           v-model="rule.field"
-          :items="FIELD_OPTIONS"
+          :items="fieldSelectItems"
           label="字段"
           hide-details
         />
@@ -13,7 +13,9 @@
       <v-col cols="12" sm="3">
         <v-select
           v-model="rule.operator"
-          :items="OPERATOR_OPTIONS"
+          :items="operatorOptions"
+          item-title="title"
+          item-value="value"
           label="操作符"
           hide-details
         />
@@ -59,7 +61,34 @@
           </div>
         </template>
 
-        <!-- 普通字段 -->
+        <!-- 普通字段:按字段元数据的值控件渲染(枚举严格限制 / 数字限制范围 / 建议值 / 自由文本) -->
+        <v-select
+          v-else-if="enumOptions"
+          v-model="rule.value"
+          :items="enumOptions"
+          item-title="title"
+          item-value="value"
+          label="值"
+          hide-details
+        />
+        <v-text-field
+          v-else-if="numberControl"
+          :model-value="rule.value ?? ''"
+          type="number"
+          :min="numberControl.min"
+          :max="numberControl.max"
+          :step="numberControl.step"
+          label="值"
+          hide-details
+          @update:model-value="rule.value = ($event || null) as string | null"
+        />
+        <v-combobox
+          v-else-if="suggestOptions"
+          v-model="rule.value"
+          :items="suggestOptions"
+          label="值"
+          hide-details
+        />
         <v-text-field
           v-else
           v-model="rule.value"
@@ -69,7 +98,8 @@
         />
       </v-col>
 
-      <v-col cols="12" class="d-flex justify-end">
+      <v-col cols="12" class="d-flex align-center ga-2">
+        <span class="text-caption text-medium-emphasis flex-grow-1">{{ fieldHint }}</span>
         <v-btn icon="mdi-delete-outline" size="x-small" variant="text" color="error" @click="emit('remove')" />
       </v-col>
     </v-row>
@@ -77,9 +107,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 
 import type { AdvancedFilterRule } from '@/types/config'
+
+import { FIELD_META, OPERATOR_TITLES, buildFieldHint, buildFieldSelectItems } from './fieldMeta'
 
 /** 编辑页草稿对象;本组件直接修改传入的 rule 字段(保存时才提交) */
 const props = defineProps<{
@@ -90,46 +122,68 @@ const emit = defineEmits<{
   (e: 'remove'): void
 }>()
 
-export interface FieldOption {
-  value: string
-  title: string
-}
+const fieldSelectItems = buildFieldSelectItems()
 
-const FIELD_OPTIONS: FieldOption[] = [
-  { value: 'CommunityRating', title: '社区评分' },
-  { value: 'CriticRating', title: '影评人评分' },
-  { value: 'OfficialRating', title: '官方分级' },
-  { value: 'ProductionYear', title: '发行年份' },
-  { value: 'PremiereDate', title: '首播日期' },
-  { value: 'DateCreated', title: '添加日期' },
-  { value: 'Genres', title: '类型' },
-  { value: 'Tags', title: '标签' },
-  { value: 'Studios', title: '工作室' },
-  { value: 'VideoRange', title: '视频范围' },
-  { value: 'Container', title: '文件容器' },
-  { value: 'NameStartsWith', title: '名称以…开头' },
-  { value: 'SeriesStatus', title: '剧集状态' },
-  { value: 'IsMovie', title: '是否为电影' },
-  { value: 'IsSeries', title: '是否为剧集' },
-  { value: 'IsPlayed', title: '已播放' },
-  { value: 'IsUnplayed', title: '未播放' },
-  { value: 'HasSubtitles', title: '有字幕' },
-  { value: 'HasOfficialRating', title: '有官方评级' },
-  { value: 'ProviderIds.Tmdb', title: '拥有 TMDB ID' },
-  { value: 'ProviderIds.Imdb', title: '拥有 IMDB ID' },
-  { value: 'Name', title: '名称' },
-]
+const fieldHint = computed(() => buildFieldHint(props.rule.field))
 
-const OPERATOR_OPTIONS: { value: string; title: string }[] = [
-  { value: 'equals', title: '等于' },
-  { value: 'not_equals', title: '不等于' },
-  { value: 'contains', title: '包含' },
-  { value: 'not_contains', title: '不包含' },
-  { value: 'greater_than', title: '大于' },
-  { value: 'less_than', title: '小于' },
-  { value: 'is_empty', title: '为空' },
-  { value: 'is_not_empty', title: '不为空' },
-]
+const fieldMeta = computed(() => FIELD_META[props.rule.field])
+
+const enumOptions = computed(() => {
+  const control = fieldMeta.value?.valueControl
+  return control?.kind === 'enum' ? control.options : null
+})
+
+const suggestOptions = computed(() => {
+  const control = fieldMeta.value?.valueControl
+  return control?.kind === 'suggest' ? control.options : null
+})
+
+const numberControl = computed(() => {
+  const control = fieldMeta.value?.valueControl
+  return control?.kind === 'number' ? control : null
+})
+
+/** 操作符下拉:按当前字段过滤,原生操作符与后筛选操作符分组展示 */
+const operatorOptions = computed<Array<Record<string, unknown>>>(() => {
+  const meta = fieldMeta.value
+  const native = meta?.ops ?? []
+  const post = meta?.postOps ?? []
+
+  if (!native.length && !post.length) {
+    // 未选择字段:给全量操作符,不分组
+    return Object.entries(OPERATOR_TITLES).map(([value, title]) => ({ value, title }))
+  }
+
+  const items: Array<Record<string, unknown>> = []
+  if (native.length) {
+    items.push({ type: 'subheader', title: '原生执行(最快)' })
+    native.forEach((value) => items.push({ value, title: OPERATOR_TITLES[value] ?? value }))
+  }
+  if (post.length) {
+    if (native.length) items.push({ type: 'divider' })
+    items.push({ type: 'subheader', title: '代理端后筛选(慢)' })
+    post.forEach((value) => items.push({ value, title: OPERATOR_TITLES[value] ?? value }))
+  }
+  return items
+})
+
+/** 切换字段后:
+ * 1. 操作符不在新字段允许列表时,重置为该字段的第一个原生操作符
+ * 2. 值不在新字段的枚举里则清空,避免残留非法值 */
+watch(
+  () => props.rule.field,
+  () => {
+    const meta = fieldMeta.value
+    const allowed = new Set([...(meta?.ops ?? []), ...(meta?.postOps ?? [])])
+    if (allowed.size && !allowed.has(props.rule.operator)) {
+      props.rule.operator = meta?.ops?.[0] ?? [...allowed][0]
+    }
+    const options = enumOptions.value
+    if (options && !options.some((option) => option.value === props.rule.value)) {
+      props.rule.value = null
+    }
+  },
+)
 
 const DATE_FIELDS = ['PremiereDate', 'DateCreated']
 

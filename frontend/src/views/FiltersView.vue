@@ -62,7 +62,7 @@
           </v-radio-group>
 
           <v-alert type="warning" variant="tonal" density="compact" icon="mdi-snail">
-            OR 逻辑与部分操作符会降级为代理端后筛选,可能影响性能,详见性能指南。
+            「匹配任意 (OR)」当前不参与执行(一律按 AND 组合);部分操作符会降级为代理端后筛选,可能影响性能,详见性能指南。
           </v-alert>
 
           <FilterRuleEditor

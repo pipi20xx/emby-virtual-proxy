@@ -72,8 +72,14 @@ def _check_condition(item_value: Any, operator: str, rule_value: str) -> bool:
     if operator not in ["is_empty", "is_not_empty"]:
         if item_value is None: return False
         if isinstance(item_value, list):
-            if operator == "contains": return rule_value in item_value
-            if operator == "not_contains": return rule_value not in item_value
+            # 列表字段(Genres/Tags/Studios 等):equals 精确匹配成员,
+            # contains 在成员内做子串匹配,排除类取反
+            members = [str(v).lower() for v in item_value]
+            rule_value_str = str(rule_value).lower()
+            if operator == "equals": return rule_value_str in members
+            if operator == "not_equals": return rule_value_str not in members
+            if operator == "contains": return any(rule_value_str in m for m in members)
+            if operator == "not_contains": return all(rule_value_str not in m for m in members)
             return False
         if operator in ["greater_than", "less_than"]:
             try:
