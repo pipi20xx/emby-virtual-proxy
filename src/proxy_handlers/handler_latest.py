@@ -12,6 +12,7 @@ from pathlib import Path
 from . import handler_merger
 # 【新增】导入后台生成处理器
 from . import handler_autogen
+from .handler_views import get_vlib_include_item_types
 from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
 from .handler_images import cover_file_exists
@@ -123,7 +124,8 @@ async def handle_home_latest_items(
     new_params["SortBy"] = "DateCreated"
     new_params["SortOrder"] = "Descending"
     new_params["Recursive"] = "true"
-    new_params["IncludeItemTypes"] = "Movie,Series,Video"
+    # 条目类型与展示类型一致(混合库取全集,电视剧/电影库只取对应类型)
+    new_params["IncludeItemTypes"] = get_vlib_include_item_types(found_vlib)
     
     post_filter_rules = []
     match_all = True

@@ -4,6 +4,8 @@ import json
 from fastapi import Request, Response
 from models import AppConfig
 
+from .handler_views import get_vlib_collection_type
+
 logger = logging.getLogger(__name__)
 
 async def handle_get_virtual_item_info(request: Request, full_path: str, config: AppConfig) -> Response | None:
@@ -33,12 +35,13 @@ async def handle_get_virtual_item_info(request: Request, full_path: str, config:
     server_id = "unknown_server_id" # 提供一个默认值
 
     # 伪造一个看起来像 CollectionFolder 的 JSON 响应
+    # CollectionType 与 /Views 磁贴的 stub 保持同一推导值,避免客户端两种入口类型不一致
     fake_item_data = {
         "Name": found_vlib.name,
         "Id": found_vlib.id,
         "ServerId": server_id, # 这里需要一个真实的ServerId
         "Type": "CollectionFolder",
-        "CollectionType": "folder", # 标记为通用文件夹类型
+        "CollectionType": get_vlib_collection_type(found_vlib),
         "IsFolder": True,
         "ImageTags": {
             "Primary": found_vlib.image_tag

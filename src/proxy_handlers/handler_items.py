@@ -635,7 +635,9 @@ async def handle_virtual_library_items(
     else: new_params["Fields"] = ",".join(required_fields)
 
     new_params["Recursive"] = "true"
-    new_params["IncludeItemTypes"] = "Movie,Series,Video"
+    # 条目类型与展示类型一致:混合库拉全集,电视剧/电影库只拉对应类型,
+    # 与本地直出路径及客户端浏览请求(由 stub 的 CollectionType 决定)保持同一语义
+    new_params["IncludeItemTypes"] = handler_views.get_vlib_include_item_types(found_vlib)
 
     resource_map = {"collection": "CollectionIds", "tag": "TagIds", "person": "PersonIds", "genre": "GenreIds", "studio": "StudioIds"}
     if found_vlib.resource_type in resource_map:

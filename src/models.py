@@ -30,6 +30,9 @@ class VirtualLibrary(BaseModel):
     name: str
     resource_type: Literal["collection", "tag", "genre", "studio", "person", "all", "rsshub"]
     resource_id: Optional[str] = None
+    # 展示类型:客户端按哪种媒体库界面渲染(tvshows=电视剧, movies=电影, mixed=混合)。
+    # None = 自动推导:全库(all)按混合呈现,其余沿用电视剧(兼容存量配置),见 handler_views.get_vlib_collection_type
+    collection_type: Optional[Literal["tvshows", "movies", "mixed"]] = None
     # image: Optional[str] = None  <-- 我们不再需要这个字段了，可以删除或注释掉
     image_tag: Optional[str] = None # <-- 【新增】用于存储图片的唯一标签
     cover_format: Optional[str] = None # <-- 【新增】封面文件格式(jpg/gif/webp/png),用于定位封面文件

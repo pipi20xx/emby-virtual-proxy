@@ -6,6 +6,7 @@
 import type { Classifications } from './api'
 
 export type ResourceType = 'collection' | 'tag' | 'genre' | 'studio' | 'person' | 'all' | 'rsshub'
+export type CollectionType = 'tvshows' | 'movies' | 'mixed'
 export type RssType = 'douban' | 'bangumi'
 export type TmdbType = 'Movie' | 'TV'
 export type FilterOperator =
@@ -39,6 +40,8 @@ export interface VirtualLibrary {
   name: string
   resource_type: ResourceType
   resource_id: string | null
+  /** 展示类型:客户端按哪种媒体库界面渲染;null = 自动(全库→混合,其余→电视剧) */
+  collection_type: CollectionType | null
   image_tag: string | null
   /** 封面文件格式(jpg/gif/webp/png),动图样式生成后为非 jpg */
   cover_format: string | null
@@ -115,6 +118,13 @@ export const RESOURCE_PLURAL_KEY: Record<string, keyof Classifications> = {
   person: 'persons',
 }
 
+/** 展示类型中文标签(null = 自动推导,由后端按资源类型决定) */
+export const COLLECTION_TYPE_LABELS: Record<CollectionType, string> = {
+  tvshows: '电视剧库',
+  movies: '电影库',
+  mixed: '混合(电影+剧集)',
+}
+
 export interface CoverStyleOption {
   value: string
   title: string
@@ -158,6 +168,7 @@ export function createEmptyLibrary(): VirtualLibrary {  return {
     name: '',
     resource_type: 'collection',
     resource_id: null,
+    collection_type: null,
     image_tag: null,
     cover_format: null,
     rsshub_url: null,

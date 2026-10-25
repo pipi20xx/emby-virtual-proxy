@@ -45,6 +45,33 @@ def _extract_user_id(params, full_path: str):
     return user_id
 
 
+def get_vlib_collection_type(vlib) -> str:
+    """虚拟库对客户端呈现的 CollectionType(所有 stub / 详情伪造统一取此值)。
+
+    显式配置优先:movies/tvshows 原样,mixed 映射为 Emby 的通用混合类型 folder;
+    未配置时按资源类型自动推导——'全库'(all)本身就是真实全库,按混合呈现,
+    其余资源类型沿用历史行为(电视剧),兼容存量配置。
+    """
+    configured = getattr(vlib, "collection_type", None)
+    if configured == "movies":
+        return "movies"
+    if configured == "mixed":
+        return "folder"
+    if configured == "tvshows":
+        return "tvshows"
+    return "folder" if vlib.resource_type == "all" else "tvshows"
+
+
+def get_vlib_include_item_types(vlib) -> str:
+    """虚拟库内容查询的 IncludeItemTypes,与展示类型保持同一语义。"""
+    collection_type = get_vlib_collection_type(vlib)
+    if collection_type == "movies":
+        return "Movie"
+    if collection_type == "tvshows":
+        return "Series"
+    return "Movie,Series,Video"
+
+
 def build_vlib_view_stub(vlib, server_id: str, user_id=None, api_key=None) -> dict:
     """构建虚拟库在首页视图/磁贴中的占位条目。
 
@@ -53,7 +80,7 @@ def build_vlib_view_stub(vlib, server_id: str, user_id=None, api_key=None) -> di
     vlib_data = {
         "Name": vlib.name, "ServerId": server_id, "Id": vlib.id,
         "Type": "CollectionFolder",
-        "CollectionType": "tvshows",
+        "CollectionType": get_vlib_collection_type(vlib),
         "IsFolder": True,
         "ImageTags": {}
     }
@@ -114,7 +141,7 @@ def apply_legacy_layout(content_json: dict, config: AppConfig) -> dict:
             if not any(item.get("Id") == vlib.id for item in content_json["Items"]):
                 content_json["Items"].append({
                     "Name": vlib.name, "ServerId": server_id, "Id": vlib.id,
-                    "Type": "CollectionFolder", "CollectionType": "tvshows",
+                    "Type": "CollectionFolder", "CollectionType": get_vlib_collection_type(vlib),
                     "IsFolder": True, "ImageTags": {}
                 })
     return content_json

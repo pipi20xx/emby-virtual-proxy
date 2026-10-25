@@ -82,6 +82,7 @@
 
 - **高级筛选器**：绑定一个筛选器规则组，精确控制该库收录的内容（见第 2 节）。
 - **TMDB ID 合并**：独立开启按 TMDB ID 合并版本（见第 3 节）。
+- **展示类型**：控制客户端按哪种媒体库界面渲染——电视剧库 / 电影库 / 混合（电影+剧集）。「自动」跟随资源类型：**全库默认按混合呈现，电影与剧集都可见**，其余资源类型按电视剧呈现（历史行为）；内容同时包含电影和剧集的标签、类型等库建议显式选「混合」，否则客户端只会按剧集浏览。
 - **范围限定**：将内容源限定在某个真实媒体库之内。
 - **封面**：单独配置封面样式、中英文标题、字体与素材图片目录（见第 5 节）。
 
@@ -215,7 +216,7 @@
 | `custom_zh_font_path` / `custom_en_font_path` | （空） | 全局封面中/英文字体路径（容器内绝对路径） |
 | `custom_image_path` | （空） | 全局封面素材图片目录（库级未指定时的后备） |
 
-> 虚拟库对象（`library` 数组元素）的关键字段：`resource_type`（见资源类型表）、`resource_id`、`advanced_filter_id`、`merge_by_tmdb_id`、`source_library`、`rsshub_url`、`rss_type`、`enable_retention` / `retention_days`、`fallback_tmdb_id` / `fallback_tmdb_type`、`cover_style` / `cover_title_zh` / `cover_title_en` / `cover_animation_format` 等封面字段。
+> 虚拟库对象（`library` 数组元素）的关键字段：`resource_type`（见资源类型表）、`resource_id`、`collection_type`（展示类型：`tvshows` / `movies` / `mixed`，`null` 为自动推导——全库→混合，其余→电视剧）、`advanced_filter_id`、`merge_by_tmdb_id`、`source_library`、`rsshub_url`、`rss_type`、`enable_retention` / `retention_days`、`fallback_tmdb_id` / `fallback_tmdb_type`、`cover_style` / `cover_title_zh` / `cover_title_en` / `cover_animation_format` 等封面字段。
 
 ---
 

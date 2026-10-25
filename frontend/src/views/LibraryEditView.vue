@@ -52,6 +52,16 @@
           />
 
           <v-select
+            v-model="draft.collection_type"
+            :items="collectionTypeOptions"
+            item-title="title"
+            item-value="value"
+            label="展示类型"
+            hint="客户端按哪种媒体库界面渲染。「自动」跟随资源类型:全库→混合,其余→电视剧;内容同时包含电影和剧集的库请选「混合」"
+            persistent-hint
+          />
+
+          <v-select
             v-model="draft.advanced_filter_id"
             :items="filterOptions"
             item-title="title"
@@ -109,7 +119,14 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useNotification } from '@/composables/useNotification'
 import { useConfigStore } from '@/stores/useConfigStore'
 import { deepClone } from '@/utils/clone'
-import { RESOURCE_TYPE_LABELS, createEmptyLibrary, type ResourceType, type VirtualLibrary } from '@/types/config'
+import {
+  COLLECTION_TYPE_LABELS,
+  RESOURCE_TYPE_LABELS,
+  createEmptyLibrary,
+  type CollectionType,
+  type ResourceType,
+  type VirtualLibrary,
+} from '@/types/config'
 
 const route = useRoute()
 const router = useRouter()
@@ -133,6 +150,14 @@ const resourceTypeOptions = (Object.keys(RESOURCE_TYPE_LABELS) as ResourceType[]
   value,
   title: RESOURCE_TYPE_LABELS[value],
 }))
+
+const collectionTypeOptions: { value: CollectionType | null; title: string }[] = [
+  { value: null, title: '自动(跟随资源类型)' },
+  ...(Object.keys(COLLECTION_TYPE_LABELS) as CollectionType[]).map((value) => ({
+    value,
+    title: COLLECTION_TYPE_LABELS[value],
+  })),
+]
 
 const filterOptions = computed(() => [
   { title: '无(不使用筛选器)', value: null },

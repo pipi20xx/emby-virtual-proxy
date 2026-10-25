@@ -29,7 +29,7 @@ from models import AppConfig, VirtualLibrary
 
 from . import handler_merger, handler_views
 from emby_net import emby_proxy_of
-from .handler_views import apply_full_layout, apply_legacy_layout
+from .handler_views import apply_full_layout, apply_legacy_layout, get_vlib_collection_type, get_vlib_include_item_types
 from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
 
@@ -185,7 +185,7 @@ def _build_vlib_latest_section(vlib: VirtualLibrary, server_id: str, user_id=Non
         "Name": f"最新{vlib.name}",
         "Id": f"latestmedia_{vlib.id}",
         "SectionType": "latestmedia",
-        "CollectionType": "tvshows",
+        "CollectionType": get_vlib_collection_type(vlib),
         "Monitor": ["markplayed", "videoplayback"],
         "ItemTypes": [],
         "ExcludedFolders": [],
@@ -301,7 +301,8 @@ async def _handle_vlib_latest_media(
     new_params["SortBy"] = "DateCreated"
     new_params["SortOrder"] = "Descending"
     new_params["Recursive"] = "true"
-    new_params["IncludeItemTypes"] = "Movie,Series,Video"
+    # 条目类型与展示类型一致(混合库取全集,电视剧/电影库只取对应类型)
+    new_params["IncludeItemTypes"] = get_vlib_include_item_types(vlib)
 
     post_filter_rules = []
     match_all = True
