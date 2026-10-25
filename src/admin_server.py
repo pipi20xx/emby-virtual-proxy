@@ -383,7 +383,19 @@ async def restart_proxy_container():
     return await system_service.restart_proxy_container()
 
 
-# --- 运行日志实时流(WebSocket;必须注册在 "/" 静态挂载之前) ---
+# --- 运行日志(实时流 WebSocket + 历史分页;必须注册在 "/" 静态挂载之前) ---
+
+@api_router.get("/system/logs/history", tags=["System Management"])
+async def get_log_history(
+    start_index: Optional[int] = Query(default=None, ge=0, description="结束游标(不含):返回结束于该索引的最多 limit 行;首屏用 tail,翻页传上一次的 next_start_index"),
+    tail: Optional[int] = Query(default=None, ge=1, description="首屏模式:返回最新 N 行"),
+    limit: int = Query(default=100, ge=1, le=500, description="单次返回行数上限"),
+):
+    """历史日志分页(合并 proxy+admin 按天文件,时间升序);实时增量走 /ws/system/logs。"""
+    if (start_index is None) == (tail is None):
+        raise HTTPException(status_code=400, detail="start_index 与 tail 必须二选一")
+    return log_service.read_history(start_index=start_index, tail=tail, limit=limit)
+
 
 @admin_app.websocket("/ws/system/logs")
 async def websocket_logs(websocket: WebSocket):
@@ -391,6 +403,8 @@ async def websocket_logs(websocket: WebSocket):
 
     浏览器 WS 握手无法携带自定义 header,鉴权走 ?token=;
     管理密码未启用时直接放行;鉴权失败以 4401 关闭,前端据此不重试。
+    ?backfill=0 跳过回填:前端自行用 /system/logs/history 拉首屏时使用,
+    避免 REST 首屏与 WS 回填两份历史重叠。
     """
     await websocket.accept()
     config = config_manager.load_config()
@@ -398,12 +412,14 @@ async def websocket_logs(websocket: WebSocket):
         await websocket.close(code=4401)
         return
 
+    skip_backfill = websocket.query_params.get("backfill") == "0"
     queue = LogBroadcaster.subscribe()
 
     async def _forward():
         try:
-            for message in LogBroadcaster.history_snapshot():
-                await websocket.send_text(message)
+            if not skip_backfill:
+                for message in LogBroadcaster.history_snapshot():
+                    await websocket.send_text(message)
             while True:
                 message = await queue.get()
                 await websocket.send_text(message)

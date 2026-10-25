@@ -25,8 +25,9 @@ ENV PYTHONPATH=/app/src
 # 将依赖文件复制到工作目录根部并安装
 COPY src/requirements.txt .
 # 使用 debian 清华源加速 apt-get，并使用阿里云 pip 镜像加速依赖安装
+# tzdata:支持 TZ 环境变量指定 IANA 时区(影响日志时间戳与按天日志切分)
 RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
-    apt-get update && apt-get install -y supervisor && \
+    apt-get update && apt-get install -y supervisor tzdata && \
     pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt
 
 # 关键改动：将编译好的前端文件复制到 /app/static，与 src 目录同级

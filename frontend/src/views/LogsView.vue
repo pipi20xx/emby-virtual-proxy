@@ -44,7 +44,7 @@
           <v-icon>mdi-content-copy</v-icon>
         </v-btn>
 
-        <v-btn icon variant="text" color="error" @click="clear">
+        <v-btn icon variant="text" color="error" @click="clearView">
           <v-icon>mdi-delete-outline</v-icon>
           <v-tooltip activator="parent" location="bottom">清空日志</v-tooltip>
         </v-btn>
@@ -53,9 +53,14 @@
       <v-divider />
 
       <div ref="viewportRef" class="log-viewport" @scroll.passive="handleScroll">
+        <div v-if="loadingHistory" class="log-loading">
+          <v-progress-circular indeterminate size="16" width="2" />
+          <span>加载更早日志…</span>
+        </div>
+
         <div v-if="groupedLogs.length === 0" class="log-empty">
           <v-icon size="20">mdi-console-line</v-icon>
-          <span>{{ rawLines.length === 0 ? '暂无日志' : '没有匹配的日志' }}</span>
+          <span>{{ historyLines.length === 0 && rawLines.length === 0 ? '暂无日志' : '没有匹配的日志' }}</span>
         </div>
 
         <div v-else class="log-list">
@@ -86,15 +91,23 @@
 <script setup lang="ts">
 /**
  * LogsView —— 运行日志页面(参考 Anime-Manager LogTerminal 终端交互)
- * 数据来自 /ws/system/logs 实时流(useLogStream),此处只做展示、筛选与跟随滚动。
+ *
+ * 数据分两路:
+ *   - 历史:REST /system/logs/history 分页(首屏只取最新 100 行,向上滚动加载更早,来源为按天日志文件);
+ *   - 实时:WS /ws/system/logs(backfill=0,只推连接之后的新行,避免与 REST 首屏重叠)。
+ * 此处负责展示、筛选、跟随滚动与向上翻页的滚动位置补偿。
  */
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 import SectionHeader from '@/components/common/SectionHeader.vue'
+import { getLogHistory, getLogTail } from '@/api/logs'
 import { useLogStream } from '@/composables/useLogStream'
 import { useNotification } from '@/composables/useNotification'
 
-const MAX_DISPLAY_LINES = 1000 // 视图最多渲染的原始日志行数
+const DEFAULT_TAIL = 100 // 首屏只拉最新 100 行,避免刷屏
+const PAGE_SIZE = 100 // 每次向上翻页加载的行数
+const LOAD_MORE_THRESHOLD = 80 // 距顶部多少像素内触发加载更早
+const MAX_LOADED_HISTORY = 3000 // 单次会话最多加载的历史行数,防止无限翻页拖垮渲染
 const SCROLL_BOTTOM_THRESHOLD = 32 // 距底部多少像素内视为"贴着底部"
 
 type LogEntry = { id: number; time: string; level: string; message: string }
@@ -112,6 +125,12 @@ const isPaused = ref(false)
 const followTail = ref(true)
 const pendingLogCount = ref(0)
 const frozenLines = ref<string[]>([]) // 暂停时的显示快照
+
+// --- 历史分页状态 ---
+const historyLines = ref<string[]>([]) // REST 加载的历史(含首屏,时间升序)
+const nextStartIndex = ref<number | null>(null) // 下一页结束游标;null = 已翻到最早
+const loadingHistory = ref(false)
+const prependingHistory = ref(false) // 前插历史期间,屏蔽"新日志到达"的滚动/计数逻辑
 
 const levelOptions = [
   { title: '全部', value: 'ALL', color: 'primary' },
@@ -165,10 +184,10 @@ function parseEntries(raws: string[]): LogEntry[] {
   return entries
 }
 
-// 暂停时冻结快照,恢复后重新同步最新数据
+// 暂停时冻结快照,恢复后重新同步最新数据;正常态 = 已加载历史 + 实时增量
 const displayedLines = computed(() => {
-  const source = isPaused.value ? frozenLines.value : rawLines.value
-  return source.slice(-MAX_DISPLAY_LINES)
+  const source = isPaused.value ? frozenLines.value : [...historyLines.value, ...rawLines.value]
+  return source
 })
 
 // --- 筛选 ---
@@ -218,14 +237,33 @@ function enableFollow(behavior: ScrollBehavior = 'auto') {
   nextTick(() => scrollToBottom(behavior))
 }
 
+// 翻页只由"用户主动向上滚动"触发:程序化滚动(跟随底部/前插补偿)方向向下,
+// 不会误触发;否则加载->补偿滚动->再触发会形成无人操作的连环加载
+let lastScrollTop = 0
+let zeroVisibleLoads = 0 // 本手势内连续"无可见新增"的翻页次数(内容全被筛选滤掉时高度不变)
+const MAX_ZERO_VISIBLE_LOADS = 3
+
 function handleScroll() {
+  const el = viewportRef.value
+  if (!el) return
+  const current = el.scrollTop
+  const scrollingUp = current < lastScrollTop
+  lastScrollTop = current
+
   followTail.value = isNearBottom()
   if (followTail.value) pendingLogCount.value = 0
+
+  // !followTail:排除内容变矮后浏览器钳制 scrollTop 造成的"假向上"滚动
+  if (scrollingUp && !followTail.value && current <= LOAD_MORE_THRESHOLD) {
+    zeroVisibleLoads = 0
+    void loadOlder()
+  }
 }
 
-// 新日志到达:跟随则滚底,否则累计待查看条数
+// 新日志到达:跟随则滚底,否则累计待查看条数(前插历史不算新日志)
 watch(visibleEntryCount, (cur, prev) => {
   if (prev === undefined || cur <= prev) return
+  if (prependingHistory.value) return
   if (followTail.value) {
     nextTick(() => scrollToBottom())
   } else {
@@ -239,7 +277,7 @@ watch([selectedLevel, searchQuery], () => enableFollow())
 // --- 暂停 / 恢复 ---
 function togglePause() {
   if (!isPaused.value) {
-    frozenLines.value = [...rawLines.value]
+    frozenLines.value = [...historyLines.value, ...rawLines.value]
     isPaused.value = true
   } else {
     isPaused.value = false
@@ -247,6 +285,89 @@ function togglePause() {
     enableFollow()
   }
 }
+
+// --- 历史分页 ---
+async function loadOlder() {
+  if (loadingHistory.value || nextStartIndex.value === null) return
+  if (historyLines.value.length >= MAX_LOADED_HISTORY) {
+    nextStartIndex.value = null
+    notify.info('本次会话加载的历史日志已达上限,刷新页面可重新从头浏览')
+    return
+  }
+
+  loadingHistory.value = true
+  const el = viewportRef.value
+  const anchorHeight = el?.scrollHeight ?? 0
+  prependingHistory.value = true
+  let addedVisible = false
+  try {
+    const res = await getLogHistory(nextStartIndex.value, PAGE_SIZE)
+    if (res.lines.length === 0) {
+      nextStartIndex.value = null // 已翻到最早(或索引越界),终止翻页
+      return
+    }
+    historyLines.value = [...res.lines, ...historyLines.value]
+    nextStartIndex.value = res.next_start_index
+    await nextTick()
+    // 前插内容撑高容器后,按高度差补偿 scrollTop,视觉位置不跳动
+    if (el) {
+      const added = el.scrollHeight - anchorHeight
+      if (added > 0) {
+        el.scrollTop += added
+        addedVisible = true
+      }
+    }
+  } catch {
+    notify.error('加载更早日志失败')
+    return
+  } finally {
+    loadingHistory.value = false
+    await nextTick()
+    prependingHistory.value = false
+  }
+
+  // 后续补页只发生在两种受控场景,避免无人操作时的连环请求:
+  //   1. 内容不足一屏(无法产生滚动事件)时继续补,直到可滚动;
+  //   2. 整页内容都被筛选滤掉(高度不变、scrollTop 出不了顶部区)时有限补几页,
+  //      超限后停下提示,等用户再次主动向上滚动才继续。
+  if (nextStartIndex.value === null) return
+  if (addedVisible) {
+    zeroVisibleLoads = 0
+    const vp = viewportRef.value
+    if (vp && vp.scrollHeight <= vp.clientHeight) void loadOlder()
+  } else if (zeroVisibleLoads < MAX_ZERO_VISIBLE_LOADS) {
+    zeroVisibleLoads += 1
+    void loadOlder()
+  } else {
+    zeroVisibleLoads = 0
+    notify.info('连续多页日志均被当前筛选条件隐藏,如需查看更早日志请调整筛选后重试')
+  }
+}
+
+/** 清空当前视图;保留翻页游标,向上滚动仍可重新拉取历史 */
+function clearView() {
+  clear()
+  historyLines.value = []
+}
+
+// 首屏:先 REST 拉最新 100 行落定,再连 WS 只收实时增量(时间窗极小,期间的日志可能缺失但不会重复)
+async function initialize() {
+  try {
+    const res = await getLogTail(DEFAULT_TAIL, PAGE_SIZE)
+    historyLines.value = res.lines
+    nextStartIndex.value = res.next_start_index
+  } catch {
+    notify.error('加载历史日志失败')
+  }
+  connect({ backfill: false })
+  await nextTick()
+  scrollToBottom()
+  // 内容不足一屏时主动补页,否则滚动条都不会出现,永远无法触发向上加载
+  const el = viewportRef.value
+  if (el && el.scrollHeight <= el.clientHeight && nextStartIndex.value !== null) void loadOlder()
+}
+
+onMounted(initialize)
 
 async function copyLogs() {
   const text = parseEntries(displayedLines.value)
@@ -264,8 +385,6 @@ async function copyLogs() {
     notify.error('复制失败,浏览器可能未授权剪贴板')
   }
 }
-
-onMounted(connect)
 </script>
 
 <style scoped>
@@ -313,6 +432,8 @@ onMounted(connect)
   height: calc(100vh - 260px);
   min-height: 360px;
   overflow-y: auto;
+  /* 前插历史时由代码自行补偿 scrollTop,禁用浏览器滚动锚定避免双重补偿 */
+  overflow-anchor: none;
   padding: 8px 12px;
   background: rgba(var(--v-theme-on-surface), 0.03);
 }
@@ -325,6 +446,24 @@ onMounted(connect)
   height: 100%;
   min-height: 200px;
   color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+}
+
+/* 顶部加载更早日志的悬浮指示(绝对定位,不影响滚动高度计算) */
+.log-loading {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(var(--v-theme-surface), 0.92);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+  font-size: 0.78rem;
+  color: rgba(var(--v-theme-on-surface), var(--v-medium-emphasis-opacity));
+  z-index: 2;
 }
 
 /* 分组:左侧时间列 + 右侧内容 */

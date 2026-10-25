@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from collections import deque
 from datetime import datetime
 
@@ -22,6 +23,22 @@ import app_paths
 LOG_DIR = str(app_paths.LOG_DIR)
 HISTORY_SIZE = 1000  # 内存回填缓冲条数,新 WS 连接建立时直接回填
 SUBSCRIBER_QUEUE_SIZE = 2000  # 单个订阅者积压上限,超出即丢弃(慢客户端不拖垮广播者)
+
+
+def apply_tz_env() -> str:
+    """应用 TZ 环境变量指定的时区。
+
+    Linux 容器内 TZ 在进程启动后需显式 tzset() 才对 time.localtime /
+    datetime.now() 生效(日志时间戳与按天日志切分都依赖它们);
+    Windows 无 tzset,系统本地时区即最终行为,直接跳过。
+
+    返回生效的 TZ 值(未设置返回空串),供启动日志说明。
+    """
+    tz = os.environ.get("TZ", "").strip()
+    if tz and hasattr(time, "tzset"):
+        os.environ["TZ"] = tz
+        time.tzset()
+    return tz
 
 
 class LogBroadcaster:
@@ -137,6 +154,7 @@ class _StreamToLogger:
 
 def init_logging(process_name: str, level=logging.INFO, console_format="%(asctime)s - %(levelname)s - %(message)s") -> None:
     """初始化 root logger:控制台 + 实时广播 + 按天文件。"""
+    tz_name = apply_tz_env()
     os.makedirs(LOG_DIR, exist_ok=True)
     root = logging.getLogger()
     root.setLevel(level)
@@ -169,3 +187,7 @@ def init_logging(process_name: str, level=logging.INFO, console_format="%(asctim
     # 重定向 stdout/stderr,捕获 print() 与库输出
     sys.stdout = _StreamToLogger(root, logging.INFO)
     sys.stderr = _StreamToLogger(root, logging.ERROR)
+
+    # 时区生效情况写入日志流,容器时间不对时一眼可见
+    offset = datetime.now().astimezone().strftime("%z") or "+0000"
+    logging.getLogger(__name__).info(f"日志时区: {tz_name or '系统默认'} (UTC{offset}),当前时间 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")

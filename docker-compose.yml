@@ -14,4 +14,5 @@ services:
     environment:
       - PROXY_CONTAINER_NAME=emby-proxy
       - PROXY_CORE_URL=http://localhost:8999
+      - TZ=Asia/Shanghai # 时区:影响日志时间戳与按天日志切分,可改为任意 IANA 时区名
     restart: unless-stopped
