@@ -33,12 +33,18 @@ _INTERNAL_FETCH_LIMIT = 1000
 async def load_cover_source_items(library_id: str, vlib, user_id: str, api_key: str) -> list:
     """取封面「内容指纹 + 素材」所需的条目。
 
-    优先读本地缓存(零 Emby 开销、与浏览直出看到的内容完全一致):
+    项目缓存开启时优先读本地缓存(零 Emby 开销、与浏览直出看到的内容完全一致):
     共享元数据 → 封面素材缓存 → 都没有才回退内部自调用。
-    旧实现无条件自调用一次 /Items,既多一次完整管线开销,又只在有缓存时算出的指纹才准。
+    **项目缓存关闭时必须忽略残留缓存**,否则会拿旧数据画封面(开关关掉后并不会
+    自动删除 SQLite 里的历史行,这里必须显式绕过)。
     """
     # 延迟导入:handler_views → handler_autogen → handler_items 会形成循环导入
     from . import handler_items
+
+    config = config_manager.load_config_readonly()
+    if not getattr(config, "enable_vlib_cache", True):
+        return await fetch_vlib_items_internal(vlib, user_id, api_key)
+
     meta = handler_items.get_shared_metadata(library_id)
     if meta and meta.get("items"):
         return meta["items"]
