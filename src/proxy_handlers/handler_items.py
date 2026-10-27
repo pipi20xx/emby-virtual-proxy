@@ -92,7 +92,8 @@ _SERVING_NUMERIC_SORT_FIELDS = {
 _SERVING_DATE_SORT_FIELDS = {"DateCreated", "PremiereDate"}
 # 可安全本地排序的字段白名单;出现白名单之外的 SortBy 一律回退实时查询(避免"排序静默失效")
 _SERVING_SAFE_SORT_FIELDS = (
-    _SERVING_NUMERIC_SORT_FIELDS | _SERVING_DATE_SORT_FIELDS | {"SortName", "Name", "Random"}
+    _SERVING_NUMERIC_SORT_FIELDS | _SERVING_DATE_SORT_FIELDS
+    | {"SortName", "Name", "Random", "DateLastContentAdded"}
 )
 
 # 叠加层按 Id 批量查询的每批条目数(控制 URL 长度)
@@ -279,6 +280,67 @@ def _items_signature(items: List[Dict[str, Any]]) -> str:
     return hashlib.md5(",".join(sorted(str(i.get("Id")) for i in items)).encode()).hexdigest()
 
 
+# 「最近更新」排序(Emby 的 DateLastContentAdded)不随条目 DTO 返回,只能在服务端排序。
+# 为了让它也能本地直出,构建数据源时按该字段拉一遍 id 顺序,把"排名"烙进条目:
+# 排名越大 = 越新,于是可以复用统一的 reverse=descending 排序逻辑而不必特判方向。
+_PROXY_RANK_SORT = "DateLastContentAdded"
+_PROXY_RANK_FIELD = "_EvpRankDateLastContentAdded"
+_RANK_PAGE = 500
+
+
+def _base_has_rank(items: List[Dict[str, Any]]) -> bool:
+    """抽样检查数据源是否带「最近更新」排名(老数据没有,需要重建一次)。"""
+    for item in items[:20]:
+        if isinstance(item, dict) and _PROXY_RANK_FIELD in item:
+            return True
+    return False
+
+
+async def _fetch_content_added_ranks(user_id: str, session: ClientSession, real_emby_url: str,
+                                     headers: Dict[str, str],
+                                     proxy: Optional[str] = None) -> Dict[str, int]:
+    """按 DateLastContentAdded 降序拉一遍 id 顺序,返回 {条目ID: 排名};排名越大越新。
+
+    失败返回空字典(调用方保持原有行为,不注入排名 → 该排序继续回退实时查询)。
+    """
+    params_base: Dict[str, Any] = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series,Video",
+        "SortBy": _PROXY_RANK_SORT,
+        "SortOrder": "Descending",
+        "Limit": str(_RANK_PAGE),
+        "Fields": "DateCreated",
+        "EnableUserData": "false",
+        "EnableImages": "false",
+    }
+    token = _extract_token(headers)
+    if token:
+        params_base["X-Emby-Token"] = token
+
+    ordered: List[str] = []
+    start = 0
+    while True:
+        params = dict(params_base)
+        params["StartIndex"] = str(start)
+        async with session.get(f"{real_emby_url}/emby/Users/{user_id}/Items",
+                               params=params, headers=headers, proxy=proxy) as resp:
+            if resp.status != 200:
+                logger.warning(f"「最近更新」排序抓取失败, Status: {resp.status},该排序继续回退实时查询。")
+                return {}
+            batch = (await resp.json(content_type=None)).get("Items", [])
+        if not batch:
+            break
+        ordered.extend(str(it["Id"]) for it in batch if it.get("Id"))
+        start += len(batch)
+        if len(batch) < _RANK_PAGE:
+            break
+
+    total = len(ordered)
+    if not total:
+        return {}
+    return {item_id: (total - index) for index, item_id in enumerate(ordered)}
+
+
 def _base_fetch_params(api_token: Optional[str]) -> Dict[str, Any]:
     """全库裸拉参数:不含任何资源/筛选参数,所有虚拟库完全一致 —— 这正是可共享的前提。"""
     params: Dict[str, Any] = {
@@ -316,6 +378,21 @@ async def build_base_items(user_id: str, session: ClientSession, real_emby_url: 
 
     for item in all_items:
         item.pop("UserData", None)
+
+    # 顺带把「最近更新」顺序烙进条目,让这个排序也能本地直出(失败则跳过,不影响主流程)
+    try:
+        ranks = await _fetch_content_added_ranks(user_id, session, real_emby_url, headers, proxy=proxy)
+        if ranks:
+            matched = 0
+            for item in all_items:
+                rank = ranks.get(str(item.get("Id")))
+                if rank is not None:
+                    item[_PROXY_RANK_FIELD] = rank
+                    matched += 1
+            logger.info(f"「最近更新」排序已就绪:覆盖 {matched}/{len(all_items)} 个条目。")
+    except Exception as e:
+        logger.warning(f"「最近更新」排序抓取出错(忽略): {e}")
+
     logger.info(f"全库数据源裸拉完成,共 {len(all_items)} 个条目。")
     return all_items
 
@@ -348,7 +425,16 @@ def store_base_items(source_key: str, items: List[Dict[str, Any]]) -> bool:
     if changed:
         drop_source_overlays(source_key)
         db_manager.delete_vlib_user_overlay(source_key)
-        logger.info(f"全库数据源 '{source_key}' 内容已变化({len(items)} 项),相关用户叠加层已失效。")
+        # 数据源本身变了:所有虚拟库的「派生结果」都过期了(不只当前这个库)。
+        # 这些派生结果都引用 base 的条目对象,不失效会继续给出旧数据(例如缺新入库的条目、
+        # 或缺构建期烙入的排序排名)。失效后下次浏览会从 base 本地重新派生,不产生 Emby 请求。
+        vlib_metadata_cache.clear()
+        serving_result_cache.clear()
+        db_manager.clear_vlib_metadata()
+        logger.info(
+            f"全库数据源 '{source_key}' 内容已变化({len(items)} 项):"
+            f"用户叠加层与各库派生结果已一并失效,将在下次浏览时本地重新派生。"
+        )
     return changed
 
 
@@ -359,7 +445,9 @@ async def ensure_base_items(config: AppConfig, source_key: str, user_id: str, se
     entry = get_base_items(source_key)
     now = int(time.time())
     if entry and not force and now - int(entry["updated_at"]) <= _BASE_HARD_TTL:
-        return entry
+        if _base_has_rank(entry["items"]):
+            return entry
+        logger.info(f"全库数据源 '{source_key}' 缺少「最近更新」排名,重建一次以支持该排序。")
 
     items = await build_base_items(user_id, session, real_emby_url, headers, proxy=proxy)
     if not items:
@@ -749,6 +837,9 @@ def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: s
         tokens = [t for t in tokens if t != "Random"]
 
     def _key(token: str):
+        if token == _PROXY_RANK_SORT:
+            # 排名越大越新,与其它字段一样用 reverse=descending 表达"新→旧"
+            return lambda i: i.get(_PROXY_RANK_FIELD, -1)
         if token in _SERVING_NUMERIC_SORT_FIELDS:
             return lambda i: float(i.get(token) or 0)
         if token in _SERVING_DATE_SORT_FIELDS:
@@ -883,7 +974,10 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     用户叠加层未命中/硬过期 → 回退实时查询并后台构建(该用户此后秒开);
     任意一层软过期 → 照常返回并后台刷新(stale-while-revalidate)。
     """
-    if method != "GET" or not config.enable_vlib_local_serving or not config.enable_vlib_cache:
+    if method != "GET":
+        return None
+    if not config.enable_vlib_local_serving or not config.enable_vlib_cache:
+        proxy_cache.bump("serving_skip_disabled")
         return None
     # 仅当筛选/搜索参数带"非空值"时才回退实时查询;
     # Emby 客户端常发送空值参数(如 Filters=),不能据此判定为筛选请求
@@ -894,9 +988,11 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         if str(params.get(p, "")).strip().lower() in ("true", "1", "yes")
     ]
     if blocked_params:
+        proxy_cache.bump("serving_skip_blocked")
         logger.info(f"直出跳过:'{vlib.name}' 请求包含筛选参数 {blocked_params},回退实时查询。")
         return None
     if str(params.get("Recursive", "true")).lower() not in ("", "true"):
+        proxy_cache.bump("serving_skip_recursive")
         return None
     # 排序字段白名单:本地排序不支持的字段直接回退实时查询,不让"排序静默失效"
     sort_by_raw = params.get("SortBy", "SortName")
@@ -905,6 +1001,7 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         if t.strip() and t.strip() not in _SERVING_SAFE_SORT_FIELDS
     ]
     if unsupported_sorts:
+        proxy_cache.bump("serving_skip_sort")
         logger.info(f"直出跳过:'{vlib.name}' 请求使用了不支持的排序字段 {unsupported_sorts},回退实时查询。")
         return None
 
@@ -913,24 +1010,41 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
 
     meta = await aget_shared_metadata(vlib.id)
     if meta is None:
+        proxy_cache.bump("serving_miss")
+        proxy_cache.bump("serving_miss_meta")
         logger.info(f"直出元数据未命中('{vlib.name}'),本次实时查询并后台构建共享元数据。")
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
     meta_age = now - int(meta["updated_at"])
     if meta_age > _SERVING_HARD_TTL:
+        proxy_cache.bump("serving_miss")
+        proxy_cache.bump("serving_expired_meta")
         logger.info(f"直出元数据已硬过期({meta_age // 3600}h),回退实时查询并后台重建。")
+        _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
+        return None
+
+    # 「最近更新」排序依赖构建期烙进条目的排名;老数据没有时会静默给出错误顺序,
+    # 所以这里显式检查,缺排名就回退实时查询(重建一次后自动可用)。
+    if _PROXY_RANK_SORT in (sort_by_raw or "") and not _base_has_rank(meta["items"]):
+        proxy_cache.bump("serving_skip_sort_no_rank")
+        logger.info(f"直出跳过:'{vlib.name}' 的派生结果缺少「最近更新」排名,本次回退并后台补建。")
+        # 从共享数据源本地重新派生即可补上排名(不产生 Emby 请求),后台自愈:
+        # 本次先回退实时查询,下一次同样请求就能直出。
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
 
     overlay = await aget_user_overlay(source_key, user_id)
     if overlay is None:
         proxy_cache.bump("serving_miss")
+        proxy_cache.bump("serving_miss_overlay")
         logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, 数据源 {source_key}),本次实时查询并后台构建。")
         headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
         return None
     overlay_age = now - int(overlay["updated_at"])
     if overlay_age > _OVERLAY_HARD_TTL:
+        proxy_cache.bump("serving_miss")
+        proxy_cache.bump("serving_expired_overlay")
         logger.info(f"用户叠加层已硬过期({overlay_age // 3600}h),回退实时查询并后台重建。")
         headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
