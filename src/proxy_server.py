@@ -391,6 +391,72 @@ async def clear_vlib_cache():
     return {"success": True}
 
 
+@proxy_app.get("/api/internal/image-cache-selftest")
+async def image_cache_selftest(path: str, query: str = ""):
+    """图片缓存自检:给定请求 path 与原始 query,报告"是否命中同一个文件"。
+
+    排查"落盘了但读不到"只需这一条:它复用了与真实请求完全相同的
+    匹配正则、参数解析与缓存键计算,只是不真正返回图片。
+    示例:
+      /api/internal/image-cache-selftest
+        ?path=emby/Items/230831/Images/Primary
+        &query=maxHeight=563%26maxWidth=375%26tag=<tag>%26quality=90
+    """
+    from urllib.parse import parse_qsl
+
+    handler = handler_image_cache
+    dir_info = {"cache_dir": str(handler.CACHE_DIR)}
+    try:
+        handler.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        dir_info["cache_dir_ok"] = handler.CACHE_DIR.is_dir()
+    except Exception as e:
+        dir_info["cache_dir_ok"] = False
+        dir_info["cache_dir_error"] = str(e)
+
+    match = handler._IMAGE_PATH_RE.search(f"/{path}")
+    if not match:
+        return {
+            "matched": False,
+            "reason": "路径不匹配图片规则",
+            "pattern": handler._IMAGE_PATH_RE.pattern,
+            "path": path,
+            **dir_info,
+        }
+
+    item_id, image_type = match.group(1), match.group(2)
+    params = dict(parse_qsl(query or "", keep_blank_values=True))
+    tag = params.get("tag") or params.get("Tag")
+
+    result = {
+        "matched": True,
+        "item_id": item_id,
+        "image_type": image_type,
+        "virtual_or_placeholder": bool(
+            handler._VLIB_ID_RE.match(item_id) or item_id.startswith(("tmdb_", "tmdb-"))
+        ),
+        "tag_present": bool(tag),
+        "params": params,
+        **dir_info,
+    }
+
+    if tag:
+        key = handler._cache_key(item_id, image_type, tag, params)
+        found = handler._find_cached(key)
+        result.update({
+            "key": key,
+            "bucket": key[:2],
+            "cached": bool(found),
+            "cached_path": str(found) if found else None,
+        })
+
+    try:
+        result["usage"] = await handler.cache_usage()
+    except Exception as e:
+        result["usage_error"] = str(e)
+
+    return result
+
+
 @proxy_app.get("/api/internal/cache-stats")
 async def cache_stats():
     """缓存状态与命中率快照(供管理面板展示,让"下一步优化哪里"有数据依据)。"""

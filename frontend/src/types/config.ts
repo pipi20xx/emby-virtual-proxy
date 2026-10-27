@@ -86,6 +86,8 @@ export interface AppConfig {
   enable_image_cache: boolean
   /** 图片缓存磁盘上限(MB);0 = 不限制 */
   image_cache_max_mb: number
+  /** 图片缓存是否要求请求带凭证(默认关闭:浏览器 <img> 通常不带凭证) */
+  image_cache_require_credential: boolean
   /** TMDB 索引重建间隔(小时),0 = 仅启动时构建一次 */
   tmdb_index_refresh_interval: number
   /** API 响应缓存 TTL(秒),0 = 禁用 */
@@ -213,6 +215,7 @@ export function createDefaultConfig(): AppConfig {
     enable_merge_cache: true,
     enable_image_cache: true,
     image_cache_max_mb: 2048,
+    image_cache_require_credential: false,
     tmdb_index_refresh_interval: 24,
     api_cache_ttl: 300,
     default_cover_style: 'style_multi_1',

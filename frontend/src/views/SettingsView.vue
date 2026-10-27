@@ -176,6 +176,14 @@
                   persistent-hint
                   @update:model-value="setImageCacheMaxMb"
                 />
+                <v-switch
+                  v-model="draft.image_cache_require_credential"
+                  color="primary"
+                  label="图片缓存要求凭证"
+                  :disabled="!draft.enable_image_cache"
+                  hint="默认关闭。多数 Emby 的图片接口本身不鉴权,而浏览器加载海报时不会携带可识别的 Cookie/令牌 —— 开启会导致图片全部绕过本地缓存。仅当你的 Emby 确实对图片接口做了鉴权时才需要打开。"
+                  persistent-hint
+                />
 
                 <div class="text-caption text-medium-emphasis">
                   <div class="font-weight-medium text-high-emphasis mb-1">工作原理</div>

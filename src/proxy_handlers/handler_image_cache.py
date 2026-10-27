@@ -85,8 +85,15 @@ def _find_cached(key: str) -> Optional[Path]:
 
 
 def _has_credential(request: Request) -> bool:
-    """只有带令牌的请求才允许命中缓存(否则等于绕开 Emby 鉴权读图)。"""
+    """判断请求是否携带了某种 Emby 凭证(只是"有会话"的门槛,不做真伪校验)。
+
+    注意:浏览器 <img> 标签无法设置自定义请求头,Emby Web 与多数第三方客户端
+    加载海报时依赖 Cookie 或 api_key 查询参数。只认 X-Emby-Token 会把这类
+    正常图片请求全部挡掉(表现为 image_miss 永远是 0)。
+    """
     if request.headers.get("x-emby-token") or request.headers.get("x-emby-authorization"):
+        return True
+    if request.headers.get("cookie"):
         return True
     params = request.query_params
     return bool(params.get("X-Emby-Token") or params.get("api_key"))
@@ -196,6 +203,7 @@ async def handle_cached_image(request: Request, full_path: str, method: str,
 
     config = config_manager.load_config_readonly()
     if not getattr(config, "enable_image_cache", True):
+        proxy_cache.bump("image_skip_disabled")
         return None
 
     match = _IMAGE_PATH_RE.search(f"/{full_path}")
@@ -205,14 +213,20 @@ async def handle_cached_image(request: Request, full_path: str, method: str,
     item_id, image_type = match.group(1), match.group(2)
     # 虚拟库封面 / 伪造占位条目不走这里(前者由 handler_images 处理,后者没有真实图片)
     if _VLIB_ID_RE.match(item_id) or item_id.startswith(("tmdb_", "tmdb-")):
+        proxy_cache.bump("image_skip_virtual")
         return None
     # 分块请求(Range)不接管:整图返回会破坏 Range 语义,交给默认转发
     if request.headers.get("range"):
+        proxy_cache.bump("image_skip_range")
         return None
     tag = request.query_params.get("tag") or request.query_params.get("Tag")
     if not tag:
+        proxy_cache.bump("image_skip_no_tag")
         return None  # 没有 tag 的 URL 不稳定,不能当 immutable 缓存
-    if not _has_credential(request):
+    # 默认不校验凭证:Emby 的图片接口通常不鉴权,浏览器 <img> 也不带可识别凭证。
+    # 只有在 Emby 确实对图片做了鉴权时,才建议打开 image_cache_require_credential。
+    if getattr(config, "image_cache_require_credential", False) and not _has_credential(request):
+        proxy_cache.bump("image_skip_no_cred")
         return None
 
     key = _cache_key(item_id, image_type, tag, request.query_params)
@@ -229,7 +243,8 @@ async def handle_cached_image(request: Request, full_path: str, method: str,
     cached = _find_cached(key)
     if cached is not None:
         proxy_cache.bump("image_hit")
-        logger.debug(f"图片缓存命中: {item_id}/{image_type}")
+        # 命中是"稀有事件"(客户端拿到 immutable 后基本不再请求),所以用 INFO 记为可见证据
+        logger.info(f"图片缓存命中: {item_id}/{image_type}")
         return FileResponse(
             str(cached),
             media_type=_MEDIA_TYPE_BY_SUFFIX.get(cached.suffix, "image/jpeg"),

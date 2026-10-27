@@ -95,6 +95,12 @@ class AppConfig(BaseModel):
     enable_image_cache: bool = Field(default=True)
     image_cache_max_mb: int = Field(default=2048)
 
+    # 新增：图片缓存是否要求请求携带凭证(Cookie/token)。
+    # 默认 False:多数 Emby 的 /Items/{id}/Images 接口本身不鉴权(实测直连不带凭证也 200),
+    # 而浏览器 <img> 请求通常不带任何可识别的凭证 —— 开启会命中率归零。
+    # 只有当你的 Emby 确实对图片接口做了鉴权时,才需要打开。
+    image_cache_require_credential: bool = Field(default=False)
+
     # 新增：TMDB 索引重建间隔(小时),0 表示仅启动时构建一次、之后靠查询自愈回写维持
     tmdb_index_refresh_interval: int = Field(default=24)
     

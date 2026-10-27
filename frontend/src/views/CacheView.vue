@@ -258,6 +258,12 @@
           height="8"
           rounded
         />
+        <div class="text-caption text-medium-emphasis">
+          说明:图片 URL 自带内容指纹,我们回的是 <code>immutable</code> —— 浏览器会自己长期复用,
+          所以刷新页面通常<strong>不会再请求图片</strong>,<code>image_hit</code> 长期为 0 属正常。
+          真正有意义的指标是 <code>image_miss</code>(= 实际抓取并落盘的张数);
+          想看到 hit,可用 curl 连打同一张图,或换个浏览器 / 清掉浏览器缓存。
+        </div>
       </v-card-text>
     </v-card>
 
@@ -375,7 +381,8 @@ const tiles = computed(() => {
   const base = stats.value?.base
   const servingRate = hitRate('serving_hit', 'serving_miss')
   const resultRate = hitRate('result_hit', 'result_miss')
-  const imageRate = hitRate('image_hit', 'image_miss')
+  const imageMiss = counter('image_miss')
+  const imageHit = counter('image_hit')
   return [
     {
       label: '全库数据源',
@@ -397,11 +404,12 @@ const tiles = computed(() => {
       progressColor: resultRate !== undefined && resultRate < 50 ? 'warning' : 'success',
     },
     {
-      label: '图片命中率',
-      value: imageRate === undefined ? '尚无请求' : `${imageRate}%`,
-      hint: `${formatBytes(stats.value?.images?.bytes)} / ${imageCapLabel.value}`,
-      progress: imageRate,
-      progressColor: imageRate !== undefined && imageRate < 50 ? 'warning' : 'success',
+      // 图片用"已缓存张数"作主指标:客户端拿到 immutable 后不再请求,命中率会长期是 0
+      label: '图片已缓存',
+      value: `${stats.value?.images?.files ?? 0} 张`,
+      hint: `${formatBytes(stats.value?.images?.bytes)} / ${imageCapLabel.value} · 已抓取 ${imageMiss} 次 / 命中 ${imageHit} 次`,
+      progress: imageUsagePercent.value,
+      progressColor: (imageUsagePercent.value ?? 0) > 85 ? 'error' : 'primary',
     },
   ]
 })
