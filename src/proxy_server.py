@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from typing import Tuple, Dict, List, Optional
 
-from logger import init_logging, LogBroadcaster
+from logger import init_logging, LogBroadcaster, normalize_uvicorn_loggers
 
 # 日志初始化须先于下方项目模块导入,导入期的日志才能进入文件与实时流
 # 注意:这里是"启动默认级别",进程启动后会在 lifespan 里按 config.log_level 重新应用。
@@ -71,6 +71,8 @@ async def lifespan(app: FastAPI):
     if isinstance(_level_value, int):
         logging.getLogger().setLevel(_level_value)
         logger.info(f"日志级别已按配置应用: {_level_name}")
+    # 消除 uvicorn 自装 handler 带来的重复访问日志(详见 logger.normalize_uvicorn_loggers)
+    normalize_uvicorn_loggers()
     # 启动预热:延迟到服务开始监听后(回填缓存/补封面/按配置全量刷新)
     prewarm_task = asyncio.create_task(_startup_warmup())
     yield
@@ -350,23 +352,32 @@ async def rebuild_vlib(library_id: str):
 
 @proxy_app.post("/api/internal/invalidate-vlib/{library_id}")
 async def invalidate_vlib_cache(library_id: str):
-    """精准失效某个虚拟库的缓存(改库规则/删库后由 admin 调用)。
+    """失效某个虚拟库的派生缓存(改库规则/删库后由 admin 调用)。
 
-    清掉:该库的派生元数据、封面素材、结果层缓存 + 对应 SQLite 行,
-    以及全库数据源(规则变化后其派生结果不再适用)与合并结果缓存;
-    同时清空 API 响应缓存,避免旧列表在 TTL 内继续被返回。
+    只清「该库自己的东西」+ 通用响应缓存/合并结果缓存;
+    **不动全库数据源(L0)与用户状态层(L2)**:这两层是多个库共享的,
+    改一个库的规则完全不必让其它库重新向 Emby 拉一遍全库。
+    仅当这个库已经被删掉、且一个虚拟库都不剩时,才顺手清掉共享层(避免残留占内存)。
     """
     proxy_cache.drop_vlib_memory(library_id)
-    vlib_base_cache.clear()
     proxy_cache.merge_result_cache.clear()
     proxy_cache.api_cache.clear()
 
     db_manager.delete_vlib_items_cache(library_id)
     db_manager.delete_vlib_metadata(library_id)
     db_manager.delete_vlib_user_overlay(library_id)
-    db_manager.delete_vlib_base(handler_items.base_source_key())
 
-    logger.info(f"已失效虚拟库 {library_id} 的全部缓存(内存 + SQLite + 响应缓存)。")
+    config = config_manager.load_config_readonly()
+    library_exists = any(v.id == library_id for v in config.virtual_libraries)
+    if not library_exists and not config.virtual_libraries:
+        # 已经没有任何虚拟库:共享数据源与用户状态层再留着也没人用
+        vlib_base_cache.clear()
+        user_overlay_cache.clear()
+        db_manager.delete_vlib_base(handler_items.base_source_key())
+        db_manager.clear_vlib_user_overlay()
+        logger.info("已无任何虚拟库,全库数据源与用户状态层一并清理。")
+
+    logger.info(f"已失效虚拟库 {library_id} 的派生缓存(内存 + SQLite + 响应缓存)。")
     return {"success": True, "library_id": library_id}
 
 
@@ -392,12 +403,19 @@ async def cache_stats():
     libraries = []
     for vlib in config.virtual_libraries:
         meta = handler_items.get_shared_metadata(vlib.id)
+        # 筛选模式与"能否从共享数据源派生"直接决定该库的缓存收益,面板里要能看见
+        adv_filter = next(
+            (f for f in config.advanced_filters if f.id == vlib.advanced_filter_id), None
+        ) if getattr(vlib, "advanced_filter_id", None) else None
         libraries.append({
             "id": vlib.id,
             "name": vlib.name,
             "resource_type": vlib.resource_type,
             "items": len(meta["items"]) if meta else 0,
             "age_seconds": (now - int(meta["updated_at"])) if meta else None,
+            "filter_name": adv_filter.name if adv_filter else None,
+            "filter_mode": getattr(adv_filter, "execution_mode", None) if adv_filter else None,
+            "local_capable": handler_items.can_derive_from_base(config, vlib),
         })
 
     overlays = []
@@ -437,6 +455,27 @@ async def cache_stats():
             "api_entries": len(proxy_cache.api_cache),
         },
         "images": images,
+        "api_cache": {
+            "enabled": bool(config.enable_cache) and not proxy_cache.api_cache_disabled,
+            "ttl_seconds": int(config.api_cache_ttl or 0),
+            "entries": len(proxy_cache.api_cache),
+        },
+        "cover_materials": {
+            "libraries": len(vlib_items_cache),
+        },
+        "tmdb_index": {
+            "count": db_manager.count_tmdb_index(),
+            "age_seconds": db_manager.get_tmdb_index_age_seconds(),
+            "enabled": bool(config.enable_tmdb_index),
+        },
+        "ttls": {
+            "meta_soft": handler_items._SERVING_SOFT_TTL,
+            "meta_hard": handler_items._SERVING_HARD_TTL,
+            "overlay_soft": handler_items._OVERLAY_SOFT_TTL,
+            "overlay_hard": handler_items._OVERLAY_HARD_TTL,
+            "base_soft": handler_items._BASE_SOFT_TTL,
+            "merge": getattr(proxy_cache.merge_result_cache, "ttl", 900),
+        },
     }
 
 
@@ -445,6 +484,13 @@ async def reset_cache_stats():
     """清零计数器(不影响任何缓存内容)。"""
     proxy_cache.reset_counters()
     return {"success": True}
+
+
+@proxy_app.post("/api/internal/clear-image-cache")
+async def clear_image_cache():
+    """清空图片本地化缓存(不动虚拟库封面)。"""
+    result = await handler_image_cache.clear_cache()
+    return {"success": True, **result}
 
 
 @proxy_app.post("/api/internal/probe-vlib/{library_id}")
@@ -568,8 +614,9 @@ async def _startup_warmup():
             if persisted:
                 vlib_items_cache[vlib.id] = persisted
                 logger.info(f"启动预热:已从 SQLite 恢复库 '{vlib.name}' 的 {len(persisted)} 条项目缓存。")
-        if config.enable_vlib_local_serving:
-            # 全库数据源:所有虚拟库共享,回填后各库派生都不必等 Emby
+        if config.enable_vlib_local_serving and config.virtual_libraries:
+            # 全库数据源:所有虚拟库共享,回填后各库派生都不必等 Emby。
+            # 没有任何虚拟库时不回填 —— 否则会白白把几十 MB 的条目读进内存且永远用不到。
             source_key = handler_items.base_source_key()
             base = handler_items.get_base_items(source_key)
             if base:
@@ -727,10 +774,12 @@ async def reverse_proxy(request: Request, full_path: str):
             cached_response_data = proxy_cache.api_cache.get(cache_key)
             if cached_response_data:
                 content, status, headers = cached_response_data
-                logger.info(f"✅ Cache HIT for key: {cache_key}")
+                proxy_cache.bump("api_hit")
+                logger.debug(f"响应缓存命中: {cache_key}")
                 return Response(content=content, status_code=status, headers=headers)
         if cache_key:
-            logger.info(f"❌ Cache MISS for key: {cache_key}")
+            proxy_cache.bump("api_miss")
+            logger.debug(f"响应缓存未命中: {cache_key}")
 
     proxy_address = f"{request.url.scheme}://{request.url.netloc}"
     session = request.app.state.aiohttp_session
@@ -753,7 +802,9 @@ async def reverse_proxy(request: Request, full_path: str):
     # 播放/收藏状态写操作成功后,立即失效该用户的叠加层(否则"已看/未看"最长要等 10 分钟)
     _maybe_invalidate_user_state(request, full_path, response)
 
-    if config.enable_cache and not proxy_cache.api_cache_disabled and cache_key and response and response.status_code == 200 and not isinstance(response, StreamingResponse):
+    if (config.enable_cache and not proxy_cache.api_cache_disabled and cache_key and response
+            and response.status_code == 200 and not isinstance(response, StreamingResponse)
+            and not response.headers.get("X-EVP-Served-By")):
         content_type = response.headers.get("Content-Type", "")
         if "application/json" in content_type:
             # For aiohttp responses, we need to read the body before caching

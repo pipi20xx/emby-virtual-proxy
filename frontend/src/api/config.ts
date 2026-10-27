@@ -17,3 +17,14 @@ export async function getCacheStats(): Promise<CacheStats> {
   const { data } = await client.get<CacheStats>('/cache-stats')
   return data
 }
+
+/** 清空图片本地化缓存(不动虚拟库封面) */
+export async function clearImageCache(): Promise<{ removed: number }> {
+  const { data } = await client.post<{ removed: number }>('/cache-stats/clear-images')
+  return data
+}
+
+/** 清零命中率计数器(不影响缓存内容) */
+export async function resetCacheCounters(): Promise<void> {
+  await client.post('/cache-stats/reset')
+}

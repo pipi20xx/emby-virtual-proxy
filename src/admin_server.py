@@ -23,7 +23,7 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, Request, Respons
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from logger import init_logging, LogBroadcaster
+from logger import init_logging, LogBroadcaster, normalize_uvicorn_loggers
 
 # 日志初始化须先于下方项目模块导入,导入期的日志才能进入文件与实时流
 init_logging("admin", level=logging.INFO, console_format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -250,14 +250,69 @@ async def clear_vlib_cache():
         raise HTTPException(status_code=500, detail=f"清空虚拟库缓存时发生内部错误: {e}")
 
 
-# --- 缓存状态(转发代理核心的快照,供面板展示命中率/体积) ---
+# --- 缓存状态(转发代理核心的快照 + 本进程调度器信息) ---
+
+def _job_snapshot(scheduler, job_id: str):
+    """取一个 APScheduler 任务的下次运行时间;未调度返回 None。"""
+    if scheduler is None:
+        return None
+    try:
+        job = scheduler.get_job(job_id)
+    except Exception:
+        return None
+    if job is None:
+        return None
+
+    next_run = getattr(job, "next_run_time", None)
+    payload = {"id": job_id, "next_run_at": None, "next_run_in_seconds": None}
+    if next_run is not None:
+        payload["next_run_at"] = next_run.isoformat()
+        try:
+            from datetime import datetime
+            payload["next_run_in_seconds"] = max(
+                0, int((next_run - datetime.now(next_run.tzinfo)).total_seconds())
+            )
+        except Exception:
+            pass
+    return payload
+
+
+def _schedule_snapshot() -> dict:
+    """定时任务快照(调度器只存在于 admin 进程,所以在这里取)。"""
+    return {
+        "vlib_refresh": _job_snapshot(vlib_cache_service.scheduler, "vlib_cache_refresh_job"),
+        "tmdb_index": _job_snapshot(vlib_cache_service.scheduler, "tmdb_index_refresh_job"),
+        "rss_refresh": _job_snapshot(rss_service.scheduler, "rss_refresh_job"),
+    }
+
+
+def _cache_config_snapshot() -> dict:
+    """与缓存相关的配置摘要(面板上说明"为什么是这样")。"""
+    config = config_manager.load_config_readonly()
+    return {
+        "vlib_cache_enabled": bool(config.enable_vlib_cache),
+        "local_serving_enabled": bool(config.enable_vlib_local_serving),
+        "refresh_interval_hours": int(config.vlib_cache_refresh_interval or 0),
+        "api_cache_enabled": bool(config.enable_cache),
+        "api_cache_ttl": int(config.api_cache_ttl or 0),
+        "merge_cache_enabled": bool(getattr(config, "enable_merge_cache", True)),
+        "enable_tmdb_index": bool(config.enable_tmdb_index),
+        "tmdb_index_refresh_interval": int(config.tmdb_index_refresh_interval or 0),
+        "image_cache_enabled": bool(getattr(config, "enable_image_cache", True)),
+        "image_cache_max_mb": int(getattr(config, "image_cache_max_mb", 0) or 0),
+    }
+
 
 @api_router.get("/cache-stats", tags=["System"])
 async def get_cache_stats():
-    """返回代理核心的缓存状态与命中率;核心不可达时返回 available=False,不抛错。"""
+    """返回代理核心的缓存状态 + 命中率 + 下次自动刷新时间;核心不可达时不抛错。"""
+    schedule = _schedule_snapshot()
+    config_summary = _cache_config_snapshot()
+
     proxy_core_url = _proxy_core_url()
     if not proxy_core_url:
-        return {"available": False, "reason": "未配置 PROXY_CORE_URL"}
+        return {"available": False, "reason": "未配置 PROXY_CORE_URL",
+                "schedule": schedule, "config": config_summary}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -265,12 +320,59 @@ async def get_cache_stats():
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
-                    return {"available": False, "reason": f"代理核心返回 {resp.status}"}
+                    return {"available": False, "reason": f"代理核心返回 {resp.status}",
+                            "schedule": schedule, "config": config_summary}
                 data = await resp.json(content_type=None)
                 data["available"] = True
+                data["schedule"] = schedule
+                data["config"] = config_summary
                 return data
     except Exception as e:
-        return {"available": False, "reason": str(e)}
+        return {"available": False, "reason": str(e),
+                "schedule": schedule, "config": config_summary}
+
+
+@api_router.post("/cache-stats/reset", tags=["System"])
+async def reset_cache_counters():
+    """清零代理核心的命中率计数器(不影响任何缓存内容)。"""
+    proxy_core_url = _proxy_core_url()
+    if not proxy_core_url:
+        raise HTTPException(status_code=400, detail="未配置 PROXY_CORE_URL")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{proxy_core_url.rstrip('/')}/api/internal/cache-stats/reset",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    raise HTTPException(status_code=resp.status, detail="代理核心拒绝重置计数器")
+                return {"success": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"通知代理核心重置计数器失败: {e}")
+
+
+@api_router.post("/cache-stats/clear-images", tags=["System"])
+async def clear_image_cache():
+    """清空代理核心的图片本地化缓存(不动虚拟库封面)。"""
+    proxy_core_url = _proxy_core_url()
+    if not proxy_core_url:
+        raise HTTPException(status_code=400, detail="未配置 PROXY_CORE_URL")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{proxy_core_url.rstrip('/')}/api/internal/clear-image-cache",
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status != 200:
+                    raise HTTPException(status_code=resp.status, detail=data.get("detail", "清空图片缓存失败"))
+                return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"通知代理核心清空图片缓存失败: {e}")
 
 
 # --- RSS 虚拟库刷新 ---
@@ -514,6 +616,8 @@ admin_app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="st
 async def startup_event():
     # 记录主事件循环(工作线程日志回投用),并启动 proxy 日志文件尾随转发
     LogBroadcaster.set_loop(asyncio.get_running_loop())
+    # 消除 uvicorn 自装 handler 带来的重复访问日志
+    normalize_uvicorn_loggers()
     admin_app.state.log_tail_task = asyncio.create_task(log_service.tail_proxy_logs())
     rss_service.start_scheduler()
     rss_service.reschedule_refresh_job(config_manager.load_config())

@@ -978,8 +978,11 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
 
     payload = {"Items": page, "TotalRecordCount": total, "StartIndex": start_idx}
     content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # X-EVP-Served-By 同时是调试标记:能一眼看出响应来自本地直出还是实时转发。
+    # 代理核心据此跳过 API 响应缓存(直出已经是"缓存命中",没必要再存一份,
+    # 否则旧直出结果会在 api_cache 的 TTL 内盖掉更新的用户状态)。
     return Response(content=content, status_code=200, media_type="application/json",
-                    headers={"ETag": etag})
+                    headers={"ETag": etag, "X-EVP-Served-By": "local"})
 
 
 async def try_serve_latest_locally(config: AppConfig, vlib, user_id: str,

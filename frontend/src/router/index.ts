@@ -56,6 +56,12 @@ const router = createRouter({
       component: () => import('@/views/LogsView.vue'),
       meta: { title: '运行日志' },
     },
+    {
+      path: '/cache',
+      name: 'cache',
+      component: () => import('@/views/CacheView.vue'),
+      meta: { title: '缓存状态' },
+    },
     { path: '/:pathMatch(.*)*', redirect: { name: 'libraries' } },
   ],
 })

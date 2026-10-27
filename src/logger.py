@@ -216,3 +216,22 @@ def init_logging(process_name: str, level=logging.INFO, console_format="%(asctim
 def set_level(level: int) -> None:
     """运行期调整 root 日志级别(启动后按 config.log_level 应用)。"""
     logging.getLogger().setLevel(level)
+
+
+def normalize_uvicorn_loggers() -> None:
+    """收敛 uvicorn 自己的 logger,消除重复的访问日志。
+
+    uvicorn 在 `run()` 里先按自己的 LOGGING_CONFIG 装好 handler(绑定当时的 stderr),
+    之后才 import 应用模块 —— 我们的 init_logging 再挂一套上去,于是同一行访问日志
+    会被写两遍(docker logs 双行、按天日志翻倍)。启动完成后统一换成 root 的那一套:
+    只留 queue(控制台+文件)与广播,且不再向上重复传播。
+    """
+    root = logging.getLogger()
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uv_logger = logging.getLogger(name)
+        uv_logger.handlers.clear()
+        uv_logger.propagate = False
+        if uv_logger.level == logging.NOTSET:
+            uv_logger.setLevel(logging.INFO)
+        for handler in root.handlers:
+            uv_logger.addHandler(handler)

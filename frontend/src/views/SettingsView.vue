@@ -300,67 +300,6 @@
           </v-col>
         </v-row>
 
-        <!-- 缓存状态 -->
-        <v-card>
-          <v-card-title class="d-flex align-center ga-2">
-            <v-icon icon="mdi-chart-timeline-variant" size="small" /> 缓存状态
-            <v-spacer />
-            <v-btn size="small" variant="text" prepend-icon="mdi-refresh" :loading="loadingStats" @click="loadCacheStats">
-              刷新
-            </v-btn>
-          </v-card-title>
-          <v-card-text v-if="cacheStats?.available" class="d-flex flex-column ga-4">
-            <div class="d-flex flex-wrap ga-8">
-              <div>
-                <div class="text-caption text-medium-emphasis">全库数据源</div>
-                <div class="text-h6">{{ cacheStats.base?.items ?? 0 }} 项</div>
-                <div class="text-caption text-medium-emphasis">{{ formatAge(cacheStats.base?.age_seconds) }}</div>
-              </div>
-              <div>
-                <div class="text-caption text-medium-emphasis">直出 命中 / 未命中</div>
-                <div class="text-h6">{{ counter('serving_hit') }} / {{ counter('serving_miss') }}</div>
-                <div class="text-caption text-medium-emphasis">304 省流 {{ counter('serving_304') }} 次</div>
-              </div>
-              <div>
-                <div class="text-caption text-medium-emphasis">结果层 命中 / 未命中</div>
-                <div class="text-h6">{{ counter('result_hit') }} / {{ counter('result_miss') }}</div>
-              </div>
-              <div>
-                <div class="text-caption text-medium-emphasis">图片 命中 / 回源</div>
-                <div class="text-h6">{{ counter('image_hit') }} / {{ counter('image_miss') }}</div>
-                <div class="text-caption text-medium-emphasis">
-                  {{ formatBytes(cacheStats.images?.bytes) }} / 上限 {{ formatBytes(cacheStats.images?.max_bytes) }}
-                </div>
-              </div>
-            </div>
-
-            <v-divider />
-
-            <div>
-              <div class="text-caption text-medium-emphasis mb-1">各库派生条目</div>
-              <div
-                v-for="lib in cacheStats.libraries"
-                :key="lib.id"
-                class="d-flex align-center flex-wrap ga-2 text-body-2"
-              >
-                <span class="text-high-emphasis">{{ lib.name }}</span>
-                <v-chip size="x-small" variant="tonal">{{ lib.resource_type }}</v-chip>
-                <span>{{ lib.items }} 项</span>
-                <span class="text-medium-emphasis">{{ formatAge(lib.age_seconds) }}</span>
-              </div>
-            </div>
-
-            <div class="text-caption text-medium-emphasis">
-              用户状态层 {{ cacheStats.overlays?.length ?? 0 }} 份 ·
-              合并结果 {{ cacheStats.caches?.merge_entries ?? 0 }} 条 ·
-              响应缓存 {{ cacheStats.caches?.api_entries ?? 0 }} 条
-            </div>
-          </v-card-text>
-          <v-card-text v-else class="text-medium-emphasis">
-            {{ cacheStats?.reason || '正在读取…' }}
-          </v-card-text>
-        </v-card>
-
         <!-- 访问安全 -->
         <v-card>
           <v-card-title class="d-flex align-center ga-2">
@@ -377,41 +316,10 @@
           </v-card-text>
         </v-card>
 
-        <!-- 危险区域 -->
-        <v-card class="border-error">
-          <v-card-title class="d-flex align-center ga-2 text-error">
-            <v-icon icon="mdi-alert-octagon-outline" size="small" /> 危险区域
-          </v-card-title>
-          <v-card-text class="d-flex flex-wrap ga-3">
-            <v-btn
-              color="error"
-              prepend-icon="mdi-image-multiple-outline"
-              :loading="clearingCovers"
-              @click="clearCovers"
-            >
-              清空所有本地封面
-            </v-btn>
-            <v-btn
-              color="error"
-              prepend-icon="mdi-database-remove-outline"
-              :loading="clearingVlibCache"
-              @click="clearVlibCache"
-            >
-              清空虚拟库项目缓存
-            </v-btn>
-            <v-btn
-              color="warning"
-              prepend-icon="mdi-restart"
-              :loading="restarting"
-              @click="restartProxy"
-            >
-              重启代理服务(清空缓存)
-            </v-btn>
-            <div class="text-body-2 text-medium-emphasis align-self-center">
-              重启会短暂中断 8999 端口的代理服务,是修改配置后清空内存缓存的正确方式。
-            </div>
-          </v-card-text>
-        </v-card>
+        <!-- 说明:清空缓存 / 清空封面等维护操作已移到「缓存状态」页面 -->
+        <div class="text-caption text-medium-emphasis mt-2">
+          清理缓存、清空封面等维护操作已移到左侧「缓存状态」页面。
+        </div>
       </v-form>
     </template>
 
@@ -431,12 +339,6 @@
 import { computed, onMounted, ref } from 'vue'
 import type { VForm } from 'vuetify/components'
 
-import * as coversApi from '@/api/covers'
-import * as librariesApi from '@/api/libraries'
-import * as systemApi from '@/api/emby'
-import { getCacheStats } from '@/api/config'
-import type { CacheStats } from '@/types/api'
-import { useConfirm } from '@/composables/useConfirm'
 import { useNotification } from '@/composables/useNotification'
 import { useConfigStore } from '@/stores/useConfigStore'
 import { deepClone } from '@/utils/clone'
@@ -446,18 +348,12 @@ import SecretField from '@/components/common/SecretField.vue'
 import SectionHeader from '@/components/common/SectionHeader.vue'
 
 const configStore = useConfigStore()
-const { confirm } = useConfirm()
 const notify = useNotification()
 
 const formRef = ref<VForm | null>(null)
 const draft = ref<AppConfig>(createDefaultConfig())
 const ready = ref(false)
 const initialSnapshot = ref('')
-const clearingCovers = ref(false)
-const clearingVlibCache = ref(false)
-const restarting = ref(false)
-const cacheStats = ref<CacheStats | null>(null)
-const loadingStats = ref(false)
 
 const dirty = computed(() => Boolean(draft.value) && JSON.stringify(draft.value) !== initialSnapshot.value)
 
@@ -474,36 +370,6 @@ async function initialize() {
     resetDraft(configStore.config)
     ready.value = true
   }
-  void loadCacheStats()
-}
-
-async function loadCacheStats() {
-  loadingStats.value = true
-  try {
-    cacheStats.value = await getCacheStats()
-  } catch {
-    cacheStats.value = { available: false, reason: '无法读取缓存状态(代理核心不可达)' }
-  } finally {
-    loadingStats.value = false
-  }
-}
-
-function counter(name: string): number {
-  return cacheStats.value?.counters?.[name] ?? 0
-}
-
-function formatAge(seconds?: number | null): string {
-  if (seconds === null || seconds === undefined) return '尚未构建'
-  if (seconds < 60) return `${seconds} 秒前`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
-  return `${(seconds / 3600).toFixed(1)} 小时前`
-}
-
-function formatBytes(bytes?: number | null): string {
-  if (!bytes) return '0 MB'
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
 function resetDraft(source: AppConfig) {
@@ -556,76 +422,6 @@ async function saveAll() {
   }
 }
 
-async function clearCovers() {
-  const yes = await confirm({
-    title: '清空所有封面',
-    message: '将删除所有已生成的封面图片,并重置各虚拟库的封面状态。\n该操作不可恢复,确定继续吗?',
-    confirmText: '清空',
-    cancelText: '再想想',
-    color: 'error',
-    icon: 'mdi-alert-octagon-outline',
-  })
-  if (!yes) return
-  clearingCovers.value = true
-  try {
-    await coversApi.clearCovers()
-    const fresh = await configStore.reload()
-    if (fresh) resetDraft(fresh)
-    notify.success('所有封面已清空')
-  } catch (error) {
-    notify.error(error instanceof Error ? error.message : '清空封面失败')
-  } finally {
-    clearingCovers.value = false
-  }
-}
-
-async function clearVlibCache() {
-  const yes = await confirm({
-    title: '清空虚拟库项目缓存',
-    message: '将删除 SQLite 中持久化的项目列表,并清空代理核心内存缓存。\n封面不受影响,缓存会在下次浏览或预热时重建。确定继续吗?',
-    confirmText: '清空',
-    cancelText: '再想想',
-    color: 'error',
-    icon: 'mdi-database-remove-outline',
-  })
-  if (!yes) return
-  clearingVlibCache.value = true
-  try {
-    const counts = await librariesApi.clearVlibCache()
-    notify.success(`虚拟库缓存已清空(项目缓存 ${counts.vlib_items} 库 / 解析列表 ${counts.serving_rows} 行)`)
-  } catch (error) {
-    notify.error(error instanceof Error ? error.message : '清空缓存失败')
-  } finally {
-    clearingVlibCache.value = false
-  }
-}
-
-async function restartProxy() {
-  const yes = await confirm({
-    title: '重启代理服务',
-    message: '代理将重启并清空全部内存缓存,期间客户端会短暂无法访问。\n确定继续吗?',
-    confirmText: '重启',
-    cancelText: '取消',
-    color: 'warning',
-    icon: 'mdi-restart',
-  })
-  if (!yes) return
-  restarting.value = true
-  try {
-    await systemApi.restartProxy()
-    notify.info('重启命令已发送,服务将在几秒内恢复')
-  } catch (error) {
-    notify.error(error instanceof Error ? error.message : '重启失败')
-  } finally {
-    restarting.value = false
-  }
-}
-
 onMounted(initialize)
 </script>
 
-<style scoped>
-.border-error {
-  border: 1px solid rgba(var(--v-theme-error), 0.35);
-}
-</style>

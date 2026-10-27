@@ -35,8 +35,14 @@ from emby_net import emby_proxy_of
 
 logger = logging.getLogger(__name__)
 
-# 真实 Emby 条目 Id 是 32 位十六进制;虚拟库封面(uuid/tmdb-)由 handler_images 处理
-_IMAGE_PATH_RE = re.compile(r"/Items/([0-9a-fA-F]{32})/Images/([A-Za-z]+)")
+# 真实 Emby 条目 Id 的形态不固定:常见 32 位十六进制,但也有纯数字(如 499713)与
+# 带连字符的 GUID。这里放宽到「字母数字加连字符」,再用下面两个前缀规则排除虚拟库自身:
+#   - 虚拟库封面(uuid)由 handler_images 先处理,这里兜底跳过;
+#   - tmdb_ / tmdb- 是「缺失剧集 / RSS 占位项」的伪造 Id,没有真实图片可取。
+_IMAGE_PATH_RE = re.compile(r"/Items/([A-Za-z0-9\-]{1,64})/Images/([A-Za-z]+)")
+_VLIB_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 CACHE_DIR = Path(app_paths.CONFIG_DIR) / "image_cache"
 
@@ -197,6 +203,12 @@ async def handle_cached_image(request: Request, full_path: str, method: str,
         return None
 
     item_id, image_type = match.group(1), match.group(2)
+    # 虚拟库封面 / 伪造占位条目不走这里(前者由 handler_images 处理,后者没有真实图片)
+    if _VLIB_ID_RE.match(item_id) or item_id.startswith(("tmdb_", "tmdb-")):
+        return None
+    # 分块请求(Range)不接管:整图返回会破坏 Range 语义,交给默认转发
+    if request.headers.get("range"):
+        return None
     tag = request.query_params.get("tag") or request.query_params.get("Tag")
     if not tag:
         return None  # 没有 tag 的 URL 不稳定,不能当 immutable 缓存
@@ -208,22 +220,30 @@ async def handle_cached_image(request: Request, full_path: str, method: str,
 
     if request.headers.get("if-none-match") == etag:
         proxy_cache.bump("image_304")
-        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": f"public, max-age={_IMMUTABLE_MAX_AGE}, immutable"})
+        return Response(status_code=304, headers={
+            "ETag": etag,
+            "Cache-Control": f"public, max-age={_IMMUTABLE_MAX_AGE}, immutable",
+            "X-EVP-Image-Cache": "hit-304",
+        })
 
     cached = _find_cached(key)
     if cached is not None:
         proxy_cache.bump("image_hit")
+        logger.debug(f"图片缓存命中: {item_id}/{image_type}")
         return FileResponse(
             str(cached),
             media_type=_MEDIA_TYPE_BY_SUFFIX.get(cached.suffix, "image/jpeg"),
             headers={
                 "ETag": etag,
                 "Cache-Control": f"public, max-age={_IMMUTABLE_MAX_AGE}, immutable",
+                # 调试标记:命中时能看到,未接管(无 tag / 无令牌 / Range)时没有这个头
+                "X-EVP-Image-Cache": "hit",
             },
         )
 
     # 未命中:回源取一次(把图片整体读进内存,顺手写盘;图片都很小)
     proxy_cache.bump("image_miss")
+    logger.debug(f"图片缓存未命中,回源: {item_id}/{image_type}")
     headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     try:
         async with session.get(f"{real_emby_url}/{full_path}", params=request.query_params,
@@ -248,6 +268,7 @@ async def handle_cached_image(request: Request, full_path: str, method: str,
             "ETag": etag,
             "Cache-Control": f"public, max-age={_IMMUTABLE_MAX_AGE}, immutable",
             "Content-Length": str(len(body)),
+            "X-EVP-Image-Cache": "miss",
         },
     )
 
@@ -259,3 +280,26 @@ async def cache_usage() -> dict:
     if CACHE_DIR.is_dir():
         files = await asyncio.to_thread(lambda: sum(1 for f in CACHE_DIR.rglob("*") if f.is_file()))
     return {"files": files, "bytes": total, "max_bytes": _max_bytes()}
+
+
+async def clear_cache() -> dict:
+    """清空图片缓存目录(只删图片缓存,不动虚拟库封面)。"""
+    global _total_bytes
+
+    def _clear() -> int:
+        removed = 0
+        if CACHE_DIR.is_dir():
+            for f in list(CACHE_DIR.rglob("*")):
+                if not f.is_file():
+                    continue
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    continue
+        return removed
+
+    removed = await asyncio.to_thread(_clear)
+    _total_bytes = 0
+    logger.info(f"图片缓存已清空,删除 {removed} 个文件。")
+    return {"removed": removed}
