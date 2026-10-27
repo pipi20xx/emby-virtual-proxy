@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import aiohttp
 from emby_net import emby_proxy_from_config
 # 【【【 修改这一行 】】】
@@ -16,7 +17,9 @@ from typing import Tuple, Dict, List, Optional
 from logger import init_logging, LogBroadcaster
 
 # 日志初始化须先于下方项目模块导入,导入期的日志才能进入文件与实时流
-init_logging("proxy", level=logging.DEBUG)
+# 注意:这里是"启动默认级别",进程启动后会在 lifespan 里按 config.log_level 重新应用。
+# 过去固定 DEBUG:每条 DEBUG 都要格式化+写盘+广播,是热路径上的稳定开销。
+init_logging("proxy", level=logging.INFO)
 
 # 【【【 同时修改这一行，从 proxy_cache 导入两个缓存实例 】】】
 # api_cache 经 proxy_cache.api_cache 间接访问(TTL 可配置时会重建实例)
@@ -25,6 +28,7 @@ from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cach
 import config_manager
 import db_manager
 from services import tmdb_index_service
+from json_compress import JsonCompressionMiddleware
 from proxy_handlers import (
     handler_system,
     handler_views,
@@ -35,6 +39,7 @@ from proxy_handlers import (
     handler_latest,
     handler_home_sections,
     handler_images,
+    handler_image_cache,
     handler_virtual_items,
     handler_autogen
 )
@@ -60,6 +65,12 @@ async def lifespan(app: FastAPI):
     _startup_config = config_manager.load_config()
     proxy_cache.set_api_cache_ttl(_startup_config.api_cache_ttl)
     proxy_cache.merge_cache_enabled = bool(getattr(_startup_config, "enable_merge_cache", True))
+    # 按配置应用日志级别(默认 info;排查问题时可在面板里调成 debug,不必改代码)
+    _level_name = str(getattr(_startup_config, "log_level", "info") or "info").upper()
+    _level_value = getattr(logging, _level_name, logging.INFO)
+    if isinstance(_level_value, int):
+        logging.getLogger().setLevel(_level_value)
+        logger.info(f"日志级别已按配置应用: {_level_name}")
     # 启动预热:延迟到服务开始监听后(回填缓存/补封面/按配置全量刷新)
     prewarm_task = asyncio.create_task(_startup_warmup())
     yield
@@ -67,6 +78,9 @@ async def lifespan(app: FastAPI):
     await app.state.aiohttp_session.close(); logger.info("Global AIOHTTP ClientSession closed.")
 
 proxy_app = FastAPI(title="Emby Virtual Proxy - Core", lifespan=lifespan)
+
+# 只压缩 JSON 响应(视频/图片流一律不碰,见 json_compress.py 的说明)
+proxy_app.add_middleware(JsonCompressionMiddleware, minimum_size=1024)
 
 # 代理核心自身监听地址(供内部端点自调用走完整 handler 链)
 _SELF_PROXY_URL = "http://localhost:8999"
@@ -123,9 +137,24 @@ async def _list_emby_users(config) -> List[str]:
     return []
 
 
+# 用户列表短缓存:预热/探针每次调用都打一次 /Users 是纯浪费(用户几乎不变)
+_users_cache = {"users": [], "at": 0.0}
+
+
+async def _list_emby_users_cached(config, ttl: int = 1800) -> List[str]:
+    now = time.time()
+    if _users_cache["users"] and now - _users_cache["at"] < ttl:
+        return _users_cache["users"]
+    users = await _list_emby_users(config)
+    if users:
+        _users_cache["users"] = users
+        _users_cache["at"] = now
+    return users or _users_cache["users"]
+
+
 async def _resolve_default_user_id(config) -> Optional[str]:
     """从 Emby 解析一个可用用户(取第一个),供内部请求模拟客户端身份。"""
-    users = await _list_emby_users(config)
+    users = await _list_emby_users_cached(config)
     return users[0] if users else None
 
 
@@ -200,7 +229,7 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
             raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则")
 
         if config.enable_vlib_cache:
-            handler_items.store_shared_metadata(vlib, items)
+            await handler_items.astore_shared_metadata(vlib, items)
             # 封面素材缓存沿用元数据前 100 项
             cover_items = items[:100]
             vlib_items_cache[library_id] = cover_items
@@ -349,6 +378,152 @@ async def clear_vlib_cache():
     proxy_cache.api_cache.clear()
     logger.info("已清空内存中的全库数据源、共享元数据、用户叠加层、结果层与响应缓存。")
     return {"success": True}
+
+
+@proxy_app.get("/api/internal/cache-stats")
+async def cache_stats():
+    """缓存状态与命中率快照(供管理面板展示,让"下一步优化哪里"有数据依据)。"""
+    config = config_manager.load_config_readonly()
+    now = int(time.time())
+
+    source_key = handler_items.base_source_key()
+    base = handler_items.get_base_items(source_key)
+
+    libraries = []
+    for vlib in config.virtual_libraries:
+        meta = handler_items.get_shared_metadata(vlib.id)
+        libraries.append({
+            "id": vlib.id,
+            "name": vlib.name,
+            "resource_type": vlib.resource_type,
+            "items": len(meta["items"]) if meta else 0,
+            "age_seconds": (now - int(meta["updated_at"])) if meta else None,
+        })
+
+    overlays = []
+    for key, entry in list(user_overlay_cache.items()):
+        try:
+            overlays.append({
+                "user_id": key[0],
+                "source": key[1],
+                "entries": len(entry.get("data") or {}),
+                "age_seconds": now - int(entry.get("updated_at") or now),
+            })
+        except Exception:
+            continue
+    overlays.sort(key=lambda o: (o["user_id"], o["source"]))
+
+    try:
+        images = await handler_image_cache.cache_usage()
+    except Exception:
+        images = {}
+
+    return {
+        "base": {
+            "source": source_key,
+            "items": len(base["items"]) if base else 0,
+            "age_seconds": (now - int(base["updated_at"])) if base else None,
+            "sig": (base.get("sig") or "")[:8] if base else None,
+        },
+        "libraries": libraries,
+        "overlays": overlays,
+        "counters": dict(proxy_cache.cache_counters),
+        "caches": {
+            "base_entries": len(vlib_base_cache),
+            "metadata_entries": len(vlib_metadata_cache),
+            "overlay_entries": len(user_overlay_cache),
+            "result_entries": len(proxy_cache.serving_result_cache),
+            "merge_entries": len(proxy_cache.merge_result_cache),
+            "api_entries": len(proxy_cache.api_cache),
+        },
+        "images": images,
+    }
+
+
+@proxy_app.post("/api/internal/cache-stats/reset")
+async def reset_cache_stats():
+    """清零计数器(不影响任何缓存内容)。"""
+    proxy_cache.reset_counters()
+    return {"success": True}
+
+
+@proxy_app.post("/api/internal/probe-vlib/{library_id}")
+async def probe_vlib_change(library_id: str):
+    """用 1 个极小请求判断虚拟库内容是否可能有变化,替代"到点就全量重拉"。
+
+    判断依据两条,都来自同一个响应:
+      - TotalRecordCount 与该库缓存条目数不一致(能发现新增与删除);
+      - 最新条目的 DateCreated 晚于缓存更新时间(兜住计数恰好不变的新增+删除)。
+    探测成本:1 次 Limit=1 的查询,响应体只有一条记录的少数字段。
+    """
+    config = config_manager.load_config_readonly()
+    vlib = next((v for v in config.virtual_libraries if v.id == library_id), None)
+    if not vlib:
+        raise HTTPException(status_code=404, detail="虚拟库不存在")
+    if vlib.resource_type == "rsshub":
+        return {"changed": True, "reasons": ["rss"]}
+
+    user_id = await _resolve_default_user_id(config)
+    if not user_id:
+        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户")
+
+    meta = handler_items.get_shared_metadata(library_id)
+    params = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series,Video",
+        "SortBy": "DateCreated",
+        "SortOrder": "Descending",
+        "Limit": "1",
+        "Fields": "DateCreated",
+        "EnableUserData": "false",
+        "EnableTotalRecordCount": "true",
+    }
+    resource_map = {"collection": "CollectionIds", "tag": "TagIds", "person": "PersonIds",
+                    "genre": "GenreIds", "studio": "StudioIds"}
+    if vlib.resource_type in resource_map and vlib.resource_id:
+        params[resource_map[vlib.resource_type]] = vlib.resource_id
+
+    headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
+    try:
+        async with proxy_app.state.aiohttp_session.get(
+            f"{config.emby_url.rstrip('/')}/emby/Users/{user_id}/Items",
+            params=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20),
+            proxy=emby_proxy_from_config(config),
+        ) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=502, detail=f"探测请求失败 Status={resp.status}")
+            data = await resp.json(content_type=None)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"探测请求出错: {e}")
+
+    items = data.get("Items") or []
+    newest = items[0].get("DateCreated") if items else None
+    total = data.get("TotalRecordCount")
+
+    changed = False
+    reasons: List[str] = []
+    if meta is None:
+        changed = True
+        reasons.append("no_metadata")
+    else:
+        if total is not None and int(total) != len(meta["items"]):
+            changed = True
+            reasons.append("count_changed")
+        if newest:
+            try:
+                newest_ts = datetime.fromisoformat(str(newest).replace("Z", "+00:00")).timestamp()
+                if newest_ts > int(meta["updated_at"]) + 60:
+                    changed = True
+                    reasons.append("newer_item")
+            except ValueError:
+                pass
+
+    if changed:
+        logger.info(f"探测到库 '{vlib.name}' 内容有变化({', '.join(reasons)}),本轮需要刷新。")
+    return {"changed": changed, "reasons": reasons, "total": total, "newest": newest}
 
 
 @proxy_app.post("/api/internal/apply-cache-ttl/{ttl_seconds:int}")
@@ -536,7 +711,8 @@ def _maybe_invalidate_user_state(request: Request, full_path: str, response) -> 
 
 @proxy_app.api_route("/{full_path:path}", methods=["GET", "POST", "DELETE", "PUT"])
 async def reverse_proxy(request: Request, full_path: str):
-    config = config_manager.load_config()
+    # 热路径:只读快照,不深拷贝(深拷贝整份配置是每请求的固定浪费)
+    config = config_manager.load_config_readonly()
     real_emby_url = config.emby_url.rstrip('/')
     # 本请求访问 Emby 上游应使用的代理(留空直连);handler 内通过 emby_proxy_of(request) 读取
     request.state.emby_proxy = emby_proxy_from_config(config)
@@ -563,6 +739,8 @@ async def reverse_proxy(request: Request, full_path: str):
     if not response: response = await handler_images.handle_virtual_library_image(request, full_path)
     if not response: response = await handler_virtual_items.handle_get_virtual_item_info(request, full_path, config)
     if not response: response = await handler_latest.handle_home_latest_items(request, full_path, request.method, real_emby_url, session, config)
+    # 图片本地化:海报/背景图落盘缓存(tag 即内容指纹,可 immutable)
+    if not response: response = await handler_image_cache.handle_cached_image(request, full_path, request.method, session, real_emby_url)
     # Emby 4.10+ 首页分区接口(我的媒体磁贴/各库最新横排),必须在默认转发之前拦截
     if not response: response = await handler_home_sections.handle_home_sections(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_system.handle_system_and_playback_info(request, full_path, request.method, real_emby_url, proxy_address, session)

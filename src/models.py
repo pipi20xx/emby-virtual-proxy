@@ -91,6 +91,10 @@ class AppConfig(BaseModel):
     # 新增：季/集合并结果短时缓存开关(进详情页不再每次逐剧集拉季/集);关闭后回退为实时合并
     enable_merge_cache: bool = Field(default=True)
 
+    # 新增：图片(海报/背景)本地化缓存开关与磁盘配额(MB);0 表示不限制
+    enable_image_cache: bool = Field(default=True)
+    image_cache_max_mb: int = Field(default=2048)
+
     # 新增：TMDB 索引重建间隔(小时),0 表示仅启动时构建一次、之后靠查询自愈回写维持
     tmdb_index_refresh_interval: int = Field(default=24)
     

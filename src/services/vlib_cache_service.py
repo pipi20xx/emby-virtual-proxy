@@ -73,17 +73,52 @@ async def refresh_vlib_cache(library_id: str) -> bool:
     return True
 
 
+async def probe_vlib_change(library_id: str) -> bool:
+    """问代理核心:该库内容是否可能有变化(核心侧只用 1 个 limit=1 的查询)。
+
+    任何异常都保守返回 True(照常刷新):探测失败不应该让缓存停更。
+    """
+    proxy_core_url = _proxy_core_url()
+    if not proxy_core_url:
+        return True
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{proxy_core_url.rstrip('/')}/api/internal/probe-vlib/{library_id}",
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    return bool(data.get("changed"))
+                logger.warning(f"探测库 {library_id} 变化失败 (Status: {resp.status}),按有变化处理。")
+    except Exception as e:
+        logger.warning(f"探测库 {library_id} 变化出错,按有变化处理: {e}")
+    return True
+
+
 async def refresh_all_vlib_caches() -> None:
-    """刷新所有虚拟库的项目缓存(定时任务入口),逐个串行避免压垮 Emby。"""
+    """刷新所有虚拟库的项目缓存(定时任务入口),逐个串行避免压垮 Emby。
+
+    先探测再刷新:内容没变化的库整轮跳过,把"每小时全量重拉"降成"每小时每库 1 个
+    极小请求";有变化(新增/删除)才真正重建。
+    """
     logger.info("Starting scheduled vlib cache refresh...")
     config = config_manager.load_config()
 
     ok = 0
+    skipped = 0
     for vlib in config.virtual_libraries:
+        if not await probe_vlib_change(vlib.id):
+            logger.info(f"库 '{vlib.name}' 内容未变化,跳过本轮刷新。")
+            skipped += 1
+            continue
         if await refresh_vlib_cache(vlib.id):
             ok += 1
 
-    logger.info(f"Scheduled vlib cache refresh finished ({ok}/{len(config.virtual_libraries)} succeeded).")
+    logger.info(
+        f"Scheduled vlib cache refresh finished "
+        f"({ok} refreshed, {skipped} skipped, {len(config.virtual_libraries)} total)."
+    )
 
 
 # --- TMDB 索引定时重建(独立任务,间隔独立于列表预热) ---
@@ -154,6 +189,8 @@ async def clear_all_caches() -> dict:
     removed_meta = db_manager.clear_vlib_metadata()
     removed_overlay = db_manager.clear_vlib_user_overlay()
     removed_index = db_manager.clear_tmdb_index()
+    # 季/集合并结果落盘缓存同样失效(否则清空后详情页仍返回旧合并结果)
+    db_manager.clear_merge_results()
     # 旧版按用户全量缓存表一并清理(历史数据)
     db_manager.clear_vlib_serving_cache()
 

@@ -82,6 +82,10 @@ export interface AppConfig {
   enable_tmdb_index: boolean
   /** 季/集合并结果短时缓存:进详情页不再每次逐剧集拉季/集 */
   enable_merge_cache: boolean
+  /** 海报/背景图本地化缓存;关闭后图片全部直连 Emby */
+  enable_image_cache: boolean
+  /** 图片缓存磁盘上限(MB);0 = 不限制 */
+  image_cache_max_mb: number
   /** TMDB 索引重建间隔(小时),0 = 仅启动时构建一次 */
   tmdb_index_refresh_interval: number
   /** API 响应缓存 TTL(秒),0 = 禁用 */
@@ -207,6 +211,8 @@ export function createDefaultConfig(): AppConfig {
     enable_vlib_local_serving: true,
     enable_tmdb_index: true,
     enable_merge_cache: true,
+    enable_image_cache: true,
+    image_cache_max_mb: 2048,
     tmdb_index_refresh_interval: 24,
     api_cache_ttl: 300,
     default_cover_style: 'style_multi_1',

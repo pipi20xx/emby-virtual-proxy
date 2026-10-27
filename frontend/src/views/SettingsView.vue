@@ -136,8 +136,7 @@
                   persistent-hint
                   @update:model-value="setVlibCacheInterval"
                 />
-                <div class="text-subtitle-2 text-high-emphasis mt-2">Emby 响应缓存(内存)</div>
-                <v-switch
+                <div class="text-subtitle-2 text-high-emphasis mt-2">Emby 响应缓存(内存)</div>                <v-switch
                   v-model="draft.enable_cache"
                   color="primary"
                   label="启用响应缓存(内存)"
@@ -157,6 +156,27 @@
                   @update:model-value="setApiCacheTtl"
                 />
 
+                <div class="text-subtitle-2 text-high-emphasis mt-2">图片本地化缓存(磁盘)</div>
+                <v-switch
+                  v-model="draft.enable_image_cache"
+                  color="primary"
+                  label="缓存海报 / 背景图"
+                  hint="首次请求某张图时把它存到本地,之后直接由代理返回。Emby 图片 URL 自带内容指纹,缓存永不失效,可回 immutable 让客户端长期复用。关闭后所有图片直连 Emby。"
+                  persistent-hint
+                />
+                <v-text-field
+                  :model-value="String(draft.image_cache_max_mb ?? 0)"
+                  label="磁盘上限"
+                  type="number"
+                  min="0"
+                  step="256"
+                  suffix="MB"
+                  :disabled="!draft.enable_image_cache"
+                  hint="图片缓存总量上限,超出后按最久未使用逐步淘汰(删到 90%)。0 = 不限制。存放在 config 目录下的 image_cache/。"
+                  persistent-hint
+                  @update:model-value="setImageCacheMaxMb"
+                />
+
                 <div class="text-caption text-medium-emphasis">
                   <div class="font-weight-medium text-high-emphasis mb-1">工作原理</div>
                   <div>① 全库数据源:所有虚拟库共用同一份向 Emby 裸拉的全库条目,规则与资源过滤都在代理端本地派生;</div>
@@ -165,7 +185,7 @@
                   <div>④ 直出结果层:列表组装与排序结果按版本缓存,翻页只做切片;</div>
                   <div>⑤ 首页「最新」与详情页季/集合并同样走缓存,过期后先返回旧数据、后台静默刷新。</div>
                   <div class="mt-1">
-                    注意:海报图片与播放控制直连 Emby;已看状态变更会触发该账号的缓存失效,不会出现"标了已看仍是未看"。
+                    注意:播放控制仍直连 Emby;海报图片可本地缓存(见上方开关);已看状态变更会触发该账号的缓存失效,不会出现"标了已看仍是未看"。
                   </div>
                 </div>
               </v-card-text>
@@ -280,6 +300,67 @@
           </v-col>
         </v-row>
 
+        <!-- 缓存状态 -->
+        <v-card>
+          <v-card-title class="d-flex align-center ga-2">
+            <v-icon icon="mdi-chart-timeline-variant" size="small" /> 缓存状态
+            <v-spacer />
+            <v-btn size="small" variant="text" prepend-icon="mdi-refresh" :loading="loadingStats" @click="loadCacheStats">
+              刷新
+            </v-btn>
+          </v-card-title>
+          <v-card-text v-if="cacheStats?.available" class="d-flex flex-column ga-4">
+            <div class="d-flex flex-wrap ga-8">
+              <div>
+                <div class="text-caption text-medium-emphasis">全库数据源</div>
+                <div class="text-h6">{{ cacheStats.base?.items ?? 0 }} 项</div>
+                <div class="text-caption text-medium-emphasis">{{ formatAge(cacheStats.base?.age_seconds) }}</div>
+              </div>
+              <div>
+                <div class="text-caption text-medium-emphasis">直出 命中 / 未命中</div>
+                <div class="text-h6">{{ counter('serving_hit') }} / {{ counter('serving_miss') }}</div>
+                <div class="text-caption text-medium-emphasis">304 省流 {{ counter('serving_304') }} 次</div>
+              </div>
+              <div>
+                <div class="text-caption text-medium-emphasis">结果层 命中 / 未命中</div>
+                <div class="text-h6">{{ counter('result_hit') }} / {{ counter('result_miss') }}</div>
+              </div>
+              <div>
+                <div class="text-caption text-medium-emphasis">图片 命中 / 回源</div>
+                <div class="text-h6">{{ counter('image_hit') }} / {{ counter('image_miss') }}</div>
+                <div class="text-caption text-medium-emphasis">
+                  {{ formatBytes(cacheStats.images?.bytes) }} / 上限 {{ formatBytes(cacheStats.images?.max_bytes) }}
+                </div>
+              </div>
+            </div>
+
+            <v-divider />
+
+            <div>
+              <div class="text-caption text-medium-emphasis mb-1">各库派生条目</div>
+              <div
+                v-for="lib in cacheStats.libraries"
+                :key="lib.id"
+                class="d-flex align-center flex-wrap ga-2 text-body-2"
+              >
+                <span class="text-high-emphasis">{{ lib.name }}</span>
+                <v-chip size="x-small" variant="tonal">{{ lib.resource_type }}</v-chip>
+                <span>{{ lib.items }} 项</span>
+                <span class="text-medium-emphasis">{{ formatAge(lib.age_seconds) }}</span>
+              </div>
+            </div>
+
+            <div class="text-caption text-medium-emphasis">
+              用户状态层 {{ cacheStats.overlays?.length ?? 0 }} 份 ·
+              合并结果 {{ cacheStats.caches?.merge_entries ?? 0 }} 条 ·
+              响应缓存 {{ cacheStats.caches?.api_entries ?? 0 }} 条
+            </div>
+          </v-card-text>
+          <v-card-text v-else class="text-medium-emphasis">
+            {{ cacheStats?.reason || '正在读取…' }}
+          </v-card-text>
+        </v-card>
+
         <!-- 访问安全 -->
         <v-card>
           <v-card-title class="d-flex align-center ga-2">
@@ -353,6 +434,8 @@ import type { VForm } from 'vuetify/components'
 import * as coversApi from '@/api/covers'
 import * as librariesApi from '@/api/libraries'
 import * as systemApi from '@/api/emby'
+import { getCacheStats } from '@/api/config'
+import type { CacheStats } from '@/types/api'
 import { useConfirm } from '@/composables/useConfirm'
 import { useNotification } from '@/composables/useNotification'
 import { useConfigStore } from '@/stores/useConfigStore'
@@ -373,6 +456,8 @@ const initialSnapshot = ref('')
 const clearingCovers = ref(false)
 const clearingVlibCache = ref(false)
 const restarting = ref(false)
+const cacheStats = ref<CacheStats | null>(null)
+const loadingStats = ref(false)
 
 const dirty = computed(() => Boolean(draft.value) && JSON.stringify(draft.value) !== initialSnapshot.value)
 
@@ -389,6 +474,36 @@ async function initialize() {
     resetDraft(configStore.config)
     ready.value = true
   }
+  void loadCacheStats()
+}
+
+async function loadCacheStats() {
+  loadingStats.value = true
+  try {
+    cacheStats.value = await getCacheStats()
+  } catch {
+    cacheStats.value = { available: false, reason: '无法读取缓存状态(代理核心不可达)' }
+  } finally {
+    loadingStats.value = false
+  }
+}
+
+function counter(name: string): number {
+  return cacheStats.value?.counters?.[name] ?? 0
+}
+
+function formatAge(seconds?: number | null): string {
+  if (seconds === null || seconds === undefined) return '尚未构建'
+  if (seconds < 60) return `${seconds} 秒前`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`
+  return `${(seconds / 3600).toFixed(1)} 小时前`
+}
+
+function formatBytes(bytes?: number | null): string {
+  if (!bytes) return '0 MB'
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
 function resetDraft(source: AppConfig) {
@@ -412,6 +527,12 @@ function setApiCacheTtl(value: unknown) {
   if (!draft.value) return
   const parsed = Math.max(0, Math.floor(Number(value) || 0))
   draft.value.api_cache_ttl = parsed
+}
+
+function setImageCacheMaxMb(value: unknown) {
+  if (!draft.value) return
+  const parsed = Math.max(0, Math.floor(Number(value) || 0))
+  draft.value.image_cache_max_mb = parsed
 }
 
 function setTmdbIndexInterval(value: unknown) {

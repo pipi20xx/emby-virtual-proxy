@@ -8,7 +8,7 @@ from fastapi import Request, Response
 from aiohttp import ClientSession
 from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 from emby_net import emby_proxy_of
-from config_manager import load_config
+import config_manager
 import proxy_cache
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     auth_token_param = {'X-Emby-Token': params.get('X-Emby-Token')} if 'X-Emby-Token' in params else {}
 
     # --- 合并结果缓存:命中后进详情页不再逐个剧集拉「季 + 集」,也不再请求 TMDB ---
-    config = load_config()
+    config = config_manager.load_config_readonly()
     show_missing = config.show_missing_episodes
     tmdb_api_key = config.tmdb_api_key
     tmdb_proxy = config.tmdb_proxy

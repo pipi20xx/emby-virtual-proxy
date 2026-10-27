@@ -252,6 +252,15 @@ def init_databases():
     )
     """, commit=True)
 
+    # 季/集合并结果落盘缓存:内存 TTL 缓存被淘汰或进程重启后仍可直接复用
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS merge_result_cache (
+        cache_key TEXT PRIMARY KEY,
+        items_json TEXT,
+        updated_at INTEGER
+    )
+    """, commit=True)
+
     # TMDB 索引:全库 媒体项 → TMDB ID 快速查找表(消灭季/集合并时的全库遍历)
     vlib_items_db.execute("""
     CREATE TABLE IF NOT EXISTS emby_tmdb_index (
@@ -448,6 +457,37 @@ def clear_vlib_base() -> int:
         return 0
 
 
+def save_merge_result(cache_key: str, items: list, updated_at: int) -> None:
+    """保存一条季/集合并结果(内存缓存被淘汰或进程重启后仍可复用)。"""
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "INSERT INTO merge_result_cache (cache_key, items_json, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET items_json = excluded.items_json, "
+            "updated_at = excluded.updated_at",
+            (cache_key, json.dumps(items, ensure_ascii=False), updated_at),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving merge result cache {cache_key}: {e}")
+
+
+def load_merge_result(cache_key: str, max_age_seconds: int):
+    """读取一条合并结果;超过 max_age_seconds 视为过期,返回 None。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT items_json, updated_at FROM merge_result_cache WHERE cache_key = ?", (cache_key,)
+        )
+        if not row or not row["items_json"]:
+            return None
+        if int(time.time()) - int(row["updated_at"] or 0) > int(max_age_seconds):
+            return None
+        items = json.loads(row["items_json"])
+        return items if isinstance(items, list) else None
+    except Exception as e:
+        print(f"Error loading merge result cache {cache_key}: {e}")
+        return None
+
+
 def save_vlib_user_overlay(user_id: str, library_id: str, data: dict, updated_at: int) -> None:
     """保存用户叠加层 {条目ID: UserData}。"""
     try:
@@ -522,6 +562,28 @@ def delete_user_overlay_rows(user_id: str, source_key: Optional[str] = None) -> 
             db.execute("DELETE FROM vlib_user_overlay WHERE user_id = ?", (user_id,), commit=True)
     except Exception as e:
         print(f"Error deleting user overlay rows for {user_id}/{source_key}: {e}")
+
+
+def purge_merge_results(max_age_seconds: int) -> int:
+    """清理过期的合并结果行(调用方按概率触发即可,不必每次写都清)。"""
+    try:
+        cutoff = int(time.time()) - int(max_age_seconds)
+        cursor = DBManager(VLIB_ITEMS_DB).execute(
+            "DELETE FROM merge_result_cache WHERE updated_at < ?", (cutoff,), commit=True
+        )
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error purging merge result cache: {e}")
+        return 0
+
+
+def clear_merge_results() -> int:
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM merge_result_cache", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing merge result cache: {e}")
+        return 0
 
 
 # --- TMDB 索引(全库 媒体项 → TMDB ID 快速查找表) ---

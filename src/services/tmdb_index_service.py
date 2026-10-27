@@ -79,7 +79,7 @@ async def rebuild_if_stale(session, real_emby_url: str, headers: Dict[str, str])
       - 重建间隔 > 0 且索引年龄达到间隔 → 重建;
       - 重建间隔 = 0 → 仅在索引为空时构建,之后靠查询自愈回写维持。
     """
-    config = config_manager.load_config()
+    config = config_manager.load_config_readonly()
 
     if not config.enable_tmdb_index:
         return {"rebuilt": False, "count": db_manager.count_tmdb_index(), "reason": "disabled"}

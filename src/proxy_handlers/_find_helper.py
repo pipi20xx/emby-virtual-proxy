@@ -22,7 +22,7 @@ def _is_item_in_merge_vlib_via_metadata(item_id: str) -> Optional[bool]:
     返回 True(确认属于)/ False(所有合并库的元数据都在且不含此条目)/
     None(部分合并库没有元数据,无法判定,需走旧路径)。
     """
-    config = config_manager.load_config()
+    config = config_manager.load_config_readonly()
     if config.force_merge_by_tmdb_id:
         return True
 
@@ -58,7 +58,7 @@ async def is_item_in_a_merge_enabled_vlib(
     if fast is not None:
         return fast
 
-    config = config_manager.load_config()
+    config = config_manager.load_config_readonly()
     merge_vlibs = [vlib for vlib in config.virtual_libraries if vlib.merge_by_tmdb_id]
 
     item_details_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{item_id}"
@@ -163,7 +163,7 @@ async def find_all_series_by_tmdb_id(
     索引未命中或校验全部失效时回退全局遍历,并把结果回写索引自愈。
     索引关闭时:直接走旧的全局遍历方案(不读写索引)。
     """
-    if not config_manager.load_config().enable_tmdb_index:
+    if not config_manager.load_config_readonly().enable_tmdb_index:
         return await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=proxy)
 
     entries = db_manager.find_items_by_tmdb(tmdb_id, "Series")
@@ -228,7 +228,7 @@ async def resolve_tmdb_id_for_item(
 ) -> Optional[str]:
     """获取条目的 TMDB ID:索引开启时优先反查索引(零网络请求),未索引时回退详情请求并回写;
     索引关闭时直接走详情请求。"""
-    if config_manager.load_config().enable_tmdb_index:
+    if config_manager.load_config_readonly().enable_tmdb_index:
         tmdb_id = db_manager.get_tmdb_id_for_item(item_id)
         if tmdb_id:
             return tmdb_id

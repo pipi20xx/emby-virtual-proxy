@@ -81,6 +81,26 @@ def load_config(force_reload: bool = False) -> AppConfig:
         return config.model_copy(deep=True)
 
 
+def load_config_readonly() -> AppConfig:
+    """返回进程内共享的配置快照(**不深拷贝**),仅供只读热路径使用。
+
+    代理核心每个请求要读 2~4 次配置,每次深拷贝整个 AppConfig(含全部虚拟库与
+    高级筛选规则)是稳定的浪费。这里直接返回缓存对象:
+    **调用方禁止就地修改**;需要修改请用 load_config()(深拷贝)后 save_config()。
+    缓存过期(>1s)时会退化为一次正常加载,开销仍是"最多每秒一次深拷贝"。
+    """
+    now = time.monotonic()
+    cached = _cache["config"]
+    if cached is not None and now - _cache["loaded_at"] < _CACHE_TTL_SECONDS:
+        return cached
+    return load_config()
+
+
+def load_config_for_write() -> AppConfig:
+    """语义化别名:需要就地修改并 save_config() 时用这个(返回深拷贝)。"""
+    return load_config()
+
+
 def save_config(config: AppConfig) -> None:
     try:
         CONFIG_DIR.mkdir(exist_ok=True)

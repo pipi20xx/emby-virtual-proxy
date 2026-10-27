@@ -2,6 +2,7 @@
 
 import logging
 import re
+import time
 from pathlib import Path
 from fastapi import Request, Response
 from fastapi.responses import FileResponse
@@ -29,10 +30,33 @@ PLACEHOLDER_RSSHUB_PATH = Path("/app/src/assets/images_placeholder/rsshubpost.jp
 # 【重要】请确保这个路径下存在一个为缺失剧集准备的占位图文件
 PLACEHOLDER_EPISODE_PATH = Path("/app/src/assets/images_placeholder/placeholder.jpg")      # 缺失剧集 (tmdb_)
 
+# 封面存在性缓存:/Views 等热路径每个请求要 stat 4 次,短 TTL 即可
+_COVER_EXISTS_TTL = 5.0
+_cover_exists_cache: dict = {}
+
 
 def cover_file_exists(item_id: str) -> bool:
-    """检查某虚拟库的封面文件是否已生成(兼容静态 jpg 与动图 gif/webp/apng)。"""
-    return any((COVERS_DIR / f"{item_id}{ext}").is_file() for ext in COVER_EXTENSIONS)
+    """检查某虚拟库的封面文件是否已生成(兼容静态 jpg 与动图 gif/webp/apng)。
+
+    热路径(/Views、首页分区)每个请求都会问一次,原先每次 4 次 stat;
+    这里加 5 秒进程内缓存。封面生成/删除后可直接调 invalidate_cover_cache(),
+    不调也只是最多 5 秒延迟。
+    """
+    now = time.monotonic()
+    cached = _cover_exists_cache.get(item_id)
+    if cached is not None and now - cached[0] < _COVER_EXISTS_TTL:
+        return cached[1]
+    exists = any((COVERS_DIR / f"{item_id}{ext}").is_file() for ext in COVER_EXTENSIONS)
+    _cover_exists_cache[item_id] = (now, exists)
+    return exists
+
+
+def invalidate_cover_cache(item_id: str = None) -> None:
+    """封面刚生成/删除后主动失效(不依赖 5 秒 TTL)。"""
+    if item_id is None:
+        _cover_exists_cache.clear()
+    else:
+        _cover_exists_cache.pop(item_id, None)
 
 
 async def handle_virtual_library_image(request: Request, full_path: str) -> Response | None:
@@ -61,24 +85,24 @@ async def handle_virtual_library_image(request: Request, full_path: str) -> Resp
     # --- 【修复 2】重构占位图返回逻辑 ---
     # 如果封面文件不存在，则根据 item_id 的格式返回对应的占位图
     # 这种方法比检查 URL 参数更可靠
-    
+
     placeholder_to_serve = None
-    
+
     if item_id.startswith("tmdb_"):  # 缺失剧集的 ID 以 "tmdb_" 开头
         logger.debug(f"IMAGE_HANDLER: Serving MISSING EPISODE placeholder for item '{item_id}'.")
         placeholder_to_serve = PLACEHOLDER_EPISODE_PATH
-        
+
     elif item_id.startswith("tmdb-"):  # RSSHub 项目的 ID 以 "tmdb-" 开头
         logger.debug(f"IMAGE_HANDLER: Serving RSSHUB placeholder for item '{item_id}'.")
         placeholder_to_serve = PLACEHOLDER_RSSHUB_PATH
-        
+
     else:  # 其他情况（标准的 UUID）被认为是常规虚拟库
         logger.debug(f"IMAGE_HANDLER: Serving 'GENERATING' placeholder for virtual library '{item_id}'.")
         placeholder_to_serve = PLACEHOLDER_GENERATING_PATH
 
     if placeholder_to_serve and placeholder_to_serve.is_file():
         return FileResponse(str(placeholder_to_serve), media_type="image/jpeg")
-    
+
     # 如果连占位图文件本身都不存在，则返回 404
     logger.error(f"IMAGE_HANDLER: Placeholder file not found for item '{item_id}' at path: {placeholder_to_serve}")
     return Response(status_code=404)

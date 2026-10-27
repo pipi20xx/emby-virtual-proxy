@@ -32,6 +32,7 @@ from proxy_cache import (
     serving_result_cache,
     drop_source_overlays,
 )
+import proxy_cache
 from emby_net import emby_proxy_of
 import db_manager
 logger = logging.getLogger(__name__)
@@ -760,6 +761,66 @@ def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: s
     return items
 
 
+# ---------- 异步包装:把 SQLite 读 + 大 JSON 序列化挪到线程,别卡事件循环 ----------
+# L0/L1/L2 都是"整库一个 JSON blob",冷读一次 json.loads、热写一次 json.dumps
+# 在几千~上万条目时是几十到几百毫秒,放在事件循环上会直接顶住所有并发请求。
+
+async def aget_base_items(source_key: str) -> Optional[Dict[str, Any]]:
+    entry = vlib_base_cache.get(source_key)
+    if entry is not None:
+        return entry
+    persisted = await asyncio.to_thread(db_manager.load_vlib_base, source_key)
+    if persisted:
+        entry = {"items": persisted[0], "updated_at": persisted[1], "sig": persisted[2]}
+        vlib_base_cache[source_key] = entry
+        logger.info(f"已从 SQLite 恢复全库数据源 '{source_key}'({len(persisted[0])} 项)。")
+    return entry
+
+
+async def aget_shared_metadata(vlib_id: str) -> Optional[Dict[str, Any]]:
+    entry = vlib_metadata_cache.get(vlib_id)
+    if entry is not None:
+        return entry
+    persisted = await asyncio.to_thread(db_manager.load_vlib_metadata, vlib_id)
+    if persisted:
+        entry = {"items": persisted[0], "updated_at": persisted[1]}
+        vlib_metadata_cache[vlib_id] = entry
+    return entry
+
+
+async def astore_shared_metadata(vlib, items: List[Dict[str, Any]]) -> None:
+    now = int(time.time())
+    vlib_metadata_cache[vlib.id] = {"items": items, "updated_at": now}
+    await asyncio.to_thread(db_manager.save_vlib_metadata, vlib.id, items, now)
+
+
+async def aget_user_overlay(source_key: str, user_id: str) -> Optional[Dict[str, Any]]:
+    key = (user_id, source_key)
+    entry = user_overlay_cache.get(key)
+    if entry is not None:
+        return entry
+    persisted = await asyncio.to_thread(db_manager.load_vlib_user_overlay, user_id, source_key)
+    if persisted:
+        entry = {"data": persisted[0], "updated_at": persisted[1]}
+        user_overlay_cache[key] = entry
+    return entry
+
+
+# 结果层单条上限:超过这个条目数就不进缓存(避免 16 条大列表把内存顶起来)
+_RESULT_CACHE_MAX_ITEMS = 8000
+
+
+def _serving_etag(vlib, meta: Dict[str, Any], overlay: Dict[str, Any], type_filter: Optional[str],
+                  sort_by: str, sort_order: str, start_idx: int, limit: Optional[int]) -> str:
+    """直出响应的弱 ETag:只由"数据版本 + 请求形态"决定,内容一致必然一致。"""
+    raw = "|".join([
+        vlib.id, str(int(meta["updated_at"])), str(int(overlay["updated_at"])),
+        type_filter or "", sort_by or "", sort_order or "",
+        str(start_idx), str(limit if limit is not None else -1),
+    ])
+    return 'W/"' + hashlib.md5(raw.encode()).hexdigest() + '"'
+
+
 def assemble_visible_items(meta_items: List[Dict[str, Any]],
                            overlay_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     """元数据 ∩ 用户可见条目,并叠加该用户自己的 UserData。
@@ -788,7 +849,9 @@ def _serving_view(config: AppConfig, vlib, user_id: str, meta: Dict[str, Any], o
     )
     cached = serving_result_cache.get(cache_key)
     if cached is not None:
+        proxy_cache.bump("result_hit")
         return cached["items"], cached["total"]
+    proxy_cache.bump("result_miss")
 
     items = assemble_visible_items(meta["items"], overlay["data"])
 
@@ -806,7 +869,7 @@ def _serving_view(config: AppConfig, vlib, user_id: str, meta: Dict[str, Any], o
     total = len(items)
 
     # Random 排序每次都应重新洗牌,不进入缓存;其余排序稳定,可以复用
-    if "random" not in (sort_by or "").lower():
+    if "random" not in (sort_by or "").lower() and total <= _RESULT_CACHE_MAX_ITEMS:
         serving_result_cache[cache_key] = {"items": items, "total": total}
     return items, total
 
@@ -848,7 +911,7 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     now = int(time.time())
     source_key = base_source_key(vlib)
 
-    meta = get_shared_metadata(vlib.id)
+    meta = await aget_shared_metadata(vlib.id)
     if meta is None:
         logger.info(f"直出元数据未命中('{vlib.name}'),本次实时查询并后台构建共享元数据。")
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
@@ -859,8 +922,9 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
 
-    overlay = get_user_overlay(source_key, user_id)
+    overlay = await aget_user_overlay(source_key, user_id)
     if overlay is None:
+        proxy_cache.bump("serving_miss")
         logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, 数据源 {source_key}),本次实时查询并后台构建。")
         headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
@@ -899,9 +963,23 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     page = items[start_idx:] if not limit else items[start_idx:start_idx + limit]
 
     logger.debug(f"本地直出:'{vlib.name}' 命中分层缓存(元数据 {len(meta['items'])} 项 / 用户可见 {total} 项)。")
+    proxy_cache.bump("serving_hit")
+
+    type_filter = params.get("IncludeItemTypes")
+    sort_by = params.get("SortBy", "SortName")
+    sort_order = params.get("SortOrder", "Ascending")
+
+    # 条件请求:数据版本 + 请求形态一致时,客户端前进/后退/重新进入筛选可直接命中 304,
+    # 连序列化与传输都省掉(整页 JSON 常常几百 KB)。
+    etag = _serving_etag(vlib, meta, overlay, type_filter, sort_by, sort_order, start_idx, limit)
+    if (request_headers or {}).get("if-none-match") == etag:
+        proxy_cache.bump("serving_304")
+        return Response(status_code=304, headers={"ETag": etag})
+
     payload = {"Items": page, "TotalRecordCount": total, "StartIndex": start_idx}
-    content = json.dumps(payload).encode("utf-8")
-    return Response(content=content, status_code=200, media_type="application/json")
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return Response(content=content, status_code=200, media_type="application/json",
+                    headers={"ETag": etag})
 
 
 async def try_serve_latest_locally(config: AppConfig, vlib, user_id: str,
@@ -922,14 +1000,14 @@ async def try_serve_latest_locally(config: AppConfig, vlib, user_id: str,
 
     now = int(time.time())
     source_key = base_source_key(vlib)
-    meta = get_shared_metadata(vlib.id)
+    meta = await aget_shared_metadata(vlib.id)
     if meta is None or (now - int(meta["updated_at"])) > _SERVING_HARD_TTL:
         if session is not None and real_emby_url:
             logger.info(f"首页最新:库 '{vlib.name}' 尚无可用元数据,本次实时查询并后台构建。")
             _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
 
-    overlay = get_user_overlay(source_key, user_id)
+    overlay = await aget_user_overlay(source_key, user_id)
     if overlay is None or (now - int(overlay["updated_at"])) > _OVERLAY_HARD_TTL:
         if session is not None and real_emby_url:
             logger.info(f"首页最新:用户叠加层不可用(数据源 {source_key}),本次实时查询并后台构建。")

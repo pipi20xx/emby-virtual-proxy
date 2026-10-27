@@ -250,6 +250,29 @@ async def clear_vlib_cache():
         raise HTTPException(status_code=500, detail=f"清空虚拟库缓存时发生内部错误: {e}")
 
 
+# --- 缓存状态(转发代理核心的快照,供面板展示命中率/体积) ---
+
+@api_router.get("/cache-stats", tags=["System"])
+async def get_cache_stats():
+    """返回代理核心的缓存状态与命中率;核心不可达时返回 available=False,不抛错。"""
+    proxy_core_url = _proxy_core_url()
+    if not proxy_core_url:
+        return {"available": False, "reason": "未配置 PROXY_CORE_URL"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{proxy_core_url.rstrip('/')}/api/internal/cache-stats",
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return {"available": False, "reason": f"代理核心返回 {resp.status}"}
+                data = await resp.json(content_type=None)
+                data["available"] = True
+                return data
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+
 # --- RSS 虚拟库刷新 ---
 
 @api_router.post("/libraries/{library_id}/refresh", status_code=202, tags=["Libraries"])

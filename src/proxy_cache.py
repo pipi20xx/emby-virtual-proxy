@@ -1,5 +1,7 @@
 # src/proxy_cache.py
 
+import hashlib
+
 from cachetools import TTLCache, LRUCache
 
 # 创建一个全局的、线程安全的缓存实例
@@ -30,6 +32,18 @@ serving_result_cache = LRUCache(maxsize=16)  # (库,用户,元数据版本,叠�
 merge_result_cache = TTLCache(maxsize=256, ttl=900)
 # 合并结果缓存开关(随配置刷新;由 proxy_server 每请求按 config 同步,避免 handler 里再深拷贝配置)
 merge_cache_enabled = True
+
+# --- 命中率计数器(给 /api/internal/cache-stats 用;单事件循环内自增,无需加锁) ---
+cache_counters = {}
+
+
+def bump(name: str, n: int = 1) -> None:
+    """累加一个计数器(名字任意,首次出现自动建)。"""
+    cache_counters[name] = cache_counters.get(name, 0) + n
+
+
+def reset_counters() -> None:
+    cache_counters.clear()
 
 
 def clear_vlib_caches() -> None:

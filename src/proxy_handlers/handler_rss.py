@@ -1,6 +1,7 @@
 from db_manager import DBManager
 from emby_net import emby_proxy_from_config
 from pathlib import Path
+import asyncio
 import requests
 import json
 import config_manager
@@ -13,7 +14,7 @@ class RssHandler:
     def __init__(self):
         self.rss_library_db = DBManager(RSS_LIBRARY_DB)
         self.tmdb_cache_db = DBManager(TMDB_CACHE_DB)
-        self.config = config_manager.load_config()
+        self.config = config_manager.load_config_readonly()
 
     async def handle(self, request_path: str, vlib_id: str, request_params, user_id: str, session, real_emby_url: str, request_headers):
         all_items_from_db = self.rss_library_db.fetchall(
@@ -42,9 +43,11 @@ class RssHandler:
         # 3. 使用真实的 ServerId 创建不存在项目的占位符
         missing_items_placeholders = []
         for item_info in missing_items_info:
-            # 注意：_get_item_from_tmdb 是同步的，但内部的数据库和网络请求是阻塞的
-            # 在异步函数中直接调用它在 aiohttp 环境下是安全的
-            item = self._get_item_from_tmdb(item_info['tmdb_id'], item_info['media_type'], server_id)
+            # _get_item_from_tmdb 是同步实现(内部 requests.get,最长 10 秒):
+            # 必须挪到线程执行,否则一个缺失条目就能把整个事件循环堵死。
+            item = await asyncio.to_thread(
+                self._get_item_from_tmdb, item_info['tmdb_id'], item_info['media_type'], server_id
+            )
             if item:
                 missing_items_placeholders.append(item)
 

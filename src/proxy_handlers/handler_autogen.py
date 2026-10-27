@@ -100,7 +100,7 @@ async def generate_poster_in_background(library_id: str, user_id: str, api_key: 
     logger.info(f"✅ 已启动库 {library_id} (用户: {user_id}) 的封面自动生成后台任务。")
 
     try:
-        config = config_manager.load_config()
+        config = config_manager.load_config_readonly()
         vlib = next((v for v in config.virtual_libraries if v.id == library_id), None)
         if not vlib:
             logger.error(f"后台任务：配置中未找到 vlib {library_id}。")

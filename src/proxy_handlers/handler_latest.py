@@ -92,7 +92,10 @@ async def handle_home_latest_items(
 
         missing_items_placeholders = []
         for item_info in missing_items_info:
-            item = rss_handler._get_item_from_tmdb(item_info['tmdb_id'], item_info['media_type'], server_id)
+            # 同步 TMDB 请求,挪到线程(否则阻塞事件循环)
+            item = await asyncio.to_thread(
+                rss_handler._get_item_from_tmdb, item_info['tmdb_id'], item_info['media_type'], server_id
+            )
             if item:
                 missing_items_placeholders.append(item)
 
