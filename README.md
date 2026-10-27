@@ -2,7 +2,7 @@
 
 本项目是一个功能强大的 **Emby 代理服务器**。它作为中间层部署在您的 Emby 客户端（如浏览器、手机APP）和真实的 Emby 服务器之间。通过智能地拦截和修改客户端与服务器之间的通信数据（API请求），本项目实现了许多 Emby 原生不支持的高级功能，极大地增强了您的媒体库管理和浏览体验。
 
-**功能总览**：虚拟媒体库 · 高级筛选器 · TMDB ID 合并 · RSS 虚拟库（豆瓣/Bangumi）· 风格化封面生成（含动态封面）· 虚拟库缓存预热与本地直出 · 缺失剧集显示 · 实时运行日志 · Web 管理后台
+**功能总览**：虚拟媒体库 · 高级筛选器 · TMDB ID 合并 · RSS 虚拟库（豆瓣/Bangumi）· 风格化封面生成（含动态封面）· 四层缓存与本地直出 · 图片本地化缓存 · 缺失剧集显示 · 实时运行日志 · 缓存状态面板 · Web 管理后台
 
 ---
 
@@ -23,13 +23,9 @@
           # 代理核心端口，左边为主机端口，右边为容器端口
           - "8999:8999"
         volumes:
-          # 挂载配置文件和生成的封面/日志目录，确保数据持久化
+          # 挂载配置文件和生成的封面/日志/图片缓存目录，确保数据持久化
           - ./config:/app/config
-          # 可选：仅在需要使用管理后台的“重启代理服务”按钮时才需要挂载
-          #- /var/run/docker.sock:/var/run/docker.sock
         environment:
-          # 环境变量：告诉管理服务要重启的容器名（即自身）
-          - PROXY_CONTAINER_NAME=emby-proxy
           # 环境变量：告诉管理服务如何访问同一容器内的代理服务
           - PROXY_CORE_URL=http://localhost:8999
           # 时区：影响日志时间戳与按天日志切分，可改为任意 IANA 时区名
@@ -48,8 +44,9 @@
     - **设置管理密码（可选）**: 在管理后台的“系统设置”中填写 `admin_password` 并保存，之后打开管理后台需要先登录
 
 > 说明：
-> - “重启代理服务”按钮依赖 Docker API，如需使用请取消注释 docker.sock 挂载行，并确保 `PROXY_CONTAINER_NAME` 与 `container_name` 一致。
+> - 管理后台已不再提供「重启代理服务」按钮（该方式在 compose 环境下不稳定），需要清空内存缓存请用「缓存状态」页的维护操作，或直接 `docker compose restart`。
 > - 如果想从源码构建镜像，可直接克隆本仓库并使用仓库自带的 `docker-compose.yml`（使用 `build: .` 方式构建）。
+> - `config/` 目录现在还会保存 `image_cache/`（海报本地化缓存），体积随浏览增长，可在设置页限制上限或一键清空。
 
 ### 🔌 端口说明
 
@@ -153,14 +150,57 @@
 - **素材来源（四级回退）**：虚拟库内容随机取材 → 库级自定义图片目录 → 全局自定义图片目录 → 编辑页临时上传的素材（最多 9 张，超出所需时随机抽选，保证每次生成有所不同）。
 - **自定义外观**：封面可单独设置中文主标题（留空使用库名）与英文标题；中英文字体支持全局设置（`custom_zh_font_path` / `custom_en_font_path`），也可为单个虚拟库覆盖，不填则使用内置默认字体。
 - **自动生成与重绘**：保存虚拟库、缓存预热或定时刷新完成后，代理会按内容指纹（条目集合哈希）自动重新生成封面——内容未变化则跳过重绘，内容变化则沿用该库固化的样式配方重绘。自动生成的样式由 `default_cover_style` 控制。
-- **存储与维护**：封面文件存放于 `config/images` 并通过代理 `/covers` 路径提供服务；系统设置中可一键清空所有本地封面。
+- **存储与维护**：封面文件存放于 `config/images` 并通过代理 `/covers` 路径提供服务；「缓存状态」页面可一键清空所有本地封面（清空后下次预热/浏览会按当前配方重新生成）。
 
 ### 6. 性能与缓存 (Performance & Caching)
 
-- **API 响应缓存**：`enable_cache` 总开关 + `api_cache_ttl`（秒，默认 300，0 为禁用），加速客户端高频请求。
-- **虚拟库提前缓存（预热）**：`enable_vlib_cache` 开启后，虚拟库项目列表以“模拟客户端”方式向 Emby 拉取并写入内存 + SQLite 双层缓存；`vlib_cache_refresh_interval` 设置定时预热间隔（小时，0 为禁用），启用后服务启动时也会先全量预热一轮。
-- **本地直出**：`enable_vlib_local_serving` 开启后，命中缓存的虚拟库列表由代理直接返回，不请求 Emby（过期后在后台刷新），首屏延迟大幅降低。
-- **TMDB 全库索引**：`enable_tmdb_index` 开启后在本地构建全库 TMDB ID 索引，加速 TMDB 合并的季/集跨库查找；`tmdb_index_refresh_interval`（默认 24 小时，0 表示仅启动时构建一次，之后靠查询自愈回写维持）。
+缓存按“越往下越共享”分成四层，另有几类全局缓存（API 响应 / 图片 / TMDB 索引）。所有层的实时状态都可在管理后台的**「缓存状态」页面**查看（条目数、时效、命中率、下次自动刷新时间、磁盘占用）。
+
+| 层 | 存什么 | 位置 | 作用域 | 默认时效 | 开关 |
+|---|---|---|---|---|---|
+| **L0 全库数据源** | 向 Emby 裸拉的全部条目（未筛选、未合并） | 内存 + SQLite `vlib_base_items` | **全局一份，所有虚拟库共用** | 6 小时（内容有变化才重拉） | `enable_vlib_local_serving` + `enable_vlib_cache` |
+| **L1 派生元数据** | 该库过滤 + TMDB 合并后的条目 | 内存 + SQLite `vlib_metadata` | 每虚拟库 | 6 小时软过期 / 72 小时硬过期 | 同上 |
+| **L2 用户状态层** | 每账号的已看 / 收藏 / 进度 | 内存 + SQLite `vlib_user_overlay` | 每账号（所有虚拟库共用） | 10 分钟 / 24 小时硬过期 | 同上 |
+| **L3 直出结果层** | 已组装 + 已排序的可见列表 | 内存 | 库 × 用户 × 当前排序 | 随 L1/L2 版本变化 | 同上 |
+| **季/集合并结果** | 合并后的季与集 | 内存 | 账号 × 剧集 × 季 | 15 分钟 | `enable_merge_cache` |
+| **API 响应缓存** | 任意 GET JSON 响应 | 内存 | 账号 × URL × 参数 | `api_cache_ttl`（默认 300 秒） | `enable_cache` |
+| **图片缓存** | 海报 / 背景 / 缩略图 | 磁盘 `config/image_cache/` | 全局（按条目 + 尺寸 + tag） | 永久（URL 带内容指纹，`immutable`） | `enable_image_cache` + `image_cache_max_mb` |
+| **封面素材** | 每库前 100 项，供封面自动取材 | 内存 + SQLite `vlib_items` | 每虚拟库 | 跟随 L1 | `enable_vlib_cache` |
+| **TMDB 索引** | 条目 → TMDB ID 查找表 | SQLite `emby_tmdb_index` | 全局 | 每 `tmdb_index_refresh_interval` 小时重建 | `enable_tmdb_index` |
+
+**作用范围**：L0~L3、季/集合并、封面素材只服务**虚拟库**请求；真实库的列表与详情请求原样透传，既不读也不写这些缓存。**图片缓存与 API 响应缓存是全局的** —— 图片缓存对真实库同样生效（同一张图在虚拟库和真实库中共用一份缓存）。
+
+**关键机制**：
+
+- **共享数据源**：挂在同一批内容上的多个虚拟库只向 Emby 拉一次（L0），各库在本地派生自己的结果。「合集 / 标签 / 类型 / 工作室 / 人员」型虚拟库的资源过滤也已下沉到本地完成（依赖 `CollectionIds` / `TagItems` / `GenreItems` 字段），因此同样共享 L0。
+- **探测式定时刷新**：到点先发 **1 个 `Limit=1` 的请求**，比对 `TotalRecordCount` 与最新 `DateCreated`；内容没变化就整轮跳过，有新增/删除才真正重建。把“每小时全量重拉”降成“每小时每库 1 个极小请求”。
+- **条件请求（ETag / 304）**：虚拟库列表响应带 ETag（由数据版本 + 请求形态决定），客户端前进/后退/重复进入时直接 304，连序列化都省掉。
+- **写入即失效**：修改库规则 → 立即失效该库派生缓存并重建（不再等 6 小时）；标记已看/收藏 → 立即丢弃该账号的状态层与响应缓存。共享的 L0/L2 不会因为改一个库而被清空。
+- **stale-while-revalidate**：软过期后照常返回旧数据，后台静默重建，浏览永不阻塞。
+- **JSON 压缩**：只对 `application/json` 做 gzip / br（视频与图片流完全不碰），一页几百 KB 的列表通常压到 10~20%。
+- **图片永久缓存**：Emby 的图片 URL 自带 `tag`（内容指纹），同一 URL 内容永不改变，因此可回 `Cache-Control: immutable`，连客户端都不再重复请求；磁盘超出配额时按最久未使用淘汰到 90%。
+
+**排障速查**（在服务器上执行）：
+
+```bash
+# 各层条目数 / 时效 / 命中率 / 下次自动刷新时间
+curl -s http://127.0.0.1:8999/api/internal/cache-stats | python3 -m json.tool
+
+# 图片缓存自检:给定 path 与原始 query,直接回答"会不会命中同一个文件"
+curl -s -G http://127.0.0.1:8999/api/internal/image-cache-selftest \
+  --data-urlencode 'path=emby/Items/123456/Images/Primary' \
+  --data-urlencode 'query=maxHeight=563&maxWidth=375&tag=<tag>&quality=90'
+
+# 单个图片请求是否走了本地缓存(看响应头)
+curl -sI 'http://127.0.0.1:8999/emby/Items/123456/Images/Primary?maxHeight=563&maxWidth=375&tag=<tag>&quality=90' \
+  | grep -i x-evp-image-cache
+#   miss      = 回源抓取并落盘
+#   hit       = 读本地磁盘
+#   hit-304   = 客户端带 ETag 来,直接 304
+#   无此响应头 = 未接管(无 tag / 带 Range / 功能关闭)
+```
+
+日志中的关键事件：`图片缓存命中: <id>/Primary`、`从共享数据源派生 '<库名>' 完成`、`探测到库 '<名>' 内容有变化(...)`、`启动预热:库 '<名>' 缓存仍新鲜(...),跳过刷新`。
 
 ### 7. 显示缺失剧集 (Missing Episodes)
 
@@ -178,9 +218,10 @@
 
 内置基于 Vue 3 + TypeScript + Vuetify 4 的管理界面（管理端口 8001），覆盖全部配置能力：
 
-- **页面**：登录、虚拟库管理、虚拟库编辑（资源/筛选器/封面工作室）、高级筛选器管理、系统设置、运行日志。
+- **页面**：登录、虚拟库管理、虚拟库编辑（资源/筛选器/封面工作室）、高级筛选器管理、主页布局、**缓存状态**、运行日志、系统设置。
+- **缓存状态页**：实时快照 + 10 秒自动刷新，包含全库数据源与各库派生条目、用户状态层、合并结果、图片缓存占用、命中计数器、**定时任务的下次运行时间**，以及维护操作（清空项目缓存 / 清空图片缓存 / 清空所有本地封面 / 清零计数器）。
 - **密码登录（可选）**：设置 `admin_password` 后打开管理后台需先登录，会话 Token 7 天有效，重启服务后需重新登录。密码只保护管理端口，**不影响代理端口（8999）的客户端访问**。
-- **维护操作**：手动生成封面、清空本地封面、清除代理缓存与虚拟库缓存、重启代理服务（需挂载 docker.sock 并正确设置 `PROXY_CONTAINER_NAME`）。
+- **维护操作**：手动生成/刷新封面、清空本地封面、清空项目缓存、清空图片缓存、清零命中计数器，均集中在「缓存状态」页（原「系统设置 → 危险区域」已移除，为改配置后清缓存而重启代理的做法也不再需要）。
 
 ---
 
@@ -200,13 +241,17 @@
 | `hide` | `[]` | 需在首页隐藏的真实库 ID 列表 |
 | `library` | `[]` | 虚拟库列表 |
 | `advanced_filters` | `[]` | 高级筛选器列表 |
-| `enable_cache` | `true` | API 响应缓存总开关 |
+| `enable_cache` | `true` | API 响应缓存总开关（**全局**：含真实库的 GET JSON） |
 | `api_cache_ttl` | `300` | API 响应缓存 TTL（秒），0 为禁用 |
 | `enable_vlib_cache` | `true` | 虚拟库项目缓存总开关（内存 + SQLite + 预热） |
-| `vlib_cache_refresh_interval` | `0` | 虚拟库缓存定时预热间隔（小时），0 为禁用 |
-| `enable_vlib_local_serving` | `true` | 虚拟库列表本地直出开关 |
+| `vlib_cache_refresh_interval` | `0` | 虚拟库缓存刷新间隔（小时），0 为禁用；到点先做一次变更探测，内容未变化则整轮跳过 |
+| `enable_vlib_local_serving` | `true` | 虚拟库列表本地直出（四层缓存的总开关） |
+| `enable_merge_cache` | `true` | 季/集合并结果短时缓存（15 分钟，按账号隔离） |
 | `enable_tmdb_index` | `true` | TMDB 全库索引开关（加速季/集合并） |
 | `tmdb_index_refresh_interval` | `24` | TMDB 索引重建间隔（小时），0 为仅启动时构建 |
+| `enable_image_cache` | `true` | 图片本地化缓存开关（海报/背景，**全局**生效） |
+| `image_cache_max_mb` | `2048` | 图片缓存磁盘上限（MB），0 为不限制 |
+| `image_cache_require_credential` | `false` | 图片缓存是否要求请求带凭证；默认关闭——多数 Emby 的图片接口不鉴权，而浏览器 `<img>` 不携带可识别凭证，开启会导致图片不再命中缓存 |
 | `show_missing_episodes` | `false` | 显示缺失剧集开关 |
 | `tmdb_api_key` | （空） | TMDB API 密钥（RSS 占位符、缺失剧集依赖） |
 | `tmdb_proxy` | （空） | TMDB 的 HTTP 代理 |
@@ -227,14 +272,19 @@ src/
 ├── main.py                 # 双进程入口 (admin / proxy)
 ├── app_paths.py            # 文件系统路径唯一定义处
 ├── models.py               # Pydantic 数据模型
-├── config_manager.py       # config.json 读写 (TTL缓存 + 原子写入)
+├── config_manager.py       # config.json 读写 (TTL缓存 + 只读快照 + 原子写入)
 ├── db_manager.py           # SQLite 缓存库管理 (每线程独立连接)
-├── proxy_cache.py          # 代理端内存缓存
+├── proxy_cache.py          # 代理端内存缓存 (四层缓存 / 响应缓存 / 合并缓存 / 命中计数器)
+├── json_compress.py        # 只压缩 JSON 响应的 ASGI 中间件 (视频/图片流不碰)
 ├── emby_net.py             # 访问 Emby 上游的 HTTP 代理统一解析
-├── logger.py               # 日志采集 (控制台 + WebSocket实时 + 按天文件)
+├── logger.py               # 日志采集 (后台线程写盘 + WebSocket实时 + 按天文件)
 │
 ├── proxy_server.py         # 代理核心 (客户端流量入口,勿随意改动)
-├── proxy_handlers/         # 代理端各端点处理器 (视图/Items/季集/最新/首页分区/合并/RSS/封面等)
+├── proxy_handlers/         # 代理端各端点处理器
+│   │                       #   视图/Items/季集/最新/首页分区/合并/RSS/封面等
+│   ├── handler_items.py    #   四层缓存与本地直出、列表派生、变更探测的数据侧
+│   ├── handler_image_cache.py  # 图片本地化缓存 (tag 即内容指纹,immutable)
+│   └── handler_autogen.py  #   封面按内容指纹自动重绘
 ├── advanced_filters/       # 高级筛选器 (规则翻译为 Emby 原生参数)
 │   └── translator.py       #   纯函数,无网络请求
 │
@@ -244,6 +294,9 @@ src/
 ├── cover_generator/        # 封面样式插件 (3 静态 + 4 动态,每个 style_*.py 一个样式,可插拔)
 └── assets/                 # 内置字体与占位图
 ```
+
+运行时数据都在 `config/`（容器内 `/app/config`，建议整目录挂载持久化）：
+`config.json` · `vlib_items.db`（全库数据源/派生元数据/用户状态层/封面素材/合并缓存/TMDB 索引）· `images/`（生成的封面）· `image_cache/`（海报本地化缓存）· `logs/`（按天日志）· RSS 相关缓存库。
 
 分层原则:**代理核心** (`proxy_server.py` + `proxy_handlers/`) 面向客户端,
 改动需极度谨慎;**管理后台** (`admin_server.py` + `services/`) 面向配置,
@@ -300,10 +353,12 @@ Emby 服务器自带与你运行版本逐字一致的 API 文档(493 个端点),
 
 - **后端 (Backend)**:
     - **框架**: Python `FastAPI`，通过 `supervisor` 在单容器内运行双进程（代理核心 + 管理后台）。
-    - **异步处理**: `aiohttp` 用于与 Emby 服务器进行高性能的异步HTTP通信。
-    - **缓存**: `cachetools` 内存缓存 + 多个 SQLite 缓存库（虚拟库条目 / TMDB / Bangumi / RSS 等）。
-    - **定时任务**: `APScheduler` 负责 RSS 刷新、虚拟库预热、TMDB 索引刷新等周期任务。
+    - **异步处理**: `aiohttp` 用于与 Emby 服务器进行高性能的异步HTTP通信；大对象的 SQLite 读写与 JSON 序列化走线程池，避免阻塞事件循环。
+    - **缓存**: `cachetools` 内存缓存（四层虚拟库缓存 + 响应缓存 + 合并缓存 + 命中计数器）+ 多个 SQLite 持久层（虚拟库数据源/元数据/状态层、TMDB、Bangumi、RSS 等）+ 磁盘图片缓存。
+    - **传输优化**: 只对 JSON 响应生效的 gzip/br 压缩中间件；虚拟库列表响应支持 ETag / 304。
+    - **定时任务**: `APScheduler` 负责 RSS 刷新、虚拟库缓存刷新（先探测后重建）、TMDB 索引刷新等周期任务。
     - **封面生成**: `Pillow` + `NumPy` 负责图片拼贴与动图帧合成。
+    - **日志**: 写盘与控制台输出在后台线程执行（`QueueHandler` + `QueueListener`），实时流经 WebSocket 推送。
 - **前端 (Frontend)**:
     - **框架/构建**: `Vue 3` + `TypeScript` + `Vite`
     - **状态管理**: `Pinia`
