@@ -8,10 +8,17 @@ from fastapi import Request, Response
 from aiohttp import ClientSession
 from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 from emby_net import emby_proxy_of
+import proxy_cache
 
 logger = logging.getLogger(__name__)
 
 SEASONS_PATH_REGEX = re.compile(r"/Shows/([a-f0-9\-]+)/Seasons")
+
+
+def _seasons_cache_key(user_id: str, representative_id: str, params) -> tuple:
+    """合并结果缓存键:条目自带用户 UserData,故按用户隔离;Fields 不同则结果字段不同。"""
+    return ("seasons", user_id, representative_id, params.get("Fields", ""))
+
 
 async def handle_seasons_merge(request: Request, full_path: str, session: ClientSession, real_emby_url: str) -> Response | None:
     match = SEASONS_PATH_REGEX.search(f"/{full_path}")
@@ -23,6 +30,15 @@ async def handle_seasons_merge(request: Request, full_path: str, session: Client
     params = request.query_params
     user_id = params.get("UserId")
     if not user_id: return Response(content="UserId not found", status_code=400)
+
+    # --- 命中合并结果缓存则直接返回:进详情页不再逐个剧集向 Emby 拉"季" ---
+    cache_key = _seasons_cache_key(user_id, representative_id, params)
+    if proxy_cache.merge_cache_enabled:
+        cached_items = proxy_cache.merge_result_cache.get(cache_key)
+        if cached_items is not None:
+            logger.info(f"SEASONS_HANDLER: 合并结果缓存命中,直接返回 {len(cached_items)} 个季。")
+            return Response(content=json.dumps({"Items": cached_items, "TotalRecordCount": len(cached_items)}),
+                            status_code=200, media_type="application/json")
 
     headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
     auth_token_param = {'X-Emby-Token': params.get('X-Emby-Token')} if 'X-Emby-Token' in params else {}
@@ -69,5 +85,8 @@ async def handle_seasons_merge(request: Request, full_path: str, session: Client
     
     final_items = sorted(merged_seasons.values(), key=lambda x: x.get("IndexNumber", 0))
     logger.info(f"SEASONS_HANDLER: 合并完成。合并前总数: {len(all_seasons)}, 合并后最终数量: {len(final_items)}")
+
+    if proxy_cache.merge_cache_enabled and final_items:
+        proxy_cache.merge_result_cache[cache_key] = final_items
 
     return Response(content=json.dumps({"Items": final_items, "TotalRecordCount": len(final_items)}), status_code=200, media_type="application/json")

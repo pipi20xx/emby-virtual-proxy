@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 import aiohttp
 from emby_net import emby_proxy_from_config
@@ -20,7 +21,7 @@ init_logging("proxy", level=logging.DEBUG)
 # 【【【 同时修改这一行，从 proxy_cache 导入两个缓存实例 】】】
 # api_cache 经 proxy_cache.api_cache 间接访问(TTL 可配置时会重建实例)
 import proxy_cache
-from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
+from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache, vlib_base_cache
 import config_manager
 import db_manager
 from services import tmdb_index_service
@@ -55,8 +56,10 @@ async def lifespan(app: FastAPI):
     # 记录主事件循环,后台工作线程产生的日志经此回投进实时广播
     LogBroadcaster.set_loop(asyncio.get_running_loop())
     app.state.aiohttp_session = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()); logger.info("Global AIOHTTP ClientSession created.")
-    # 按配置应用 API 响应缓存 TTL
-    proxy_cache.set_api_cache_ttl(config_manager.load_config().api_cache_ttl)
+    # 按配置应用 API 响应缓存 TTL 与合并结果缓存开关
+    _startup_config = config_manager.load_config()
+    proxy_cache.set_api_cache_ttl(_startup_config.api_cache_ttl)
+    proxy_cache.merge_cache_enabled = bool(getattr(_startup_config, "enable_merge_cache", True))
     # 启动预热:延迟到服务开始监听后(回填缓存/补封面/按配置全量刷新)
     prewarm_task = asyncio.create_task(_startup_warmup())
     yield
@@ -180,12 +183,18 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
     items: List[dict] = []
 
     if vlib.resource_type != "rsshub" and config.enable_vlib_local_serving:
-        # 规则库:共享元数据只解析一次(管理员身份,可见性最全),
-        # 各用户仅做轻量 UserData 叠加层 —— 用户数再多也不会放大全量解析
+        # 规则库:所有库共享同一份「全库基础数据源」,各库只在本地派生自己的结果;
+        # 各用户仅做轻量 UserData 叠加层(按数据源一份,多库共用)
+        source_key = handler_items.base_source_key(vlib)
+        # 整轮刷新里只重拉一次数据源:第一轮拉完后 60 秒内的后续库直接复用,
+        # 避免 N 个虚拟库把同一份全库数据源拉 N 遍。
+        base_entry = handler_items.get_base_items(source_key)
+        base_fresh_enough = bool(base_entry) and (int(time.time()) - int(base_entry["updated_at"])) <= 60
         items = await handler_items.resolve_shared_metadata(
             config, vlib, user_id, proxy_app.state.aiohttp_session,
             config.emby_url.rstrip('/'), internal_headers,
             proxy=emby_proxy_from_config(config),
+            force_base=not base_fresh_enough,
         )
         if not items:
             raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则")
@@ -201,6 +210,9 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
             if user_id not in all_users:
                 all_users.insert(0, user_id)
             for uid in all_users:
+                # 叠加层按数据源共享:同一轮预热里若有别的库已建过,直接跳过
+                if handler_items.overlay_is_fresh(source_key, uid):
+                    continue
                 try:
                     count = await handler_items.build_and_store_user_overlay(
                         config, vlib, uid, proxy_app.state.aiohttp_session,
@@ -210,7 +222,7 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
                     if count is None:
                         logger.warning(f"叠加层预热失败:库 '{vlib.name}' 用户 {uid}。")
                     else:
-                        logger.info(f"叠加层预热:库 '{vlib.name}' 用户 {uid} 已叠加 {count} 项用户状态。")
+                        logger.info(f"叠加层预热:数据源 '{source_key}' 用户 {uid} 已叠加 {count} 项用户状态。")
                 except Exception as e:
                     logger.warning(f"叠加层预热失败 ('{vlib.name}' 用户 {uid}): {e}")
 
@@ -253,7 +265,7 @@ async def get_vlib_source_hash(library_id: str):
     if not user_id:
         raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url / emby_api_key 配置")
 
-    items = await handler_autogen.fetch_vlib_items_internal(vlib, user_id, config.emby_api_key)
+    items = await handler_autogen.load_cover_source_items(library_id, vlib, user_id, config.emby_api_key)
     if not items:
         raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,无法计算内容指纹")
 
@@ -283,13 +295,59 @@ async def autogen_cover_for_library(library_id: str):
     return await _trigger_autogen_cover(library_id)
 
 
+@proxy_app.post("/api/internal/rebuild-vlib/{library_id}")
+async def rebuild_vlib(library_id: str):
+    """改库后的一次性重建:失效旧缓存 → 重新解析数据源/元数据/叠加层 → 触发封面刷新。
+
+    供 admin 在「保存虚拟库」后调用,保证规则改动立即生效(不必等软过期)。
+    """
+    await invalidate_vlib_cache(library_id)
+
+    config = config_manager.load_config()
+    vlib = next((v for v in config.virtual_libraries if v.id == library_id), None)
+    if not vlib:
+        raise HTTPException(status_code=404, detail="虚拟库不存在")
+
+    items = await _refresh_vlib_items_internal(config, library_id)
+    logger.info(f"重建完成:库 '{vlib.name}' 共 {len(items)} 项,封面将按新内容指纹刷新。")
+
+    try:
+        await _trigger_autogen_cover(library_id)
+    except Exception as e:
+        logger.warning(f"重建后触发封面刷新失败 ({library_id}): {e}")
+
+    return {"success": True, "library_id": library_id, "item_count": len(items)}
+
+
+@proxy_app.post("/api/internal/invalidate-vlib/{library_id}")
+async def invalidate_vlib_cache(library_id: str):
+    """精准失效某个虚拟库的缓存(改库规则/删库后由 admin 调用)。
+
+    清掉:该库的派生元数据、封面素材、结果层缓存 + 对应 SQLite 行,
+    以及全库数据源(规则变化后其派生结果不再适用)与合并结果缓存;
+    同时清空 API 响应缓存,避免旧列表在 TTL 内继续被返回。
+    """
+    proxy_cache.drop_vlib_memory(library_id)
+    vlib_base_cache.clear()
+    proxy_cache.merge_result_cache.clear()
+    proxy_cache.api_cache.clear()
+
+    db_manager.delete_vlib_items_cache(library_id)
+    db_manager.delete_vlib_metadata(library_id)
+    db_manager.delete_vlib_user_overlay(library_id)
+    db_manager.delete_vlib_base(handler_items.base_source_key())
+
+    logger.info(f"已失效虚拟库 {library_id} 的全部缓存(内存 + SQLite + 响应缓存)。")
+    return {"success": True, "library_id": library_id}
+
+
 @proxy_app.post("/api/internal/clear-vlib-cache")
 async def clear_vlib_cache():
     """清空代理核心内存中的虚拟库缓存(admin 侧同时清 SQLite 持久层)。"""
-    vlib_items_cache.clear()
-    vlib_metadata_cache.clear()
-    user_overlay_cache.clear()
-    logger.info("已清空内存中的虚拟库项目缓存、共享元数据与用户叠加层。")
+    proxy_cache.clear_vlib_caches()
+    # 响应缓存里可能存的是直出结果,不清就会在 TTL 内继续返回旧列表
+    proxy_cache.api_cache.clear()
+    logger.info("已清空内存中的全库数据源、共享元数据、用户叠加层、结果层与响应缓存。")
     return {"success": True}
 
 
@@ -317,7 +375,7 @@ async def _startup_warmup():
 
     1. SQLite -> 内存回填(零 Emby 开销,重启后缓存即刻可用);
     2. 为缺少封面文件的虚拟库补触发自动生成;
-    3. 启用 vlib_cache_refresh_interval 时,先全量刷新一轮项目缓存。
+    3. 启用 vlib_cache_refresh_interval 时刷新缓存,但只刷已超过该间隔的库(不做无谓的 Emby 压力)。
     """
     await asyncio.sleep(10)
     try:
@@ -336,6 +394,11 @@ async def _startup_warmup():
                 vlib_items_cache[vlib.id] = persisted
                 logger.info(f"启动预热:已从 SQLite 恢复库 '{vlib.name}' 的 {len(persisted)} 条项目缓存。")
         if config.enable_vlib_local_serving:
+            # 全库数据源:所有虚拟库共享,回填后各库派生都不必等 Emby
+            source_key = handler_items.base_source_key()
+            base = handler_items.get_base_items(source_key)
+            if base:
+                logger.info(f"启动预热:已从 SQLite 恢复全库数据源({len(base['items'])} 项),各虚拟库共享复用。")
             for vlib in config.virtual_libraries:
                 if vlib.id in vlib_metadata_cache:
                     continue
@@ -356,9 +419,15 @@ async def _startup_warmup():
 
     # 3. 启用定时预热时,启动先全量刷新一轮(缓存功能关闭时跳过)
     if config.enable_vlib_cache and config.vlib_cache_refresh_interval and config.vlib_cache_refresh_interval > 0:
-        logger.info("启动预热:开始全量刷新虚拟库项目缓存...")
+        interval_seconds = int(config.vlib_cache_refresh_interval) * 3600
+        logger.info(f"启动预热:开始刷新虚拟库缓存(仅过期库,阈值 {config.vlib_cache_refresh_interval}h)...")
         for vlib in config.virtual_libraries:
             try:
+                meta = handler_items.get_shared_metadata(vlib.id)
+                if meta and (int(time.time()) - int(meta["updated_at"])) < interval_seconds:
+                    age_minutes = (int(time.time()) - int(meta["updated_at"])) // 60
+                    logger.info(f"启动预热:库 '{vlib.name}' 缓存仍新鲜({age_minutes} 分钟前),跳过刷新。")
+                    continue
                 items = await _refresh_vlib_items_internal(config, vlib.id)
                 logger.info(f"启动预热:库 '{vlib.name}' 已刷新 {len(items)} 个项目。")
                 # 数据刷新后顺势触发封面自动刷新(内容指纹未变化时内部会跳过)
@@ -430,6 +499,40 @@ async def websocket_proxy(client_ws: WebSocket, full_path: str):
             pass
 # --- 【【【 修复结束 】】】 ---
 
+# 用户状态型写操作(标记已看/收藏)路径标记:命中后失效该用户的状态缓存
+_USER_STATE_WRITE_MARKERS = ("PlayedItems", "FavoriteItems")
+
+
+def _maybe_invalidate_user_state(request: Request, full_path: str, response) -> None:
+    """播放/收藏状态变更后,丢弃该用户的叠加层与响应缓存(下次浏览即重新拉取真实状态)。
+
+    只处理"状态型"写操作;播放进度上报(PlayingItems)频率极高且影响很小,故意不在失效范围。
+    """
+    if request.method == "GET" or response is None:
+        return
+    if not any(marker in full_path for marker in _USER_STATE_WRITE_MARKERS):
+        return
+    if not (200 <= int(getattr(response, "status_code", 500)) < 300):
+        return
+
+    user_id = request.query_params.get("UserId")
+    if not user_id:
+        parts = full_path.split('/')
+        if 'Users' in parts:
+            try:
+                idx = parts.index('Users') + 1
+                if idx < len(parts):
+                    user_id = parts[idx]
+            except (ValueError, IndexError):
+                pass
+    if not user_id:
+        return
+
+    handler_items.invalidate_user_overlay(user_id)
+    # 列表响应里的 TotalRecordCount / UserData 已不可信,一并清掉响应缓存
+    proxy_cache.api_cache.clear()
+    logger.info(f"用户 {user_id[:8]}… 的播放/收藏状态已变更,其叠加层与响应缓存已失效。")
+
 
 @proxy_app.api_route("/{full_path:path}", methods=["GET", "POST", "DELETE", "PUT"])
 async def reverse_proxy(request: Request, full_path: str):
@@ -438,6 +541,8 @@ async def reverse_proxy(request: Request, full_path: str):
     # 本请求访问 Emby 上游应使用的代理(留空直连);handler 内通过 emby_proxy_of(request) 读取
     request.state.emby_proxy = emby_proxy_from_config(config)
     request.state.real_emby_url = real_emby_url
+    # 运行时开关随配置同步(handler 里不再为此深拷贝一份配置)
+    proxy_cache.merge_cache_enabled = bool(getattr(config, "enable_merge_cache", True))
     
     cache_key = None
     if config.enable_cache and not proxy_cache.api_cache_disabled:
@@ -466,6 +571,9 @@ async def reverse_proxy(request: Request, full_path: str):
     if not response: response = await handler_items.handle_virtual_library_items(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_views.handle_view_injection(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_default.forward_request(request, full_path, request.method, real_emby_url, session)
+
+    # 播放/收藏状态写操作成功后,立即失效该用户的叠加层(否则"已看/未看"最长要等 10 分钟)
+    _maybe_invalidate_user_state(request, full_path, response)
 
     if config.enable_cache and not proxy_cache.api_cache_disabled and cache_key and response and response.status_code == 200 and not isinstance(response, StreamingResponse):
         content_type = response.headers.get("Content-Type", "")

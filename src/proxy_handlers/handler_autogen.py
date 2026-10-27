@@ -18,6 +18,7 @@ import aiohttp
 from fastapi import HTTPException
 
 import config_manager
+from proxy_cache import vlib_items_cache
 from services import cover_service
 from .handler_images import cover_file_exists
 
@@ -25,8 +26,28 @@ logger = logging.getLogger(__name__)
 
 GENERATION_IN_PROGRESS = set()
 
-# 指纹与素材取材向内部代理索取的条目上限
+# 指纹与素材取材向内部代理索取的条目上限(仅缓存不可用时才走这条回退路径)
 _INTERNAL_FETCH_LIMIT = 1000
+
+
+async def load_cover_source_items(library_id: str, vlib, user_id: str, api_key: str) -> list:
+    """取封面「内容指纹 + 素材」所需的条目。
+
+    优先读本地缓存(零 Emby 开销、与浏览直出看到的内容完全一致):
+    共享元数据 → 封面素材缓存 → 都没有才回退内部自调用。
+    旧实现无条件自调用一次 /Items,既多一次完整管线开销,又只在有缓存时算出的指纹才准。
+    """
+    # 延迟导入:handler_views → handler_autogen → handler_items 会形成循环导入
+    from . import handler_items
+    meta = handler_items.get_shared_metadata(library_id)
+    if meta and meta.get("items"):
+        return meta["items"]
+
+    cached = vlib_items_cache.get(library_id)
+    if cached:
+        return cached
+
+    return await fetch_vlib_items_internal(vlib, user_id, api_key)
 
 
 async def fetch_vlib_items_internal(vlib, user_id: str, api_key: str) -> list:
@@ -85,7 +106,7 @@ async def generate_poster_in_background(library_id: str, user_id: str, api_key: 
             logger.error(f"后台任务：配置中未找到 vlib {library_id}。")
             return
 
-        items = await fetch_vlib_items_internal(vlib, user_id, api_key)
+        items = await load_cover_source_items(library_id, vlib, user_id, api_key)
         if not items:
             logger.warning(f"后台任务：根据虚拟库 '{vlib.name}' 的规则，未从代理获取到任何项目。")
             return

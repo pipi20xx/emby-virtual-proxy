@@ -222,6 +222,16 @@ def init_databases():
     )
     """, commit=True)
 
+    # 全库基础数据源(所有虚拟库共享):裸拉原始条目,未筛选、未合并、已剥离 UserData
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS vlib_base_items (
+        source_key TEXT PRIMARY KEY,
+        items_json TEXT,
+        updated_at INTEGER,
+        sig TEXT
+    )
+    """, commit=True)
+
     # 共享元数据(本地直出分层缓存):每库一份、所有用户共用(已剥离 UserData)
     vlib_items_db.execute("""
     CREATE TABLE IF NOT EXISTS vlib_metadata (
@@ -387,6 +397,57 @@ def clear_vlib_metadata() -> int:
         return 0
 
 
+# --- 全库基础数据源(所有虚拟库共享的裸拉结果) ---
+
+def save_vlib_base(source_key: str, items: list, updated_at: int, sig: str = "") -> None:
+    """保存全库基础数据源(裸拉原样,未筛选未合并);sig 为条目 Id 集合指纹。"""
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "INSERT INTO vlib_base_items (source_key, items_json, updated_at, sig) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(source_key) DO UPDATE SET items_json = excluded.items_json, "
+            "updated_at = excluded.updated_at, sig = excluded.sig",
+            (source_key, json.dumps(items, ensure_ascii=False), updated_at, sig),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving vlib base source {source_key}: {e}")
+
+
+def load_vlib_base(source_key: str):
+    """读取全库基础数据源,返回 (items, updated_at, sig) 或 None。"""
+    try:
+        row = DBManager(VLIB_ITEMS_DB).fetchone(
+            "SELECT items_json, updated_at, sig FROM vlib_base_items WHERE source_key = ?", (source_key,)
+        )
+        if not row or not row["items_json"]:
+            return None
+        items = json.loads(row["items_json"])
+        if not isinstance(items, list):
+            return None
+        return items, int(row["updated_at"] or 0), str(row["sig"] or "")
+    except Exception as e:
+        print(f"Error loading vlib base source {source_key}: {e}")
+        return None
+
+
+def delete_vlib_base(source_key: str) -> None:
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "DELETE FROM vlib_base_items WHERE source_key = ?", (source_key,), commit=True
+        )
+    except Exception as e:
+        print(f"Error deleting vlib base source {source_key}: {e}")
+
+
+def clear_vlib_base() -> int:
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_base_items", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing vlib base sources: {e}")
+        return 0
+
+
 def save_vlib_user_overlay(user_id: str, library_id: str, data: dict, updated_at: int) -> None:
     """保存用户叠加层 {条目ID: UserData}。"""
     try:
@@ -443,6 +504,24 @@ def delete_vlib_user_overlay(library_id: str) -> None:
         )
     except Exception as e:
         print(f"Error deleting vlib user overlay for {library_id}: {e}")
+
+
+def delete_user_overlay_rows(user_id: str, source_key: Optional[str] = None) -> None:
+    """删除某用户的叠加层行;source_key 为空表示该用户的所有数据源。
+
+    说明:library_id 列现在存的是数据源键(如 "all"),与用户叠加层的粒度保持一致。
+    """
+    try:
+        db = DBManager(VLIB_ITEMS_DB)
+        if source_key:
+            db.execute(
+                "DELETE FROM vlib_user_overlay WHERE user_id = ? AND library_id = ?",
+                (user_id, source_key), commit=True,
+            )
+        else:
+            db.execute("DELETE FROM vlib_user_overlay WHERE user_id = ?", (user_id,), commit=True)
+    except Exception as e:
+        print(f"Error deleting user overlay rows for {user_id}/{source_key}: {e}")
 
 
 # --- TMDB 索引(全库 媒体项 → TMDB ID 快速查找表) ---

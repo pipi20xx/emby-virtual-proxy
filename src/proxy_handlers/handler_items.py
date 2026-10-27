@@ -1,6 +1,7 @@
 # src/proxy_handlers/handler_items.py (高性能重构版)
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -23,38 +24,75 @@ from ._filter_translator import (
     USER_STATE_FIELDS,
 )
 from .handler_rss import RssHandler
-from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cache
+from proxy_cache import (
+    vlib_base_cache,
+    vlib_items_cache,
+    vlib_metadata_cache,
+    user_overlay_cache,
+    serving_result_cache,
+    drop_source_overlays,
+)
 from emby_net import emby_proxy_of
 import db_manager
 logger = logging.getLogger(__name__)
 
 # ================= 本地直出(访问加速,分层缓存) =================
-# 架构:共享元数据(每库一份,管理员身份解析,已剥离 UserData,所有用户共用)
-#      + 用户叠加层(每 用户+库 一份,仅存 {条目ID: UserData},体积约为元数据的 5%)
-# 服务时按叠加层裁剪可见性并叠加用户状态 —— 元数据只存/解析一份,任意用户数都低成本。
+# 架构(自下而上四层,越往下越共享):
+#   L0 全库基础数据源:裸拉(不筛选、不合并)的原始条目,【所有虚拟库共用一份】
+#   L1 共享元数据:每库一份派生结果(资源/规则过滤 + TMDB 合并),所有用户共用
+#   L2 用户叠加层:每 用户+数据源 一份,只存 {条目ID: UserData}
+#   L3 直出结果:已组装 + 已排序的可见列表,翻页只做切片
 # 软过期:超过后照常返回,同时后台异步刷新(stale-while-revalidate)
 _SERVING_SOFT_TTL = 6 * 3600
-# 硬过期:元数据超过后不再直出,回退实时查询并后台重建;叠加层硬过期仍照常返回
+# 硬过期:元数据超过后不再直出,回退实时查询并后台重建
 _SERVING_HARD_TTL = 72 * 3600
+# 用户叠加层单独一套更短的时效:播放状态变化频繁,不能跟元数据一样等 6 小时
+_OVERLAY_SOFT_TTL = 10 * 60
+# 叠加层硬过期:过久未更新(Emby 长时间不可达)时回退实时查询,避免一直返回旧播放状态
+_OVERLAY_HARD_TTL = 24 * 3600
+# 全库基础数据源时效(与元数据同节奏;内容未变化时只更新时间戳,不重写叠加层)
+_BASE_SOFT_TTL = 6 * 3600
+_BASE_HARD_TTL = 72 * 3600
 
 # 全量解析时向 Emby 索取的字段(覆盖常规客户端浏览所需)
+# 说明:CollectionIds / TagItems / GenreItems 用于把「合集/标签/类型」型虚拟库的资源过滤
+#       从 Emby 参数下沉到代理端,从而让所有虚拟库共享同一份全库数据源(见 L0 层)。
+#       Studios / People 本身就带 Id,可直接本地比对。
 _SERVING_FETCH_FIELDS = [
     "ProviderIds", "Genres", "Tags", "Studios", "People", "OfficialRatings", "CommunityRating",
     "ProductionYear", "VideoRange", "Container", "Overview", "PremiereDate", "DateCreated",
     "SortName", "PrimaryImageAspectRatio", "ChildCount", "MediaSourceCount", "BasicSyncInfo", "CanDelete",
+    "CollectionIds", "TagItems", "GenreItems",
 ]
 
 # 请求中出现以下参数说明不是"简单浏览",回退实时查询(保证过滤语义正确)
 _SERVING_BLOCKLIST_PARAMS = [
-    "SearchTerm", "Filters", "Genres", "Years", "OfficialRating", "Tags", "Studios",
-    "Person", "PersonIds", "GenreIds", "StudioIds", "TagIds", "CollectionIds",
-    "MinCommunityRating", "MinDateCreated", "MaxDateCreated", "Ids", "IsPlayed",
-    "IsUnplayed", "IsFavorite", "IsResume", "IsLiked", "AlbumArtistIds", "ArtistIds",
+    "SearchTerm", "SearchQuery", "Filters", "Genres", "Years", "OfficialRating", "OfficialRatings",
+    "Tags", "Studios", "Person", "PersonIds", "GenreIds", "StudioIds", "TagIds", "CollectionIds",
+    "MinCommunityRating", "MinDateCreated", "MaxDateCreated", "MinPremiereDate", "MaxPremiereDate",
+    "Ids", "IsPlayed", "IsUnplayed", "IsFavorite", "IsResume", "IsLiked", "AlbumArtistIds", "ArtistIds",
+    # 以下参数原实现未拦截,会在直出路径被静默忽略 → 返回与请求不符的内容(错内容比慢更糟)
+    "NameStartsWith", "NameLessThan", "ExcludeItemTypes", "VideoTypes", "SeriesStatus", "Containers",
+    "AnyProviderIdEquals", "MinStartDate", "MaxStartDate", "MinEndDate", "MaxEndDate",
+]
+
+# 布尔型筛选参数:只有"真的被开启"时才回退实时查询。
+# 客户端常带 =false 的空语义参数,若一并回退会让直出长期失效、缓存形同虚设。
+_SERVING_TRUTHY_ONLY_PARAMS = [
+    "IsMovie", "IsSeries", "IsFolder", "Is4K", "IsHD", "IsUnaired",
+    "HasSubtitles", "HasTrailer", "IsMissing",
 ]
 
 # 直出响应的本地排序支持
-_SERVING_NUMERIC_SORT_FIELDS = {"CommunityRating", "ProductionYear"}
+_SERVING_NUMERIC_SORT_FIELDS = {
+    "CommunityRating", "ProductionYear", "Runtime", "PlayCount",
+    "ParentIndexNumber", "IndexNumber", "ChildCount",
+}
 _SERVING_DATE_SORT_FIELDS = {"DateCreated", "PremiereDate"}
+# 可安全本地排序的字段白名单;出现白名单之外的 SortBy 一律回退实时查询(避免"排序静默失效")
+_SERVING_SAFE_SORT_FIELDS = (
+    _SERVING_NUMERIC_SORT_FIELDS | _SERVING_DATE_SORT_FIELDS | {"SortName", "Name", "Random"}
+)
 
 # 叠加层按 Id 批量查询的每批条目数(控制 URL 长度)
 _SERVING_OVERLAY_CHUNK = 150
@@ -209,8 +247,203 @@ def _build_user_forward_headers(request_headers, params) -> Dict[str, str]:
     return headers
 
 
+# ---------- L0:全库基础数据源(所有虚拟库共享的裸拉结果) ----------
+
+# 单批拉取条数
+_BASE_PAGE = 200
+# 唯一数据源键:所有真实媒体库的并集(见 base_source_key 的扩展说明)
+BASE_SOURCE_ALL = "all"
+
+# 资源类型 -> 本地过滤所依赖的条目字段(用于判断共享 base 能否支撑该库)
+_RESOURCE_FIELD_KEY = {
+    "collection": "CollectionIds",
+    "tag": "TagItems",
+    "genre": "GenreItems",
+    "studio": "Studios",
+    "person": "People",
+}
+
+
+def base_source_key(vlib=None) -> str:
+    """虚拟库对应的数据源键。当前只有一个数据源:所有真实媒体库的并集。
+
+    未来若要按真实库切分,只需在此返回 "library:<真实库Id>",
+    并把该 Id 作为 ParentId 加进 _base_fetch_params,上层逻辑无需改动。
+    """
+    return BASE_SOURCE_ALL
+
+
+def _items_signature(items: List[Dict[str, Any]]) -> str:
+    """条目 Id 集合指纹(与顺序无关);内容未变化时不必重建用户叠加层。"""
+    return hashlib.md5(",".join(sorted(str(i.get("Id")) for i in items)).encode()).hexdigest()
+
+
+def _base_fetch_params(api_token: Optional[str]) -> Dict[str, Any]:
+    """全库裸拉参数:不含任何资源/筛选参数,所有虚拟库完全一致 —— 这正是可共享的前提。"""
+    params: Dict[str, Any] = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series,Video",
+        "Fields": ",".join(_SERVING_FETCH_FIELDS),
+    }
+    if api_token:
+        params["X-Emby-Token"] = api_token
+    return params
+
+
+async def build_base_items(user_id: str, session: ClientSession, real_emby_url: str,
+                           headers: Dict[str, str], proxy: Optional[str] = None) -> List[Dict[str, Any]]:
+    """以传入身份裸拉全库条目(不筛选、不合并),失败返回空列表。"""
+    params = _base_fetch_params(_extract_token(headers))
+    url = f"{real_emby_url}/emby/Users/{user_id}/Items"
+    all_items: List[Dict[str, Any]] = []
+    start_index = 0
+    while True:
+        fetch_params = dict(params)
+        fetch_params["StartIndex"] = str(start_index)
+        fetch_params["Limit"] = str(_BASE_PAGE)
+        async with session.get(url, params=fetch_params, headers=headers, proxy=proxy) as resp:
+            if resp.status != 200:
+                logger.warning(f"全库数据源拉取失败, Status: {resp.status}")
+                return []
+            batch_items = (await resp.json(content_type=None)).get("Items", [])
+        if not batch_items:
+            break
+        all_items.extend(batch_items)
+        start_index += len(batch_items)
+        if len(batch_items) < _BASE_PAGE:
+            break
+
+    for item in all_items:
+        item.pop("UserData", None)
+    logger.info(f"全库数据源裸拉完成,共 {len(all_items)} 个条目。")
+    return all_items
+
+
+def get_base_items(source_key: str) -> Optional[Dict[str, Any]]:
+    """读取全库数据源(内存优先,未命中回退 SQLite 并回填)。"""
+    entry = vlib_base_cache.get(source_key)
+    if entry is None:
+        persisted = db_manager.load_vlib_base(source_key)
+        if persisted:
+            entry = {"items": persisted[0], "updated_at": persisted[1], "sig": persisted[2]}
+            vlib_base_cache[source_key] = entry
+            logger.info(f"已从 SQLite 恢复全库数据源 '{source_key}'({len(persisted[0])} 项)。")
+    return entry
+
+
+def store_base_items(source_key: str, items: List[Dict[str, Any]]) -> bool:
+    """写入全库数据源;条目集合变化时丢弃该数据源的用户叠加层(叠加层按 Id 建)。
+
+    返回 True 表示内容确实变化(调用方据此决定是否重建叠加层)。
+    """
+    now = int(time.time())
+    sig = _items_signature(items)
+    previous = get_base_items(source_key)
+    changed = previous is None or previous.get("sig") != sig
+
+    vlib_base_cache[source_key] = {"items": items, "updated_at": now, "sig": sig}
+    db_manager.save_vlib_base(source_key, items, now, sig)
+
+    if changed:
+        drop_source_overlays(source_key)
+        db_manager.delete_vlib_user_overlay(source_key)
+        logger.info(f"全库数据源 '{source_key}' 内容已变化({len(items)} 项),相关用户叠加层已失效。")
+    return changed
+
+
+async def ensure_base_items(config: AppConfig, source_key: str, user_id: str, session: ClientSession,
+                            real_emby_url: str, headers: Dict[str, str],
+                            proxy: Optional[str] = None, force: bool = False) -> Optional[Dict[str, Any]]:
+    """确保全库数据源可用:未过期直接复用,过期/强制时重新裸拉(失败保留旧快照)。"""
+    entry = get_base_items(source_key)
+    now = int(time.time())
+    if entry and not force and now - int(entry["updated_at"]) <= _BASE_HARD_TTL:
+        return entry
+
+    items = await build_base_items(user_id, session, real_emby_url, headers, proxy=proxy)
+    if not items:
+        if entry:
+            logger.warning(f"全库数据源 '{source_key}' 刷新失败,沿用旧快照({len(entry['items'])} 项)。")
+        return entry
+    store_base_items(source_key, items)
+    return get_base_items(source_key)
+
+
+def can_derive_from_base(config: AppConfig, vlib) -> bool:
+    """该库能否从共享全库数据源本地派生,从而完全不必自己向 Emby 拉一遍。
+
+    条件:非 RSS 库,且高级筛选器为空或为「本地全量」模式。
+    native 模式依赖翻译后的 Emby 原生参数,无法在共享 base 上复现,仍走逐库拉取(行为不变)。
+    """
+    if getattr(vlib, "resource_type", None) == "rsshub":
+        return False
+    adv_filter = find_vlib_filter(config, vlib)
+    if adv_filter is not None and not is_local_mode(adv_filter):
+        return False
+    return True
+
+
+def _base_supports_resource(base_items: List[Dict[str, Any]], resource_type: str) -> bool:
+    """抽样检查共享 base 是否带够了本地资源过滤所需的字段;缺字段则回退逐库拉取。"""
+    if resource_type == "all":
+        return True
+    key = _RESOURCE_FIELD_KEY.get(resource_type)
+    if not key:
+        return False
+    sample = base_items[:50]
+    if not sample:
+        return True
+    return any(isinstance(it, dict) and key in it for it in sample)
+
+
+def _resource_matches(vlib, item: Dict[str, Any]) -> bool:
+    """本地资源过滤:条目是否属于该虚拟库指定的合集/标签/类型/工作室/人员。"""
+    resource_id = str(getattr(vlib, "resource_id", "") or "")
+    if not resource_id:
+        return True
+
+    resource_type = vlib.resource_type
+    if resource_type == "collection":
+        return resource_id in {str(x) for x in (item.get("CollectionIds") or [])}
+    if resource_type == "tag":
+        if resource_id in {str(x) for x in (item.get("Tags") or [])}:
+            return True
+        return resource_id in {str(t.get("Id")) for t in (item.get("TagItems") or []) if isinstance(t, dict)}
+    if resource_type == "genre":
+        if resource_id in {str(g.get("Id")) for g in (item.get("GenreItems") or []) if isinstance(g, dict)}:
+            return True
+        return resource_id in {str(x) for x in (item.get("Genres") or [])}
+    if resource_type == "studio":
+        return resource_id in {str(s.get("Id")) for s in (item.get("Studios") or []) if isinstance(s, dict)}
+    if resource_type == "person":
+        return resource_id in {str(p.get("Id")) for p in (item.get("People") or []) if isinstance(p, dict)}
+    return True
+
+
+async def derive_metadata_from_base(config: AppConfig, vlib, base_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """在全库数据源上本地派生该虚拟库的共享元数据(资源过滤 → 规则过滤 → TMDB 合并)。
+
+    顺序与逐库拉取完全一致(先筛后合并),因此合并代表条目的选择不变;
+    返回的列表与 base 共享同一批 item dict,不产生第二份条目数据。
+    """
+    if vlib.resource_type == "all":
+        items = list(base_items)
+    else:
+        items = [it for it in base_items if _resource_matches(vlib, it)]
+
+    _native_params, post_filter_rules, _user_state_rules, match_all = resolve_for_serving(config, vlib)
+    if post_filter_rules:
+        items = _apply_post_filter(items, post_filter_rules, match_all=match_all)
+
+    if vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id:
+        items = await handler_merger.merge_items_by_tmdb(items)
+
+    logger.info(f"从共享数据源派生 '{vlib.name}' 完成,共 {len(items)} 个项目。")
+    return items
+
+
 def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) -> Tuple[Dict[str, Any], List, List, bool]:
-    """构建虚拟库解析请求参数与本地评估规则,供全量拉取复用。
+    """构建虚拟库解析请求参数与本地评估规则,供(逐库)全量拉取复用。
 
     返回 (拉取参数, 元数据后筛选规则, 用户态规则, 匹配方式):
     - 原生模式:可翻译规则进拉取参数,其余规则全部本地后筛选(历史行为);
@@ -235,52 +468,71 @@ def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) 
     return new_params, post_filter_rules, user_state_rules, match_all
 
 
+async def _resolve_shared_metadata_direct(config: AppConfig, vlib, user_id: str, session: ClientSession,
+                                          real_emby_url: str, headers: Dict[str, str],
+                                          proxy: Optional[str] = None) -> List[Dict[str, Any]]:
+    """逐库拉取(共享数据源不可用时的回退:native 筛选器,或 base 缺少所需字段)。"""
+    new_params, post_filter_rules, _user_state_rules, match_all = _build_resolution_params(config, vlib, _extract_token(headers))
+    search_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
+
+    all_items: List[Dict[str, Any]] = []
+    start_index, limit = 0, _BASE_PAGE
+    while True:
+        fetch_params = new_params.copy()
+        fetch_params["StartIndex"] = str(start_index)
+        fetch_params["Limit"] = str(limit)
+        async with session.get(search_url, params=fetch_params, headers=headers, proxy=proxy) as resp:
+            if resp.status != 200:
+                logger.warning(f"全量解析 '{vlib.name}' 批次请求失败, Status: {resp.status}")
+                return []
+            batch_items = (await resp.json(content_type=None)).get("Items", [])
+            if not batch_items:
+                break
+            all_items.extend(batch_items)
+            start_index += len(batch_items)
+            if len(batch_items) < limit:
+                break
+
+    if post_filter_rules:
+        all_items = _apply_post_filter(all_items, post_filter_rules, match_all=match_all)
+
+    if vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id:
+        all_items = await handler_merger.merge_items_by_tmdb(all_items)
+
+    for item in all_items:
+        item.pop("UserData", None)
+
+    logger.info(f"全量解析 '{vlib.name}' 完成(逐库拉取),共 {len(all_items)} 个项目。")
+    return all_items
+
+
 async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session: ClientSession,
                                   real_emby_url: str, headers: Dict[str, str],
-                                  proxy: Optional[str] = None) -> List[Dict[str, Any]]:
+                                  proxy: Optional[str] = None, force_base: bool = False) -> List[Dict[str, Any]]:
     """解析虚拟库共享元数据(规则过滤 + 高级筛选 + TMDB 合并),并剥离 UserData。
 
+    优先从「全库基础数据源」本地派生:所有虚拟库共享一次裸拉,不再各自向 Emby 拉一遍。
+    数据源不可用(字段不足 / native 筛选器 / 拉取失败)时回退到逐库拉取,行为与历史一致。
     共享元数据与用户无关,所有用户共用一份;可见性差异由用户叠加层在服务时裁剪。
-    以传入身份查询(预热时为管理员 api_key,可见性最全);失败返回空列表。
-    用户态规则(IsPlayed/IsUnplayed)在此不评估——共享元数据已剥离用户状态,
+    用户态规则(IsPlayed/IsUnplayed)在此不评估 —— 共享元数据已剥离用户状态,
     由 try_serve_locally 在叠加用户 UserData 后评估。
     """
     try:
-        new_params, post_filter_rules, _user_state_rules, match_all = _build_resolution_params(config, vlib, _extract_token(headers))
-        search_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
-
-        all_items: List[Dict[str, Any]] = []
-        start_index, limit = 0, 200
-        while True:
-            fetch_params = new_params.copy()
-            fetch_params["StartIndex"] = str(start_index)
-            fetch_params["Limit"] = str(limit)
-            async with session.get(search_url, params=fetch_params, headers=headers, proxy=proxy) as resp:
-                if resp.status != 200:
-                    logger.warning(f"全量解析 '{vlib.name}' 批次请求失败, Status: {resp.status}")
-                    return []
-                batch_items = (await resp.json(content_type=None)).get("Items", [])
-                if not batch_items:
-                    break
-                all_items.extend(batch_items)
-                start_index += len(batch_items)
-                if len(batch_items) < limit:
-                    break
-
-        if post_filter_rules:
-            all_items = _apply_post_filter(all_items, post_filter_rules, match_all=match_all)
-
-        if vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id:
-            all_items = await handler_merger.merge_items_by_tmdb(all_items)
-
-        for item in all_items:
-            item.pop("UserData", None)
-
-        logger.info(f"全量解析 '{vlib.name}' 完成,共 {len(all_items)} 个项目。")
-        return all_items
+        if can_derive_from_base(config, vlib):
+            source_key = base_source_key(vlib)
+            base = await ensure_base_items(config, source_key, user_id, session, real_emby_url,
+                                           headers, proxy=proxy, force=force_base)
+            if base and base["items"] and _base_supports_resource(base["items"], vlib.resource_type):
+                return await derive_metadata_from_base(config, vlib, base["items"])
+            if base and base["items"]:
+                logger.warning(
+                    f"全库数据源缺少 '{vlib.resource_type}' 过滤所需字段,库 '{vlib.name}' 回退为逐库拉取。"
+                )
+        return await _resolve_shared_metadata_direct(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
     except Exception as e:
         logger.warning(f"解析虚拟库 '{vlib.name}' 完整列表时出错: {e}")
         return []
+
 
 
 def get_shared_metadata(vlib_id: str) -> Optional[Dict[str, Any]]:
@@ -300,23 +552,38 @@ def store_shared_metadata(vlib, items: List[Dict[str, Any]]) -> None:
     db_manager.save_vlib_metadata(vlib.id, items, now)
 
 
-async def build_user_overlay_data(config: AppConfig, vlib, user_id: str, session: ClientSession,
+# 封面素材缓存落盘节流:同一虚拟库最多每 10 分钟写一次 SQLite。
+# 旧实现每次浏览请求都会把当前页写回 vlib_items.db(事件循环内 json+commit),
+# 既拖慢请求,也把预热写好的整库素材缓存覆盖成一页。
+_COVER_WRITE_MIN_INTERVAL = 600
+_last_cover_write_at: Dict[str, int] = {}
+
+
+def _remember_cover_materials(vlib, items: List[Dict[str, Any]]) -> None:
+    """更新封面素材缓存(内存即时生效,SQLite 落盘按库节流)。"""
+    if not items:
+        return
+    vlib_items_cache[vlib.id] = items
+    now = int(time.time())
+    if now - int(_last_cover_write_at.get(vlib.id, 0)) < _COVER_WRITE_MIN_INTERVAL:
+        return
+    _last_cover_write_at[vlib.id] = now
+    db_manager.save_vlib_items_cache(vlib.id, items)
+    logger.debug(f"封面素材缓存已落盘:'{vlib.name}' {len(items)} 条。")
+
+
+async def build_user_overlay_data(user_id: str, source_key: str, ids: List[str], session: ClientSession,
                                   real_emby_url: str, headers: Dict[str, str],
                                   proxy: Optional[str] = None) -> Optional[Dict[str, dict]]:
-    """基于共享元数据的条目 Id 分批拉取该用户的 UserData,返回 {条目ID: UserData}。
+    """按给定条目 Id 分批拉取该用户的 UserData,返回 {条目ID: UserData}。
 
     返回 None 表示构建失败(调用方不应落盘);叠加层缺失的 Id 即该用户不可见的条目。
     """
-    meta = get_shared_metadata(vlib.id)
-    if meta is None:
-        logger.warning(f"叠加层构建跳过:'{vlib.name}' 尚无共享元数据。")
-        return None
-    if not meta["items"]:
+    if not ids:
         return {}
 
     token = _extract_token(headers)
     url = f"{real_emby_url}/emby/Users/{user_id}/Items"
-    ids = [i.get("Id") for i in meta["items"] if i.get("Id")]
     data: Dict[str, dict] = {}
 
     for chunk_start in range(0, len(ids), _SERVING_OVERLAY_CHUNK):
@@ -328,43 +595,66 @@ async def build_user_overlay_data(config: AppConfig, vlib, user_id: str, session
             async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
                 if resp.status != 200:
                     body_snippet = (await resp.text())[:200].replace("\n", " ")
-                    logger.warning(f"叠加层构建失败:'{vlib.name}' 用户 {user_id} 批次 Status={resp.status} Body={body_snippet}")
+                    logger.warning(f"叠加层构建失败:数据源 {source_key} 用户 {user_id} 批次 Status={resp.status} Body={body_snippet}")
                     return None
                 for it in (await resp.json(content_type=None)).get("Items", []):
                     if it.get("Id"):
                         data[it["Id"]] = it.get("UserData") or {}
         except Exception as e:
-            logger.warning(f"叠加层构建失败 ('{vlib.name}' 用户 {user_id}): {e}")
+            logger.warning(f"叠加层构建失败 (数据源 {source_key} 用户 {user_id}): {e}")
             return None
     return data
 
 
-def get_user_overlay(vlib_id: str, user_id: str) -> Optional[Dict[str, Any]]:
-    """读取用户叠加层(内存优先,未命中回退 SQLite 并回填)。"""
-    key = (user_id, vlib_id)
+def get_user_overlay(source_key: str, user_id: str) -> Optional[Dict[str, Any]]:
+    """读取用户叠加层(内存优先,未命中回退 SQLite 并回填)。key = (用户, 数据源)。"""
+    key = (user_id, source_key)
     entry = user_overlay_cache.get(key)
     if entry is None:
-        persisted = db_manager.load_vlib_user_overlay(user_id, vlib_id)
+        persisted = db_manager.load_vlib_user_overlay(user_id, source_key)
         if persisted:
             entry = {"data": persisted[0], "updated_at": persisted[1]}
             user_overlay_cache[key] = entry
     return entry
 
 
-def store_user_overlay(vlib, user_id: str, data: Dict[str, dict]) -> None:
+def store_user_overlay(source_key: str, user_id: str, data: Dict[str, dict]) -> None:
     now = int(time.time())
-    user_overlay_cache[(user_id, vlib.id)] = {"data": data, "updated_at": now}
-    db_manager.save_vlib_user_overlay(user_id, vlib.id, data, now)
+    user_overlay_cache[(user_id, source_key)] = {"data": data, "updated_at": now}
+    db_manager.save_vlib_user_overlay(user_id, source_key, data, now)
+
+
+def overlay_is_fresh(source_key: str, user_id: str, ttl: int = _OVERLAY_SOFT_TTL) -> bool:
+    """叠加层是否存在且未超过给定时效(用于预热时避免重复构建)。"""
+    entry = get_user_overlay(source_key, user_id)
+    return bool(entry) and (int(time.time()) - int(entry["updated_at"])) <= ttl
+
+
+def _source_item_ids(source_key: str, vlib=None) -> List[str]:
+    """构建叠加层所需的条目 Id 清单:优先用共享数据源(全库),回退到该库的共享元数据。"""
+    base = get_base_items(source_key)
+    if base and base["items"]:
+        return [i.get("Id") for i in base["items"] if i.get("Id")]
+    if vlib is not None:
+        meta = get_shared_metadata(vlib.id)
+        if meta and meta["items"]:
+            return [i.get("Id") for i in meta["items"] if i.get("Id")]
+    return []
 
 
 async def build_and_store_user_overlay(config: AppConfig, vlib, user_id: str, session: ClientSession,
                                        real_emby_url: str, headers: Dict[str, str],
                                        proxy: Optional[str] = None) -> Optional[int]:
     """重建并持久化用户叠加层(预热链路使用),返回叠加条目数;失败返回 None。"""
-    data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
+    source_key = base_source_key(vlib)
+    ids = _source_item_ids(source_key, vlib)
+    if not ids:
+        logger.warning(f"叠加层构建跳过:数据源 {source_key} 与库 '{vlib.name}' 均无可用条目。")
+        return None
+    data = await build_user_overlay_data(user_id, source_key, ids, session, real_emby_url, headers, proxy=proxy)
     if data is None:
         return None
-    store_user_overlay(vlib, user_id, data)
+    store_user_overlay(source_key, user_id, data)
     return len(data)
 
 
@@ -374,7 +664,10 @@ _refreshing_overlay_keys = set()
 
 def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
                                  real_emby_url: str, proxy: Optional[str] = None) -> None:
-    """后台重建共享元数据(带去重锁;以管理员 api_key 身份,可见性最全)。"""
+    """后台重建共享元数据(带去重锁;以管理员 api_key 身份,可见性最全)。
+
+    数据源软过期时一并强制重拉 base,保证定时刷新链路真正拿到新内容。
+    """
     if vlib.id in _refreshing_meta_keys:
         return
     _refreshing_meta_keys.add(vlib.id)
@@ -382,7 +675,11 @@ def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session:
     async def _task():
         try:
             headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
-            items = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
+            source_key = base_source_key(vlib)
+            base = get_base_items(source_key)
+            base_stale = base is None or (int(time.time()) - int(base["updated_at"])) > _BASE_SOFT_TTL
+            items = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers,
+                                                  proxy=proxy, force_base=base_stale)
             if items:
                 store_shared_metadata(vlib, items)
                 logger.info(f"后台重建共享元数据完成:'{vlib.name}' 共 {len(items)} 项。")
@@ -399,26 +696,46 @@ def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session:
 def _refresh_overlay_background(config: AppConfig, vlib, user_id: str, session: ClientSession,
                                 real_emby_url: str, headers: Dict[str, str],
                                 proxy: Optional[str] = None) -> None:
-    """后台重建用户叠加层(带去重锁;以该用户身份拉取其 UserData)。"""
-    key = (user_id, vlib.id)
+    """后台重建用户叠加层(带去重锁;以该用户身份拉取其 UserData)。key = (用户, 数据源)。"""
+    source_key = base_source_key(vlib)
+    key = (user_id, source_key)
     if key in _refreshing_overlay_keys:
         return
     _refreshing_overlay_keys.add(key)
 
     async def _task():
         try:
-            data = await build_user_overlay_data(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
-            if data is None:
-                logger.warning(f"后台重建用户叠加层失败 ('{vlib.name}' 用户 {user_id})。")
+            ids = _source_item_ids(source_key, vlib)
+            if not ids:
+                logger.warning(f"后台重建用户叠加层跳过:数据源 {source_key} 无条目。")
                 return
-            store_user_overlay(vlib, user_id, data)
-            logger.info(f"后台重建用户叠加层完成:'{vlib.name}' 用户 {user_id} 共 {len(data)} 项状态。")
+            data = await build_user_overlay_data(user_id, source_key, ids, session, real_emby_url, headers, proxy=proxy)
+            if data is None:
+                logger.warning(f"后台重建用户叠加层失败 (数据源 {source_key} 用户 {user_id})。")
+                return
+            store_user_overlay(source_key, user_id, data)
+            logger.info(f"后台重建用户叠加层完成:数据源 {source_key} 用户 {user_id} 共 {len(data)} 项状态。")
         except Exception as e:
-            logger.warning(f"后台重建用户叠加层出错 ('{vlib.name}' 用户 {user_id}): {e}")
+            logger.warning(f"后台重建用户叠加层出错 (数据源 {source_key} 用户 {user_id}): {e}")
         finally:
             _refreshing_overlay_keys.discard(key)
 
     asyncio.create_task(_task())
+
+
+def invalidate_user_overlay(user_id: str, source_key: Optional[str] = None) -> int:
+    """丢弃某用户的叠加层(播放/收藏状态变更后调用)。
+
+    source_key 为空时清理该用户的全部数据源;内存与 SQLite 一起清。
+    返回清掉的内存条目数(仅用于日志)。
+    """
+    removed = 0
+    for key in [k for k in list(user_overlay_cache.keys())
+                if k and k[0] == user_id and (source_key is None or k[1] == source_key)]:
+        user_overlay_cache.pop(key, None)
+        removed += 1
+    db_manager.delete_user_overlay_rows(user_id, source_key)
+    return removed
 
 
 def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: str) -> List[Dict[str, Any]]:
@@ -443,13 +760,64 @@ def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: s
     return items
 
 
+def assemble_visible_items(meta_items: List[Dict[str, Any]],
+                           overlay_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """元数据 ∩ 用户可见条目,并叠加该用户自己的 UserData。
+
+    叠加层里缺失的 Id 视为该用户不可见(权限差异或数据滞后),自然裁剪。
+    """
+    items: List[Dict[str, Any]] = []
+    for item in meta_items:
+        user_data = overlay_data.get(item.get("Id"))
+        if user_data is None:
+            continue
+        items.append({**item, "UserData": user_data} if user_data else item)
+    return items
+
+
+def _serving_view(config: AppConfig, vlib, user_id: str, meta: Dict[str, Any], overlay: Dict[str, Any],
+                  type_filter: Optional[str], sort_by: str, sort_order: str) -> Tuple[List[Dict[str, Any]], int]:
+    """可见条目列表(已叠加用户状态、已类型过滤、已排序)。
+
+    结果按「库 + 用户 + 元数据版本 + 叠加层版本 + 类型 + 排序」缓存:
+    版本号一变自然失效,翻页命中后只需切片,不再重复组装与排序。
+    """
+    cache_key = (
+        vlib.id, user_id, int(meta["updated_at"]), int(overlay["updated_at"]),
+        type_filter or "", sort_by or "", sort_order or "",
+    )
+    cached = serving_result_cache.get(cache_key)
+    if cached is not None:
+        return cached["items"], cached["total"]
+
+    items = assemble_visible_items(meta["items"], overlay["data"])
+
+    # 用户态规则(已播放/未播放)必须在叠加该用户状态后评估
+    _native_params, _meta_rules, user_state_rules, match_all = resolve_for_serving(config, vlib)
+    if user_state_rules:
+        items = _apply_post_filter(items, user_state_rules, match_all=match_all)
+
+    if type_filter:
+        allowed = {t.strip() for t in type_filter.split(",") if t.strip()}
+        if allowed:
+            items = [i for i in items if i.get("Type") in allowed]
+
+    items = _sort_items_locally(items, sort_by, sort_order)
+    total = len(items)
+
+    # Random 排序每次都应重新洗牌,不进入缓存;其余排序稳定,可以复用
+    if "random" not in (sort_by or "").lower():
+        serving_result_cache[cache_key] = {"items": items, "total": total}
+    return items, total
+
+
 async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, method: str,
                             session: ClientSession, real_emby_url: str,
                             request_headers, proxy: Optional[str] = None) -> Optional[Response]:
     """本地直出:命中分层缓存时在代理端叠加用户状态、排序、分页后直接返回,不再请求 Emby。
 
     共享元数据未命中/硬过期 → 回退实时查询并后台重建;
-    用户叠加层未命中 → 回退实时查询并后台构建(该用户此后秒开);
+    用户叠加层未命中/硬过期 → 回退实时查询并后台构建(该用户此后秒开);
     任意一层软过期 → 照常返回并后台刷新(stale-while-revalidate)。
     """
     if method != "GET" or not config.enable_vlib_local_serving or not config.enable_vlib_cache:
@@ -457,13 +825,28 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     # 仅当筛选/搜索参数带"非空值"时才回退实时查询;
     # Emby 客户端常发送空值参数(如 Filters=),不能据此判定为筛选请求
     blocked_params = [p for p in _SERVING_BLOCKLIST_PARAMS if params.get(p) not in (None, "")]
+    # 布尔型参数只在真的开启时才算筛选(避免客户端带的 =false 把直出永久挡掉)
+    blocked_params += [
+        p for p in _SERVING_TRUTHY_ONLY_PARAMS
+        if str(params.get(p, "")).strip().lower() in ("true", "1", "yes")
+    ]
     if blocked_params:
         logger.info(f"直出跳过:'{vlib.name}' 请求包含筛选参数 {blocked_params},回退实时查询。")
         return None
     if str(params.get("Recursive", "true")).lower() not in ("", "true"):
         return None
+    # 排序字段白名单:本地排序不支持的字段直接回退实时查询,不让"排序静默失效"
+    sort_by_raw = params.get("SortBy", "SortName")
+    unsupported_sorts = [
+        t.strip() for t in (sort_by_raw or "").split(",")
+        if t.strip() and t.strip() not in _SERVING_SAFE_SORT_FIELDS
+    ]
+    if unsupported_sorts:
+        logger.info(f"直出跳过:'{vlib.name}' 请求使用了不支持的排序字段 {unsupported_sorts},回退实时查询。")
+        return None
 
     now = int(time.time())
+    source_key = base_source_key(vlib)
 
     meta = get_shared_metadata(vlib.id)
     if meta is None:
@@ -476,50 +859,33 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
 
-    overlay = get_user_overlay(vlib.id, user_id)
+    overlay = get_user_overlay(source_key, user_id)
     if overlay is None:
-        logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, '{vlib.name}'),本次实时查询并后台构建。")
+        logger.info(f"用户叠加层未命中(用户 {user_id[:8]}…, 数据源 {source_key}),本次实时查询并后台构建。")
         headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
         return None
     overlay_age = now - int(overlay["updated_at"])
-
-    # 组装:元数据 ∩ 用户可见条目,并叠加用户自己的 UserData
-    overlay_data = overlay["data"]
-    items = []
-    for item in meta["items"]:
-        ud = overlay_data.get(item.get("Id"))
-        if ud is None:
-            continue  # 该用户不可见(权限差异或元数据滞后),自然裁剪
-        if ud:
-            item = {**item, "UserData": ud}
-        items.append(item)
-
-    # 本地全量模式:用户态规则(已播放/未播放)在叠加该用户播放状态后评估,
-    # 每个用户看到的是自己的播放状态,而非管理员的
-    _p, _meta_rules, user_state_rules, match_all = resolve_for_serving(config, vlib)
-    if user_state_rules:
-        logger.info(f"直出评估用户态规则:'{vlib.name}' 在 {len(items)} 个可见项上应用 {len(user_state_rules)} 条。")
-        items = _apply_post_filter(items, user_state_rules, match_all=match_all)
+    if overlay_age > _OVERLAY_HARD_TTL:
+        logger.info(f"用户叠加层已硬过期({overlay_age // 3600}h),回退实时查询并后台重建。")
+        headers = _build_user_forward_headers(request_headers, params)
+        _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
+        return None
 
     if meta_age > _SERVING_SOFT_TTL:
         logger.info(f"直出元数据已软过期({meta_age // 3600}h),照常返回并后台重建。")
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
-    if overlay_age > _SERVING_SOFT_TTL:
-        logger.info(f"用户叠加层已软过期({overlay_age // 3600}h),照常返回并后台重建。")
+    if overlay_age > _OVERLAY_SOFT_TTL:
+        logger.debug(f"用户叠加层已过期({overlay_age // 60}min),照常返回并后台重建。")
         headers = _build_user_forward_headers(request_headers, params)
         _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
 
-    logger.info(f"本地直出:'{vlib.name}' 命中分层缓存(元数据 {len(meta['items'])} 项 / 用户可见 {len(items)} 项)。")
-
-    # IncludeItemTypes 本地过滤(元数据本身是 Movie,Series,Video 的并集)
-    type_filter = params.get("IncludeItemTypes")
-    if type_filter:
-        allowed = {t.strip() for t in type_filter.split(",") if t.strip()}
-        if allowed:
-            items = [i for i in items if i.get("Type") in allowed]
-
-    items = _sort_items_locally(items, params.get("SortBy", "SortName"), params.get("SortOrder", "Ascending"))
+    items, total = _serving_view(
+        config, vlib, user_id, meta, overlay,
+        params.get("IncludeItemTypes"),
+        params.get("SortBy", "SortName"),
+        params.get("SortOrder", "Ascending"),
+    )
 
     try:
         start_idx = max(0, int(params.get("StartIndex") or 0))
@@ -532,9 +898,56 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         limit = None
     page = items[start_idx:] if not limit else items[start_idx:start_idx + limit]
 
-    payload = {"Items": page, "TotalRecordCount": len(items), "StartIndex": start_idx}
+    logger.debug(f"本地直出:'{vlib.name}' 命中分层缓存(元数据 {len(meta['items'])} 项 / 用户可见 {total} 项)。")
+    payload = {"Items": page, "TotalRecordCount": total, "StartIndex": start_idx}
     content = json.dumps(payload).encode("utf-8")
     return Response(content=content, status_code=200, media_type="application/json")
+
+
+async def try_serve_latest_locally(config: AppConfig, vlib, user_id: str,
+                                   limit: Optional[int],
+                                   session: Optional[ClientSession] = None,
+                                   real_emby_url: str = "",
+                                   request_headers=None,
+                                   params=None,
+                                   proxy: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    """从本地缓存直出「最新」列表(首页 /Items/Latest 与 latestmedia 分区共用)。
+
+    这两个接口每次打开客户端都会触发,原实现每次都实时查询 Emby;
+    有了共享元数据后,按 DateCreated 倒序取前 N 条并叠加该用户状态即可。
+    任一层不可用时返回 None(顺手触发后台构建),由调用方回退实时查询。
+    """
+    if not config.enable_vlib_local_serving or not config.enable_vlib_cache:
+        return None
+
+    now = int(time.time())
+    source_key = base_source_key(vlib)
+    meta = get_shared_metadata(vlib.id)
+    if meta is None or (now - int(meta["updated_at"])) > _SERVING_HARD_TTL:
+        if session is not None and real_emby_url:
+            logger.info(f"首页最新:库 '{vlib.name}' 尚无可用元数据,本次实时查询并后台构建。")
+            _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
+        return None
+
+    overlay = get_user_overlay(source_key, user_id)
+    if overlay is None or (now - int(overlay["updated_at"])) > _OVERLAY_HARD_TTL:
+        if session is not None and real_emby_url:
+            logger.info(f"首页最新:用户叠加层不可用(数据源 {source_key}),本次实时查询并后台构建。")
+            headers = _build_user_forward_headers(request_headers or {}, params or {})
+            _refresh_overlay_background(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
+        return None
+
+    try:
+        wanted = max(1, int(limit or 20))
+    except (TypeError, ValueError):
+        wanted = 20
+
+    items, _total = _serving_view(
+        config, vlib, user_id, meta, overlay,
+        handler_views.get_vlib_include_item_types(vlib),
+        "DateCreated", "Descending",
+    )
+    return items[:wanted]
 
 
 async def handle_virtual_library_items(
@@ -742,9 +1155,7 @@ async def handle_virtual_library_items(
                     
                     final_items_to_return = data.get("Items", [])
                     if final_items_to_return and config.enable_vlib_cache:
-                        vlib_items_cache[found_vlib.id] = final_items_to_return
-                        db_manager.save_vlib_items_cache(found_vlib.id, final_items_to_return)
-                        logger.info(f"✅ 已为虚拟库 '{found_vlib.name}' 缓存 {len(final_items_to_return)} 个项目以供封面生成使用。")
+                        _remember_cover_materials(found_vlib, final_items_to_return)
                     
                     content = json.dumps(data).encode('utf-8')
                 except (json.JSONDecodeError, Exception) as e:
@@ -832,9 +1243,7 @@ async def handle_virtual_library_items(
         logger.info(f"全量处理完成,手动分页返回。总数: {total_record_count}, 返回页面项目数: {len(paginated_items)}")
 
         if paginated_items and config.enable_vlib_cache:
-            vlib_items_cache[found_vlib.id] = paginated_items
-            db_manager.save_vlib_items_cache(found_vlib.id, paginated_items)
-            logger.info(f"✅ 已为虚拟库 '{found_vlib.name}' 缓存 {len(paginated_items)} 个项目以供封面生成使用。")
+            _remember_cover_materials(found_vlib, paginated_items)
 
         content = json.dumps(final_data).encode('utf-8')
         # 伪造一个成功的响应头

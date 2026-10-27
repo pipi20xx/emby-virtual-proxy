@@ -9,6 +9,7 @@ from aiohttp import ClientSession
 from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 from emby_net import emby_proxy_of
 from config_manager import load_config
+import proxy_cache
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,24 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
 
     headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
     auth_token_param = {'X-Emby-Token': params.get('X-Emby-Token')} if 'X-Emby-Token' in params else {}
+
+    # --- 合并结果缓存:命中后进详情页不再逐个剧集拉「季 + 集」,也不再请求 TMDB ---
+    config = load_config()
+    show_missing = config.show_missing_episodes
+    tmdb_api_key = config.tmdb_api_key
+    tmdb_proxy = config.tmdb_proxy
+    cache_key = (
+        "episodes", user_id, series_id_from_path, season_id,
+        params.get("Fields", ""), bool(show_missing),
+    )
+    if proxy_cache.merge_cache_enabled:
+        cached_items = proxy_cache.merge_result_cache.get(cache_key)
+        if cached_items is not None:
+            logger.info(f"EPISODES_HANDLER: 合并结果缓存命中,直接返回 {len(cached_items)} 集。")
+            return Response(
+                content=json.dumps({"Items": cached_items, "TotalRecordCount": len(cached_items)}),
+                status_code=200, media_type="application/json",
+            )
     
     # --- 【【【 新增的资格检查 】】】 ---
     should_merge = await is_item_in_a_merge_enabled_vlib(
@@ -53,11 +72,6 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
 
     if not tmdb_id or target_season_number is None: return None
     logger.info(f"EPISODES_HANDLER: 找到TMDB ID: {tmdb_id}，目标季号: {target_season_number}。")
-
-    config = load_config()
-    show_missing = config.show_missing_episodes
-    tmdb_api_key = config.tmdb_api_key
-    tmdb_proxy = config.tmdb_proxy
 
     original_series_ids = await find_all_series_by_tmdb_id(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=emby_proxy_of(request))
     
@@ -138,6 +152,9 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
 
     final_items = sorted(merged_episodes.values(), key=lambda x: x.get("IndexNumber", 0))
     logger.info(f"EPISODES_HANDLER: 合并完成。合并前总数: {len(all_episodes)}, 合并后最终数量: {len(final_items)}")
+
+    if proxy_cache.merge_cache_enabled and final_items:
+        proxy_cache.merge_result_cache[cache_key] = final_items
 
     return Response(content=json.dumps({"Items": final_items, "TotalRecordCount": len(final_items)}), status_code=200, media_type="application/json")
 

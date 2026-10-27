@@ -121,7 +121,7 @@
                   color="primary"
                   label="虚拟库列表本地直出"
                   :disabled="!draft.enable_vlib_cache"
-                  hint="浏览虚拟库时由代理直接返回缓存列表(排序、翻页、类型过滤都在本地完成),不再请求 Emby。分两层存储:共享元数据(每库一份、所有用户共用)+ 用户状态层(每账号只存自己的已看/进度),多用户互不串数据。"
+                  hint="浏览虚拟库时由代理直接返回缓存列表(排序、翻页、类型过滤都在本地完成),不再请求 Emby。分层存储:全库数据源(所有虚拟库共用一份)+ 每库派生结果 + 每账号状态层(只存自己的已看/进度),多用户互不串数据。"
                   persistent-hint
                 />
                 <v-text-field
@@ -132,7 +132,7 @@
                   step="1"
                   suffix="小时"
                   :disabled="!draft.enable_vlib_cache"
-                  hint="每 N 小时后台自动刷新全部虚拟库缓存(重新解析共享元数据 + 刷新各用户状态层),并顺带补齐缺失封面;0 表示禁用。启用后代理重启时也会先全量预热一轮。"
+                  hint="每 N 小时后台自动刷新全部虚拟库缓存(重新拉取全库数据源 + 派生各库结果 + 刷新各用户状态层),并顺带补齐缺失封面;0 表示禁用。启用后代理重启时会先补一轮,但只刷新已过期的库。"
                   persistent-hint
                   @update:model-value="setVlibCacheInterval"
                 />
@@ -159,12 +159,13 @@
 
                 <div class="text-caption text-medium-emphasis">
                   <div class="font-weight-medium text-high-emphasis mb-1">工作原理</div>
-                  <div>① 共享元数据:每个虚拟库只向 Emby 解析一份(所有用户共用),这是缓存的大头;</div>
-                  <div>② 用户状态层:每个账号只叠加自己的已看/进度(几十 KB),互不串数据;</div>
-                  <div>③ 没被预热到的用户,首次浏览照常实时查询并自动补建,第二次起秒开;</div>
-                  <div>④ 数据过期后先返回旧数据、后台静默刷新,浏览永不阻塞。</div>
+                  <div>① 全库数据源:所有虚拟库共用同一份向 Emby 裸拉的全库条目,规则与资源过滤都在代理端本地派生;</div>
+                  <div>② 派生结果:每个虚拟库只额外保存自己筛出来的那部分(与 ① 共享条目对象,不重复占内存);</div>
+                  <div>③ 用户状态层:每个账号只叠加自己的已看/进度,互不串数据;标记已看/收藏后立即失效重建;</div>
+                  <div>④ 直出结果层:列表组装与排序结果按版本缓存,翻页只做切片;</div>
+                  <div>⑤ 首页「最新」与详情页季/集合并同样走缓存,过期后先返回旧数据、后台静默刷新。</div>
                   <div class="mt-1">
-                    注意:海报图片、播放控制与已看状态上报始终直连 Emby;列表与详情类请求由以上缓存加速,图片本地化暂未包含。
+                    注意:海报图片与播放控制直连 Emby;已看状态变更会触发该账号的缓存失效,不会出现"标了已看仍是未看"。
                   </div>
                 </div>
               </v-card-text>
@@ -203,6 +204,13 @@
                   hint="每 N 小时全量重建一次索引(只拉条目 ID 清单,负载很小);0 表示仅启动时构建一次,之后靠查询自愈回写维持。索引里已删除的媒体不会造成错误 —— 每次查询都会实时校验条目存活与可见性。"
                   persistent-hint
                   @update:model-value="setTmdbIndexInterval"
+                />
+                <v-switch
+                  v-model="draft.enable_merge_cache"
+                  color="primary"
+                  label="合并结果短时缓存"
+                  hint="进剧集详情页时,把「季 / 集」的合并结果缓存 15 分钟(按账号隔离,含各自的已看状态)。关闭后每次打开详情页都会重新向 Emby 逐个关联剧集拉取季与集。"
+                  persistent-hint
                 />
 
                 <div class="text-caption text-medium-emphasis">

@@ -80,6 +80,8 @@ export interface AppConfig {
   enable_vlib_local_serving: boolean
   /** TMDB 全库索引开关(季/集合并加速);关闭后退回全库遍历方案 */
   enable_tmdb_index: boolean
+  /** 季/集合并结果短时缓存:进详情页不再每次逐剧集拉季/集 */
+  enable_merge_cache: boolean
   /** TMDB 索引重建间隔(小时),0 = 仅启动时构建一次 */
   tmdb_index_refresh_interval: number
   /** API 响应缓存 TTL(秒),0 = 禁用 */
@@ -204,6 +206,7 @@ export function createDefaultConfig(): AppConfig {
     enable_vlib_cache: true,
     enable_vlib_local_serving: true,
     enable_tmdb_index: true,
+    enable_merge_cache: true,
     tmdb_index_refresh_interval: 24,
     api_cache_ttl: 300,
     default_cover_style: 'style_multi_1',

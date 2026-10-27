@@ -283,23 +283,51 @@ async def save_display_order(ordered_ids: List[str]):
     return Response(status_code=204)
 
 
-def _fire_autogen_cover(library_id: str) -> None:
-    """保存虚拟库后,通知代理核心后台补生成封面(尽力而为,不阻塞请求)。"""
-    proxy_core_url = os.getenv("PROXY_CORE_URL")
+def _proxy_core_url():
+    return os.getenv("PROXY_CORE_URL")
+
+
+def _fire_vlib_rebuild(library_id: str) -> None:
+    """保存虚拟库后,通知代理核心「失效旧缓存 + 按新规则重建 + 刷新封面」。
+
+    关键:代理核心的直出缓存若不失效,改完库规则后最长 6 小时仍返回旧内容,
+    封面也会按旧内容指纹判定"未变化"而跳过重绘。
+    """
+    proxy_core_url = _proxy_core_url()
     if not proxy_core_url:
-        logger.info(f"未配置 PROXY_CORE_URL,跳过库 {library_id} 的封面自动生成触发。")
+        logger.info(f"未配置 PROXY_CORE_URL,跳过库 {library_id} 的缓存重建。")
         return
 
     async def _task():
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{proxy_core_url.rstrip('/')}/api/internal/autogen-cover/{library_id}",
-                    timeout=aiohttp.ClientTimeout(total=15),
+                    f"{proxy_core_url.rstrip('/')}/api/internal/rebuild-vlib/{library_id}",
+                    timeout=aiohttp.ClientTimeout(total=600),
                 ) as resp:
-                    logger.info(f"封面自动生成触发完成 ({library_id}): Status {resp.status}")
+                    logger.info(f"虚拟库缓存重建完成 ({library_id}): Status {resp.status}")
         except Exception as e:
-            logger.warning(f"触发封面自动生成失败 ({library_id}): {e}")
+            logger.warning(f"重建虚拟库缓存失败 ({library_id}): {e}")
+
+    asyncio.create_task(_task())
+
+
+def _fire_vlib_invalidate(library_id: str) -> None:
+    """删库后通知代理核心释放内存缓存(admin 侧已清该库的 SQLite 行)。"""
+    proxy_core_url = _proxy_core_url()
+    if not proxy_core_url:
+        return
+
+    async def _task():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{proxy_core_url.rstrip('/')}/api/internal/invalidate-vlib/{library_id}",
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    logger.info(f"虚拟库缓存已失效 ({library_id}): Status {resp.status}")
+        except Exception as e:
+            logger.warning(f"失效虚拟库缓存失败 ({library_id}): {e}")
 
     asyncio.create_task(_task())
 
@@ -307,23 +335,25 @@ def _fire_autogen_cover(library_id: str) -> None:
 @api_router.post("/libraries", response_model=VirtualLibrary, tags=["Libraries"])
 async def create_library(library: VirtualLibrary):
     saved = library_service.create_library(library)
-    # 新建库没有封面,主动触发一次后台生成(素材也由代理核心自行预热)
+    # 新建库没有封面:重建会顺带解析数据源并触发生成
     if not saved.image_tag:
-        _fire_autogen_cover(saved.id)
+        _fire_vlib_rebuild(saved.id)
     return saved
 
 
 @api_router.put("/libraries/{library_id}", response_model=VirtualLibrary, tags=["Libraries"])
 async def update_library(library_id: str, updated_library_data: VirtualLibrary):
     saved = library_service.update_library(library_id, updated_library_data)
-    # 规则变化会改变库内容;由自动生成端点按内容指纹判断,未变化则自动跳过不重绘
-    _fire_autogen_cover(saved.id)
+    # 规则变化会改变库内容:先失效旧缓存再按新规则重建(封面按新指纹判断是否重绘)
+    _fire_vlib_rebuild(saved.id)
     return saved
 
 
 @api_router.delete("/libraries/{library_id}", status_code=204, tags=["Libraries"])
 async def delete_library(library_id: str):
     library_service.delete_library(library_id)
+    # 释放代理核心内存里的该库缓存(数据源与叠加层由其他库共享,不动)
+    _fire_vlib_invalidate(library_id)
     return Response(status_code=204)
 
 

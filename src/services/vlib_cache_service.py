@@ -45,7 +45,7 @@ async def refresh_vlib_cache(library_id: str) -> bool:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{base}/api/internal/refresh-vlib-items/{library_id}",
-                timeout=aiohttp.ClientTimeout(total=180),
+                timeout=aiohttp.ClientTimeout(total=600),
             ) as resp:
                 if resp.status != 200:
                     detail = (await resp.json(content_type=None)).get("detail", "未知错误")
@@ -150,6 +150,7 @@ async def clear_all_caches() -> dict:
     """清空虚拟库缓存:SQLite 持久层 + 代理核心内存,返回各类删除量。"""
     import db_manager
     removed_libraries = db_manager.clear_vlib_items_cache()
+    removed_base = db_manager.clear_vlib_base()
     removed_meta = db_manager.clear_vlib_metadata()
     removed_overlay = db_manager.clear_vlib_user_overlay()
     removed_index = db_manager.clear_tmdb_index()
@@ -170,10 +171,10 @@ async def clear_all_caches() -> dict:
             logger.warning(f"通知代理核心清空内存缓存时出错: {e}")
 
     logger.info(
-        f"虚拟库缓存已清空(项目缓存 {removed_libraries} 库,共享元数据 {removed_meta},"
+        f"虚拟库缓存已清空(项目缓存 {removed_libraries} 库,全库数据源 {removed_base},共享元数据 {removed_meta},"
         f"用户叠加层 {removed_overlay},TMDB 索引 {removed_index},内存已通知清空)。"
     )
-    return {"vlib_items": removed_libraries, "serving_rows": removed_meta + removed_overlay}
+    return {"vlib_items": removed_libraries, "serving_rows": removed_base + removed_meta + removed_overlay}
 
 
 def start_scheduler() -> None:

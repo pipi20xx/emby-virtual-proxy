@@ -126,7 +126,7 @@ async def _refresh_vlib_items(proxy_core_url: str, library_id: str) -> List[dict
     target_url = f"{proxy_core_url.rstrip('/')}/api/internal/refresh-vlib-items/{library_id}"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(target_url, timeout=120) as response:
+            async with session.post(target_url, timeout=300) as response:
                 if response.status == 200:
                     return (await response.json()).get("Items", [])
                 detail = (await response.json(content_type=None)).get("detail", "未知错误")

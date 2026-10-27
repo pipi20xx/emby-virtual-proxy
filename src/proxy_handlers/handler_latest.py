@@ -12,6 +12,7 @@ from pathlib import Path
 from . import handler_merger
 # 【新增】导入后台生成处理器
 from . import handler_autogen
+from . import handler_items
 from .handler_views import get_vlib_include_item_types
 from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
@@ -106,8 +107,8 @@ async def handle_home_latest_items(
     if not cover_file_exists(found_vlib.id):
         logger.info(f"首页最新项目：发现虚拟库 '{found_vlib.name}' ({found_vlib.id}) 缺少封面，触发自动生成。")
         if found_vlib.id not in handler_autogen.GENERATION_IN_PROGRESS:
-            # 从当前请求中提取必要信息
-            user_id = params.get("UserId")
+            # 从当前请求中提取必要信息(保留前面按路径解析出的 user_id,不能用参数覆盖成 None)
+            user_id = params.get("UserId") or user_id
             api_key = params.get("X-Emby-Token") or config.emby_api_key
 
             if user_id and api_key:
@@ -115,6 +116,22 @@ async def handle_home_latest_items(
             else:
                 logger.warning(f"无法为库 {found_vlib.id} 触发后台任务，因为缺少 UserId 或 ApiKey。")
     # --- 【【【 修正结束 】】】 ---
+
+    # --- 【【【 本地直出:最新列表直接从缓存生成,不再每次请求 Emby 】】】 ---
+    try:
+        wanted_latest = int(params.get("Limit", 20))
+    except (ValueError, TypeError):
+        wanted_latest = 20
+    served_latest = await handler_items.try_serve_latest_locally(
+        config, found_vlib, user_id, wanted_latest,
+        session=session, real_emby_url=real_emby_url,
+        request_headers=request.headers, params=params,
+        proxy=emby_proxy_of(request),
+    )
+    if served_latest is not None:
+        logger.debug(f"HOME_LATEST_HANDLER: 由本地缓存返回 '{found_vlib.name}' 最新 {len(served_latest)} 项。")
+        return Response(content=json.dumps(served_latest).encode('utf-8'), status_code=200,
+                        headers={"Content-Type": "application/json"})
 
     new_params = {}
     safe_params_to_inherit = ["Fields", "IncludeItemTypes", "EnableImageTypes", "ImageTypeLimit", "X-Emby-Token", "EnableUserData", "Limit", "ParentId"]

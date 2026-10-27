@@ -28,6 +28,7 @@ from aiohttp import ClientSession
 from models import AppConfig, VirtualLibrary
 
 from . import handler_merger, handler_views
+from . import handler_items
 from emby_net import emby_proxy_of
 from .handler_views import apply_full_layout, apply_legacy_layout, get_vlib_collection_type, get_vlib_include_item_types
 from ._filter_translator import resolve_for_user_query
@@ -290,6 +291,22 @@ async def _handle_vlib_latest_media(
     # RSS 库:直接读 rss_library_items.db(与 handler_latest 的 /Items/Latest 逻辑一致)
     if vlib.resource_type == 'rsshub':
         return await _rss_latest_items(request, vlib, user_id, session, real_emby_url)
+
+    # 非 RSS 库:优先由本地缓存生成 —— 首页每次加载都会请求这个分区,原实现每次都打 Emby
+    try:
+        wanted_latest = int(request.query_params.get("Limit", DEFAULT_LATEST_LIMIT))
+    except (ValueError, TypeError):
+        wanted_latest = DEFAULT_LATEST_LIMIT
+    served_latest = await handler_items.try_serve_latest_locally(
+        config, vlib, user_id, wanted_latest,
+        session=session, real_emby_url=real_emby_url,
+        request_headers=request.headers, params=request.query_params,
+        proxy=emby_proxy_of(request),
+    )
+    if served_latest is not None:
+        logger.debug(f"HOME_SECTIONS: 由本地缓存返回 '{vlib.name}' 最新 {len(served_latest)} 项。")
+        final_data = {"Items": served_latest, "TotalRecordCount": len(served_latest)}
+        return Response(content=json.dumps(final_data).encode('utf-8'), status_code=200, media_type="application/json")
 
     params = request.query_params
     new_params = {}
