@@ -25,6 +25,7 @@ BANGUMI_CACHE_DB = DB_DIR / "bangumi_cache.db"
 TMDB_CACHE_DB = DB_DIR / "tmdb_cache.db"
 RSS_LIBRARY_ITEMS_DB = DB_DIR / "rss_library_items.db"
 VLIB_ITEMS_DB = DB_DIR / "vlib_items.db"
+BACKEND_AUTH_DB = DB_DIR / "backend_auth.db"
 
 
 class DBManager:
@@ -100,6 +101,20 @@ def init_databases():
         url TEXT PRIMARY KEY,
         content TEXT,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """, commit=True)
+
+    # 初始化后台凭证缓存库(账号密码登录的 AccessToken 落盘,双进程共享)
+    auth_db = DBManager(BACKEND_AUTH_DB)
+    auth_db.execute("""
+    CREATE TABLE IF NOT EXISTS backend_auth (
+        key TEXT PRIMARY KEY,
+        token TEXT,
+        user_id TEXT,
+        mode TEXT,
+        updated_at INTEGER,
+        last_ok_at INTEGER,
+        last_error TEXT
     )
     """, commit=True)
 
@@ -683,6 +698,66 @@ def clear_tmdb_index() -> int:
     except Exception as e:
         print(f"Error clearing tmdb index: {e}")
         return 0
+
+
+# --- 后台凭证缓存(账号密码登录的 AccessToken,key = emby_url|username) ---
+
+def get_backend_auth_cache(key: str) -> Optional[Dict[str, str]]:
+    """读取缓存的登录凭证;无记录返回 None。"""
+    try:
+        row = DBManager(BACKEND_AUTH_DB).fetchone("SELECT * FROM backend_auth WHERE key = ?", (key,))
+        if not row:
+            return None
+        return {
+            "token": row["token"] or "",
+            "user_id": row["user_id"] or "",
+            "mode": row["mode"] or "",
+            "updated_at": int(row["updated_at"] or 0),
+            "last_ok_at": int(row["last_ok_at"] or 0),
+            "last_error": row["last_error"] or "",
+        }
+    except Exception as e:
+        print(f"Error reading backend auth cache: {e}")
+        return None
+
+
+def save_backend_auth_cache(key: str, token: str, user_id: str, mode: str) -> None:
+    """写入/更新缓存的登录凭证(成功路径:清空 last_error,刷新 last_ok_at)。"""
+    now = int(time.time())
+    try:
+        DBManager(BACKEND_AUTH_DB).execute(
+            "INSERT INTO backend_auth (key, token, user_id, mode, updated_at, last_ok_at, last_error) "
+            "VALUES (?, ?, ?, ?, ?, ?, '') "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "token = excluded.token, user_id = excluded.user_id, mode = excluded.mode, "
+            "updated_at = excluded.updated_at, last_ok_at = excluded.last_ok_at, last_error = ''",
+            (key, token, user_id, mode, now, now),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error saving backend auth cache: {e}")
+
+
+def record_backend_auth_error(key: str, error: str) -> None:
+    """记录一次登录/校验失败(仅更新 last_error,不动可能仍有效的缓存 token)。"""
+    try:
+        DBManager(BACKEND_AUTH_DB).execute(
+            "INSERT INTO backend_auth (key, token, user_id, mode, updated_at, last_ok_at, last_error) "
+            "VALUES (?, '', '', '', ?, 0, ?) "
+            "ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at, last_error = excluded.last_error",
+            (key, int(time.time()), error),
+            commit=True,
+        )
+    except Exception as e:
+        print(f"Error recording backend auth error: {e}")
+
+
+def clear_backend_auth_cache(key: str) -> None:
+    """401 自愈:清除缓存的登录凭证(下次调用重新登录)。"""
+    try:
+        DBManager(BACKEND_AUTH_DB).execute("DELETE FROM backend_auth WHERE key = ?", (key,), commit=True)
+    except Exception as e:
+        print(f"Error clearing backend auth cache: {e}")
 
 
 # 在模块加载时执行初始化

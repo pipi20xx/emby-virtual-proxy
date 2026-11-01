@@ -30,6 +30,7 @@ from models import AppConfig, VirtualLibrary
 from . import handler_merger, handler_views
 from . import handler_items
 from emby_net import emby_proxy_of
+from services import credential_service
 from .handler_views import apply_full_layout, apply_legacy_layout, get_vlib_collection_type, get_vlib_include_item_types
 from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
@@ -221,7 +222,7 @@ async def _handle_home_sections_layout(
         server_id = config.emby_server_id or "emby"
 
     user_id = _get_user_id(request.query_params, full_path)
-    api_key = request.query_params.get("X-Emby-Token") or config.emby_api_key
+    api_key = request.query_params.get("X-Emby-Token") or credential_service.peek_backend_token(config)
     vlib_ids = {v.id for v in config.virtual_libraries}
     existing_ids = {str(s.get("Id")) for s in sections if isinstance(s, dict)}
 

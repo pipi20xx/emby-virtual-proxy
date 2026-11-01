@@ -42,6 +42,7 @@ import app_paths
 import config_manager
 from emby_net import emby_proxy_from_config
 from models import AppConfig
+from services import credential_service
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,11 @@ async def _fetch_images_from_vlib(library_id: str, temp_dir: Path, config: AppCo
         raise HTTPException(status_code=404, detail="该虚拟库不包含任何带有主封面的项目。")
 
     selected_items = random.sample(items_with_images, min(MAX_MATERIALS, len(items_with_images)))
-    await _download_materials(selected_items, temp_dir, config, headers={'X-Emby-Token': config.emby_api_key})
+    try:
+        headers = await credential_service.get_backend_headers(config)
+    except credential_service.CredentialError as e:
+        raise HTTPException(status_code=502, detail=f"后台凭证不可用: {e}")
+    await _download_materials(selected_items, temp_dir, config, headers=headers)
 
 
 async def _fetch_images_from_custom_path(custom_path: str, temp_dir: Path) -> None:

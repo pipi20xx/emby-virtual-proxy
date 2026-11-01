@@ -60,6 +60,8 @@ class VirtualLibrary(BaseModel):
 class AppConfig(BaseModel):
     emby_url: str = Field(default="http://127.0.0.1:8096")
     emby_api_key: Optional[str] = Field(default="")
+    emby_username: Optional[str] = Field(default="") # 新增：后台任务凭证兜底,无 API 密钥时用账号密码登录
+    emby_password: Optional[str] = Field(default="") # 新增:与 admin_password 同级明文存储,仅建议可信环境使用
     emby_server_id: Optional[str] = Field(default=None) # 新增：用于TMDB缓存占位符的备用服务器ID
     emby_proxy: Optional[str] = Field(default="") # 新增：访问 Emby 上游的 HTTP 代理(留空直连)
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info")

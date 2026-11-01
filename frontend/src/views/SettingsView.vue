@@ -33,10 +33,30 @@
             />
             <SecretField
               v-model="draft.emby_api_key"
-              label="Emby API 密钥"
+              label="Emby API 密钥(可选)"
               placeholder="在 Emby 控制台 -> 高级 -> API 密钥 中生成"
-              :rules="[rules.required('Emby API 密钥')]"
+              hint="预热/索引/封面等后台任务的凭证;没有管理员权限时可改用下方账号密码"
+              persistent-hint
+              :rules="[credentialRule]"
             />
+            <v-row>
+              <v-col cols="12" md="6" class="py-0">
+                <v-text-field
+                  v-model="draft.emby_username"
+                  label="Emby 账号(可选)"
+                  placeholder="没有 API 密钥时的后台任务登录账号"
+                />
+              </v-col>
+              <v-col cols="12" md="6" class="py-0">
+                <SecretField
+                  v-model="draft.emby_password"
+                  label="Emby 密码(可选)"
+                  hint="与 API 密钥二选一;明文存于 config.json,仅建议可信环境使用"
+                  persistent-hint
+                  :rules="[credentialRule]"
+                />
+              </v-col>
+            </v-row>
             <v-text-field
               v-model="draft.emby_proxy"
               label="Emby 连接代理(可选)"
@@ -44,6 +64,37 @@
               hint="代理核心与管理后台访问 Emby 的所有请求(浏览转发、季/集合并、封面素材下载等)都会经由该代理,适合 Emby 与代理不在同一网络的环境。仅支持 HTTP 代理;保存后即时生效,无需重启。"
               persistent-hint
             />
+            <div class="d-flex align-center ga-2 flex-wrap">
+              <v-btn
+                color="secondary"
+                variant="tonal"
+                prepend-icon="mdi-connection"
+                :loading="testing"
+                @click="onTestCredential"
+              >
+                测试连接
+              </v-btn>
+              <template v-if="credentialStatus">
+                <v-chip
+                  v-if="credentialStatus.mode === 'api_key'"
+                  color="success" size="small" variant="tonal" prepend-icon="mdi-key-variant"
+                >
+                  API 密钥模式
+                </v-chip>
+                <v-chip
+                  v-else-if="credentialStatus.mode === 'user_pass'"
+                  color="info" size="small" variant="tonal" prepend-icon="mdi-account"
+                >
+                  账号密码模式 · {{ credentialStatus.token_cached ? '凭证已缓存' : '尚未登录' }}
+                </v-chip>
+                <v-chip v-else color="warning" size="small" variant="tonal" prepend-icon="mdi-alert-outline">
+                  未配置凭证(后台任务不可用)
+                </v-chip>
+                <span v-if="credentialStatus.last_error" class="text-caption text-error">
+                  {{ credentialStatus.last_error }}
+                </span>
+              </template>
+            </div>
           </v-card-text>
         </v-card>
 
@@ -351,6 +402,7 @@ import { useNotification } from '@/composables/useNotification'
 import { useConfigStore } from '@/stores/useConfigStore'
 import { deepClone } from '@/utils/clone'
 import { COVER_STYLES, HIDE_TYPE_PRESETS, createDefaultConfig, type AppConfig } from '@/types/config'
+import { getCredentialStatus, testCredential, type CredentialStatus } from '@/api/emby'
 import EmptyState from '@/components/common/EmptyState.vue'
 import SecretField from '@/components/common/SecretField.vue'
 import SectionHeader from '@/components/common/SectionHeader.vue'
@@ -370,6 +422,42 @@ const rules = {
     Boolean(value && String(value).trim()) || `${label}不能为空`,
   httpUrl: (value: string) =>
     /^https?:\/\//.test(String(value ?? '')) || '地址必须以 http:// 或 https:// 开头',
+}
+
+// 跨字段校验:API 密钥与账号密码至少配置一项(两项字段共用同一条规则)
+const credentialRule = (value: string) => {
+  const hasKey = Boolean(value && String(value).trim())
+  const hasAccount =
+    Boolean((draft.value.emby_username || '').trim()) && Boolean((draft.value.emby_password || '').trim())
+  return hasKey || hasAccount || 'API 密钥与账号密码至少配置一项'
+}
+
+const credentialStatus = ref<CredentialStatus | null>(null)
+const testing = ref(false)
+
+async function loadCredentialStatus() {
+  try {
+    credentialStatus.value = await getCredentialStatus()
+  } catch {
+    credentialStatus.value = null
+  }
+}
+
+async function onTestCredential() {
+  if (dirty.value) {
+    notify.info('存在未保存的修改,测试连接使用的是已保存的配置')
+  }
+  testing.value = true
+  try {
+    const result = await testCredential()
+    if (result.ok) notify.success(result.message)
+    else notify.error(result.message)
+  } catch (error) {
+    notify.error(error instanceof Error ? error.message : '测试连接失败')
+  } finally {
+    testing.value = false
+    loadCredentialStatus()
+  }
 }
 
 async function initialize() {
@@ -425,11 +513,15 @@ async function saveAll() {
     const saved = await configStore.save(draft.value)
     resetDraft(saved)
     notify.success('设置已保存')
+    loadCredentialStatus()
   } catch (error) {
     notify.error(error instanceof Error ? error.message : '保存失败')
   }
 }
 
-onMounted(initialize)
+onMounted(() => {
+  initialize()
+  loadCredentialStatus()
+})
 </script>
 

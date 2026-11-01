@@ -35,6 +35,7 @@ from proxy_cache import (
 import proxy_cache
 from emby_net import emby_proxy_of
 import db_manager
+from services import credential_service
 logger = logging.getLogger(__name__)
 
 # ================= 本地直出(访问加速,分层缓存) =================
@@ -763,7 +764,11 @@ def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session:
 
     async def _task():
         try:
-            headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
+            try:
+                headers = await credential_service.get_backend_headers(config)
+            except credential_service.CredentialError as e:
+                logger.warning(f"后台重建共享元数据跳过 ('{vlib.name}'): 凭证不可用: {e}")
+                return
             source_key = base_source_key(vlib)
             base = get_base_items(source_key)
             base_stale = base is None or (int(time.time()) - int(base["updated_at"])) > _BASE_SOFT_TTL

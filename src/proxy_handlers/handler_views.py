@@ -12,6 +12,7 @@ from pathlib import Path
 from . import handler_autogen
 from .handler_images import cover_file_exists
 from emby_net import emby_proxy_of
+from services import credential_service
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ def apply_full_layout(original_data: dict, config: AppConfig, params, full_path:
     server_id = next((item.get("ServerId") for item in all_available_libs.values() if item.get("ServerId")), "unknown")
 
     user_id = _extract_user_id(params, full_path)
-    api_key = params.get("X-Emby-Token") or config.emby_api_key
+    api_key = params.get("X-Emby-Token") or credential_service.peek_backend_token(config)
 
     for vlib in config.virtual_libraries:
         all_available_libs[vlib.id] = build_vlib_view_stub(vlib, server_id, user_id, api_key)

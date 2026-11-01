@@ -20,6 +20,7 @@ from fastapi import HTTPException
 import config_manager
 from proxy_cache import vlib_items_cache
 from services import cover_service
+from services import credential_service
 from .handler_images import cover_file_exists
 
 logger = logging.getLogger(__name__)
@@ -57,7 +58,10 @@ async def load_cover_source_items(library_id: str, vlib, user_id: str, api_key: 
 
 
 async def fetch_vlib_items_internal(vlib, user_id: str, api_key: str) -> list:
-    """以模拟客户端身份自调用代理 Items 接口,获取虚拟库当前条目列表。"""
+    """以模拟客户端身份自调用代理 Items 接口,获取虚拟库当前条目列表。
+
+    api_key 传空时由凭证解析器兜底(API 密钥或账号密码登录的 token)。
+    """
     internal_proxy_url = f"http://localhost:8999/emby/Users/{user_id}/Items"
 
     params = {
@@ -66,27 +70,41 @@ async def fetch_vlib_items_internal(vlib, user_id: str, api_key: str) -> list:
         "Fields": "ImageTags,ProviderIds",
         "Recursive": "true",
         "IncludeItemTypes": "Movie,Series,Video",
-        "X-Emby-Token": api_key,
         "X-Emby-Client": "Proxy (AutoGen)",
         "X-Emby-Device-Name": "ProxyAutoGen",
         "X-Emby-Device-Id": "proxy-autogen-device-id",
         "X-Emby-Client-Version": "4.8.11.0",
     }
-    internal_headers = {
-        'Accept': 'application/json',
-        'X-Emby-Authorization': f'Emby UserId="{user_id}", Client="Proxy (AutoGen)", Device="ProxyAutoGen", DeviceId="proxy-autogen-device-id", Version="4.8.11.0", Token="{api_key}"'
-    }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(internal_proxy_url, params=params, headers=internal_headers,
-                                   timeout=aiohttp.ClientTimeout(total=60)) as response:
-                if response.status == 200:
-                    data = await response.json(content_type=None)
-                    if isinstance(data, dict):
-                        return data.get("Items", []) or []
-                else:
-                    logger.error(f"内部代理请求失败，状态码: {response.status}, 响应: {await response.text()}")
+            for attempt in (1, 2):
+                token = api_key
+                if not token:
+                    try:
+                        auth = await credential_service.get_backend_auth(
+                            config_manager.load_config_readonly(), session=session,
+                            force_refresh=(attempt == 2))
+                        token = auth["token"]
+                    except credential_service.CredentialError as e:
+                        logger.error(f"内部取条目跳过:后台凭证不可用: {e}")
+                        return []
+                params["X-Emby-Token"] = token
+                internal_headers = {
+                    'Accept': 'application/json',
+                    'X-Emby-Authorization': f'Emby UserId="{user_id}", Client="Proxy (AutoGen)", Device="ProxyAutoGen", DeviceId="proxy-autogen-device-id", Version="4.8.11.0", Token="{token}"'
+                }
+                async with session.get(internal_proxy_url, params=params, headers=internal_headers,
+                                       timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        if isinstance(data, dict):
+                            return data.get("Items", []) or []
+                    elif response.status == 401 and attempt == 1 and not api_key:
+                        await credential_service.invalidate_backend_auth("封面素材内部请求遇到 401")
+                        continue
+                    else:
+                        logger.error(f"内部代理请求失败，状态码: {response.status}, 响应: {await response.text()}")
     except Exception as e:
         logger.error(f"连接内部代理时出错: {e}")
     return []

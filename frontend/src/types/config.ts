@@ -64,6 +64,10 @@ export interface VirtualLibrary {
 export interface AppConfig {
   emby_url: string
   emby_api_key: string
+  /** 后台任务凭证兜底:无 API 密钥时用账号密码登录 */
+  emby_username: string
+  /** 与 admin_password 同级明文存于 config.json,仅建议可信环境 */
+  emby_password: string
   /** 访问 Emby 上游的 HTTP 代理(http://[user:pass@]host:port),留空直连 */
   emby_proxy: string
   emby_server_id: string | null
@@ -201,6 +205,8 @@ export function createDefaultConfig(): AppConfig {
   return {
     emby_url: '',
     emby_api_key: '',
+    emby_username: '',
+    emby_password: '',
     emby_proxy: '',
     emby_server_id: null,
     log_level: 'info',

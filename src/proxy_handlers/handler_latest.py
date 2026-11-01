@@ -18,6 +18,7 @@ from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
 from .handler_images import cover_file_exists
 from emby_net import emby_proxy_of
+from services import credential_service
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ async def handle_home_latest_items(
         if found_vlib.id not in handler_autogen.GENERATION_IN_PROGRESS:
             # 从当前请求中提取必要信息(保留前面按路径解析出的 user_id,不能用参数覆盖成 None)
             user_id = params.get("UserId") or user_id
-            api_key = params.get("X-Emby-Token") or config.emby_api_key
+            api_key = params.get("X-Emby-Token") or credential_service.peek_backend_token(config)
 
             if user_id and api_key:
                  asyncio.create_task(handler_autogen.generate_poster_in_background(found_vlib.id, user_id, api_key))

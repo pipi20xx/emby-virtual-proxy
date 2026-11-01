@@ -23,3 +23,32 @@ export async function resolveItem(itemId: string): Promise<EmbyItemBrief> {
   const { data } = await client.get<{ name: string; id: string }>(`/emby/resolve-item/${itemId}`)
   return data
 }
+
+/** 后台凭证状态(模式 + 缓存健康度,不发网络请求) */
+export interface CredentialStatus {
+  mode: 'api_key' | 'user_pass' | 'none'
+  username: string
+  token_cached: boolean
+  updated_at: number | null
+  last_ok_at: number | null
+  last_error: string
+  user_id: string
+}
+
+/** 连接测试结果 */
+export interface CredentialTestResult {
+  ok: boolean
+  mode: CredentialStatus['mode']
+  user: string
+  message: string
+}
+
+export async function getCredentialStatus(): Promise<CredentialStatus> {
+  const { data } = await client.get<CredentialStatus>('/emby-credential/status')
+  return data
+}
+
+export async function testCredential(): Promise<CredentialTestResult> {
+  const { data } = await client.post<CredentialTestResult>('/emby-credential/test')
+  return data
+}

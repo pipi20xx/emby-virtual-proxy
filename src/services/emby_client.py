@@ -15,6 +15,7 @@ from fastapi import HTTPException
 import config_manager
 from emby_net import emby_proxy_from_config
 from models import AppConfig
+from services import credential_service
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,10 @@ DEFAULT_TIMEOUT_SECONDS = 15
 
 def _get_validated_config(config: Optional[AppConfig] = None) -> AppConfig:
     cfg = config or config_manager.load_config()
-    if not cfg.emby_url or not cfg.emby_api_key:
-        raise HTTPException(status_code=400, detail="请在系统设置中配置Emby服务器地址和API密钥。")
+    if not cfg.emby_url:
+        raise HTTPException(status_code=400, detail="请在系统设置中配置Emby服务器地址。")
+    if credential_service.auth_mode(cfg) == "none":
+        raise HTTPException(status_code=400, detail="请在系统设置中配置Emby凭证:API 密钥,或账号 + 密码。")
     return cfg
 
 
@@ -33,21 +36,24 @@ async def fetch_items(endpoint: str, params: Dict = None, config: Optional[AppCo
 
     响应为 {"Items": [...]} 时返回 Items 列表;
     响应本身是数组(如 /Users)或单个对象(如条目详情)时原样返回。
+    凭证由 credential_service 解析(API 密钥优先,账号密码登录兜底,401 自愈重登)。
     """
     cfg = _get_validated_config(config)
     url = f"{cfg.emby_url.rstrip('/')}/emby{endpoint}"
-    headers = {'X-Emby-Token': cfg.emby_api_key, 'Accept': 'application/json'}
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params, timeout=DEFAULT_TIMEOUT_SECONDS,
-                                   proxy=emby_proxy_from_config(cfg)) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    msg = f"从Emby获取数据失败 (Endpoint: {endpoint}, Status: {response.status}): {error_text}"
-                    logger.error(msg)
-                    raise HTTPException(status_code=response.status, detail=msg)
-                data = await response.json()
+            status, data = await credential_service.fetch_json_with_auth(
+                session, url, config=cfg, params=params,
+                timeout=aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT_SECONDS),
+                proxy=emby_proxy_from_config(cfg))
+            if status != 200:
+                body = data if isinstance(data, str) else str(data)
+                msg = f"从Emby获取数据失败 (Endpoint: {endpoint}, Status: {status}): {body}"
+                logger.error(msg)
+                raise HTTPException(status_code=status, detail=msg)
+    except credential_service.CredentialError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     except aiohttp.ClientError as e:
         msg = f"连接到Emby时发生网络错误 (Endpoint: {endpoint}): {e}"
         logger.error(msg)

@@ -8,6 +8,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 from db_manager import DBManager, RSS_CACHE_DB, TMDB_CACHE_DB
 import config_manager
+from services import credential_service
 
 logger = logging.getLogger(__name__)
 
@@ -290,14 +291,19 @@ class BaseRssProcessor:
 
     def _find_items_in_emby(self, tmdb_ids_map):
         """通过调用 Emby API 查找已存在的项目，并根据每个项目的具体类型进行精确查询"""
-        if not tmdb_ids_map or not self.config.emby_url or not self.config.emby_api_key:
+        if not tmdb_ids_map or not self.config.emby_url:
+            return {}
+
+        try:
+            headers = credential_service.get_backend_headers_sync(self.config)
+        except credential_service.CredentialError as e:
+            logger.warning(f"RSS 匹配跳过:后台凭证不可用: {e}")
             return {}
 
         logger.info(f"将逐个查询 {len(tmdb_ids_map)} 个 TMDB ID 在 Emby 中的存在状态...")
-        
+
         emby_id_map = {}
         url = f"{self.config.emby_url.rstrip('/')}/Items"
-        headers = {"X-Emby-Token": self.config.emby_api_key}
 
         # 【核心修复】遍历 tmdb_ids_map 的所有项，以同时获取 tmdb_id 和 media_type
         for tmdb_id, media_type in tmdb_ids_map.items():
@@ -320,10 +326,12 @@ class BaseRssProcessor:
             }
             try:
                 logger.info(f"  - 正在为 TMDB ID {tmdb_id} 查询 Emby 中的 '{item_types}'...")
-                response = requests.get(url, headers=headers, params=params, timeout=10)
-                response.raise_for_status()
-                results = response.json().get("Items", [])
-                
+                status, data = credential_service.get_backend_json_sync(url, params, self.config)
+                if status != 200:
+                    logger.error(f"查询 Emby API 失败 (TMDB ID: {tmdb_id}, Status: {status})")
+                    continue
+                results = (data or {}).get("Items", []) if isinstance(data, dict) else []
+
                 for item in results:
                     item_tmdb_id = item.get("ProviderIds", {}).get("Tmdb")
                     if str(item_tmdb_id) == str(tmdb_id):

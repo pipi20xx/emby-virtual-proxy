@@ -31,7 +31,7 @@ init_logging("admin", level=logging.INFO, console_format='%(asctime)s - %(name)s
 import app_paths
 import config_manager
 from models import AppConfig, VirtualLibrary, AdvancedFilter
-from services import auth_service, cover_service, library_service, log_service, rss_service, system_service, vlib_cache_service
+from services import auth_service, cover_service, credential_service, library_service, log_service, rss_service, system_service, vlib_cache_service
 from services.emby_client import fetch_items
 
 logger = logging.getLogger(__name__)
@@ -536,6 +536,20 @@ async def resolve_emby_item(item_id: str):
 async def restart_proxy_container():
     """通过 Docker API 重启代理服务器容器,自动清除其内存中的所有缓存。"""
     return await system_service.restart_proxy_container()
+
+
+# --- 后台凭证(API 密钥 / 账号密码)状态与连接测试 ---
+
+@api_router.get("/emby-credential/status", tags=["System Management"])
+async def get_emby_credential_status():
+    """当前凭证模式与缓存健康度(读本地缓存,不发网络请求)。"""
+    return credential_service.status_snapshot()
+
+
+@api_router.post("/emby-credential/test", tags=["System Management"])
+async def test_emby_credential():
+    """用当前配置实测 Emby 连接:API 密钥校验或账号密码重新登录。"""
+    return await credential_service.test_connection()
 
 
 # --- 运行日志(实时流 WebSocket + 历史分页;必须注册在 "/" 静态挂载之前) ---

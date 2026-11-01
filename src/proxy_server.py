@@ -28,6 +28,7 @@ from proxy_cache import vlib_items_cache, vlib_metadata_cache, user_overlay_cach
 import config_manager
 import db_manager
 from services import tmdb_index_service
+from services import credential_service
 from json_compress import JsonCompressionMiddleware
 from proxy_handlers import (
     handler_system,
@@ -124,16 +125,15 @@ async def get_cached_items_for_admin(library_id: str):
 async def _list_emby_users(config) -> List[str]:
     """从 Emby 获取全部用户 ID(封顶 10 个,家庭场景足够)。"""
     try:
-        async with proxy_app.state.aiohttp_session.get(
+        status, users = await credential_service.fetch_json_with_auth(
+            proxy_app.state.aiohttp_session,
             f"{config.emby_url.rstrip('/')}/emby/Users",
-            headers={"X-Emby-Token": config.emby_api_key or ""},
+            config=config,
             timeout=aiohttp.ClientTimeout(total=15),
             proxy=emby_proxy_from_config(config),
-        ) as resp:
-            if resp.status == 200:
-                users = await resp.json(content_type=None)
-                if isinstance(users, list):
-                    return [u.get("Id") for u in users if u.get("Id")][:10]
+        )
+        if status == 200 and isinstance(users, list):
+            return [u.get("Id") for u in users if isinstance(u, dict) and u.get("Id")][:10]
     except Exception as e:
         logger.warning(f"解析 Emby 用户列表失败: {e}")
     return []
@@ -155,7 +155,14 @@ async def _list_emby_users_cached(config, ttl: int = 1800) -> List[str]:
 
 
 async def _resolve_default_user_id(config) -> Optional[str]:
-    """从 Emby 解析一个可用用户(取第一个),供内部请求模拟客户端身份。"""
+    """解析内部请求用的默认用户:账号密码模式用登录账号,API 密钥模式取用户列表第一个。"""
+    try:
+        auth = await credential_service.get_backend_auth(config, session=proxy_app.state.aiohttp_session)
+    except credential_service.CredentialError as e:
+        logger.warning(f"解析后台凭证失败: {e}")
+        return None
+    if auth.get("mode") == "user_pass" and auth.get("user_id"):
+        return auth["user_id"]
     users = await _list_emby_users_cached(config)
     return users[0] if users else None
 
@@ -171,27 +178,37 @@ async def _fetch_vlib_items_via_self(config, user_id: str, library_id: str) -> l
         "Fields": "ImageTags,ProviderIds",
         "Recursive": "true",
         "IncludeItemTypes": "Movie,Series,Video",
-        "X-Emby-Token": config.emby_api_key,
         "X-Emby-Client": "Proxy (Internal Refresh)",
         "X-Emby-Device-Name": "ProxyInternalRefresh",
         "X-Emby-Device-Id": "proxy-internal-refresh",
         "X-Emby-Client-Version": "4.8.11.0",
     }
-    internal_headers = {
-        'Accept': 'application/json',
-        'X-Emby-Authorization': f'Emby UserId="{user_id}", Client="Proxy (Internal Refresh)", Device="ProxyInternalRefresh", DeviceId="proxy-internal-refresh", Version="4.8.11.0", Token="{config.emby_api_key}"'
-    }
     try:
-        async with proxy_app.state.aiohttp_session.get(
-            f"{_SELF_PROXY_URL}/emby/Users/{user_id}/Items",
-            params=params, headers=internal_headers, timeout=aiohttp.ClientTimeout(total=90),
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json(content_type=None)
-                if isinstance(data, dict):
-                    return data.get("Items", []) or []
-            else:
-                logger.warning(f"内部预热请求失败 (Status: {resp.status}): {await resp.text()}")
+        for attempt in (1, 2):
+            auth = await credential_service.get_backend_auth(
+                config, session=proxy_app.state.aiohttp_session, force_refresh=(attempt == 2))
+            token = auth["token"]
+            params["X-Emby-Token"] = token
+            internal_headers = {
+                'Accept': 'application/json',
+                'X-Emby-Authorization': f'Emby UserId="{user_id}", Client="Proxy (Internal Refresh)", Device="ProxyInternalRefresh", DeviceId="proxy-internal-refresh", Version="4.8.11.0", Token="{token}"'
+            }
+            async with proxy_app.state.aiohttp_session.get(
+                f"{_SELF_PROXY_URL}/emby/Users/{user_id}/Items",
+                params=params, headers=internal_headers, timeout=aiohttp.ClientTimeout(total=90),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if isinstance(data, dict):
+                        return data.get("Items", []) or []
+                elif resp.status == 401 and attempt == 1:
+                    await credential_service.invalidate_backend_auth("内部预热请求遇到 401")
+                    continue
+                else:
+                    logger.warning(f"内部预热请求失败 (Status: {resp.status}): {await resp.text()}")
+    except credential_service.CredentialError as e:
+        logger.warning(f"内部预热跳过:后台凭证不可用: {e}")
+        return []
     except Exception as e:
         logger.warning(f"内部预热请求出错: {e}")
     return []
@@ -208,9 +225,13 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
 
     user_id = await _resolve_default_user_id(config)
     if not user_id:
-        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url / emby_api_key 配置")
+        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url 与凭证(API 密钥或账号密码)配置")
 
-    internal_headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
+    try:
+        internal_headers = await credential_service.get_backend_headers(
+            config, session=proxy_app.state.aiohttp_session)
+    except credential_service.CredentialError as e:
+        raise HTTPException(status_code=502, detail=f"后台凭证不可用: {e}")
     items: List[dict] = []
 
     if vlib.resource_type != "rsshub" and config.enable_vlib_local_serving:
@@ -294,9 +315,9 @@ async def get_vlib_source_hash(library_id: str):
 
     user_id = await _resolve_default_user_id(config)
     if not user_id:
-        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url / emby_api_key 配置")
+        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url 与凭证(API 密钥或账号密码)配置")
 
-    items = await handler_autogen.load_cover_source_items(library_id, vlib, user_id, config.emby_api_key)
+    items = await handler_autogen.load_cover_source_items(library_id, vlib, user_id, "")
     if not items:
         raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,无法计算内容指纹")
 
@@ -313,9 +334,9 @@ async def _trigger_autogen_cover(library_id: str) -> dict:
 
     user_id = await _resolve_default_user_id(config)
     if not user_id:
-        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url / emby_api_key 配置")
+        raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户,请检查 emby_url 与凭证(API 密钥或账号密码)配置")
 
-    asyncio.create_task(handler_autogen.generate_poster_in_background(library_id, user_id, config.emby_api_key))
+    asyncio.create_task(handler_autogen.generate_poster_in_background(library_id, user_id, ""))
     logger.info(f"已为虚拟库 {library_id} 触发封面自动生成后台任务。")
     return {"success": True, "message": "封面生成任务已启动"}
 
@@ -595,7 +616,10 @@ async def probe_vlib_change(library_id: str):
     if vlib.resource_type in resource_map and vlib.resource_id:
         params[resource_map[vlib.resource_type]] = vlib.resource_id
 
-    headers = {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""}
+    try:
+        headers = await credential_service.get_backend_headers(config, session=proxy_app.state.aiohttp_session)
+    except credential_service.CredentialError as e:
+        raise HTTPException(status_code=502, detail=f"后台凭证不可用: {e}")
     try:
         async with proxy_app.state.aiohttp_session.get(
             f"{config.emby_url.rstrip('/')}/emby/Users/{user_id}/Items",
@@ -603,6 +627,9 @@ async def probe_vlib_change(library_id: str):
             timeout=aiohttp.ClientTimeout(total=20),
             proxy=emby_proxy_from_config(config),
         ) as resp:
+            if resp.status == 401:
+                await credential_service.invalidate_backend_auth("vlib 探测遇到 401")
+                raise HTTPException(status_code=502, detail=f"探测请求失败 Status={resp.status}")
             if resp.status != 200:
                 raise HTTPException(status_code=502, detail=f"探测请求失败 Status={resp.status}")
             data = await resp.json(content_type=None)
@@ -646,14 +673,27 @@ async def apply_cache_ttl(ttl_seconds: int):
     return {"success": True}
 
 
+async def _rebuild_tmdb_index_with_reauth(config) -> dict:
+    """带凭证自愈的 TMDB 索引重建:401 → 清缓存重登 → 重试一次。"""
+    for attempt in (1, 2):
+        headers = await credential_service.get_backend_headers(
+            config, session=proxy_app.state.aiohttp_session, force_refresh=(attempt == 2))
+        try:
+            return await tmdb_index_service.rebuild_if_stale(
+                proxy_app.state.aiohttp_session, config.emby_url.rstrip('/'), headers)
+        except RuntimeError as e:
+            if attempt == 1 and "Status=401" in str(e):
+                await credential_service.invalidate_backend_auth("TMDB 索引重建遇到 401")
+                continue
+            raise
+    return {"rebuilt": False, "count": db_manager.count_tmdb_index()}
+
+
 @proxy_app.post("/api/internal/rebuild-tmdb-index")
 async def rebuild_tmdb_index():
     """按配置重建 TMDB 索引(定时任务/预热调用;内部自判开关与新鲜度,仍新鲜则跳过)。"""
     config = config_manager.load_config()
-    result = await tmdb_index_service.rebuild_if_stale(
-        proxy_app.state.aiohttp_session, config.emby_url.rstrip('/'),
-        {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""},
-    )
+    result = await _rebuild_tmdb_index_with_reauth(config)
     return {"success": True, **result}
 
 
@@ -727,10 +767,7 @@ async def _startup_warmup():
 
     # 4. TMDB 索引:按配置判定(为空/超重建间隔时重建;开关关闭则跳过)
     try:
-        result = await tmdb_index_service.rebuild_if_stale(
-            proxy_app.state.aiohttp_session, config.emby_url.rstrip('/'),
-            {"Accept": "application/json", "X-Emby-Token": config.emby_api_key or ""},
-        )
+        result = await _rebuild_tmdb_index_with_reauth(config)
         if result.get("rebuilt"):
             logger.info(f"启动预热:TMDB 索引已重建,共 {result['count']} 条。")
         elif result.get("reason") == "disabled":
