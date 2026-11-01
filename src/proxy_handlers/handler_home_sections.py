@@ -320,7 +320,16 @@ async def _handle_secondary_library_latest(
         logger.warning(f"从服最新分区获取失败(server {server_id}): {e}")
         return None
 
-    # 继承客户端的分页/图片参数,换掉凭证;排序固定最新入库
+    # 继承客户端的分页/图片参数,换掉凭证;排序固定最新入库。
+    # IncludeItemTypes 按库类型限定为真实媒体条目 —— 不限的话递归查询会带出
+    # 年份文件夹/BoxSet/Studio 等容器与元数据条目(原版「最新」行只显示媒体)。
+    _LIB_LATEST_ITEM_TYPES = {
+        "movies": "Movie", "tvshows": "Series", "boxsets": "BoxSet",
+        "music": "MusicAlbum", "homevideos": "Video,Photo",
+    }
+    libs = await server_context.get_secondary_libraries(config, session)
+    composite_id = f"{server_id}{server_context._COMPOSITE_SEP}{real_lib_id}"
+    lib_info = next((l for l in libs if l["composite_id"] == composite_id), {})
     params = {
         k: v for k, v in request.query_params.items()
         if k.lower() not in ("x-emby-token", "api_key", "userid")
@@ -329,6 +338,7 @@ async def _handle_secondary_library_latest(
     params["Recursive"] = "true"
     params["SortBy"] = "DateCreated"
     params["SortOrder"] = "Descending"
+    params["IncludeItemTypes"] = _LIB_LATEST_ITEM_TYPES.get(lib_info.get("collection_type"), "Movie,Series")
     params.setdefault("Limit", "12")
     params["EnableUserData"] = "true"
 

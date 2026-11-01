@@ -159,11 +159,12 @@ async def get_secondary_libraries(config, session) -> List[Dict[str, Any]]:
     for sid, server in secondaries.items():
         server_cfg = server_like_config(server, config)
         try:
-            server_user_id = await resolve_server_user_id(server_cfg, session)
             server_headers = await credential_service.get_backend_headers(server_cfg, session=session)
-            views_url = f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{server_user_id}/Views"
+            # 用 MediaFolders 而非 /Views:/Views 在部分 Emby 版本上不带 CollectionType,
+            # 缺类型的库会被客户端按"通用文件夹"渲染;MediaFolders 必定携带库类型
+            libs_url = f"{server_cfg.emby_url.rstrip('/')}/emby/Library/MediaFolders"
             async with session.get(
-                views_url, headers=server_headers,
+                libs_url, headers=server_headers,
                 proxy=emby_proxy_from_config(server_cfg),
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as resp:
