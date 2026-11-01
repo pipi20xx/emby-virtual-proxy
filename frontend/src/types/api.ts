@@ -18,6 +18,8 @@ export interface LibraryBrief {
   name: string
   type: 'real' | 'virtual'
   collectionType?: string | null
+  /** 从服真实库:所属服务器的注册 id(主服库无此字段) */
+  server?: string
 }
 
 export interface CoverGenerateResult {

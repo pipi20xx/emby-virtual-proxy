@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode
 
 import aiohttp
@@ -131,6 +131,69 @@ def iter_vlib_server_targets(vlib, config):
             yield sid, server_like_config(server, config)
 
 
+# ---------- 从服真实库枚举(首页「我的媒体」注入 + 布局页展示) ----------
+
+_secondary_libs_cache: Dict[str, Tuple[List[Dict[str, Any]], float]] = {}
+_SECONDARY_LIBS_TTL = 1800
+
+
+async def get_secondary_libraries(config, session) -> List[Dict[str, Any]]:
+    """枚举各从服的真实媒体库,供首页「我的媒体」与布局页使用。
+
+    返回条目:{server_id, composite_id, name, collection_type, image_tag, has_image},
+    composite_id 为 `{server_id}~{library_id}` —— 客户端点磁贴发起的浏览请求
+    (ParentId=复合 ID)由现有参数营救路由到属主从服,原生处理排序/筛选/子视图。
+    进程内缓存 30 分钟;单台失败警告跳过,不阻塞其它服务器。
+    """
+    secondaries = secondary_servers(config)
+    if not secondaries:
+        return []
+
+    cache_key = "|".join(sorted(f"{sid}:{s.url}" for sid, s in secondaries.items()))
+    now = time.time()
+    cached = _secondary_libs_cache.get(cache_key)
+    if cached and now - cached[1] < _SECONDARY_LIBS_TTL:
+        return cached[0]
+
+    libs: List[Dict[str, Any]] = []
+    for sid, server in secondaries.items():
+        server_cfg = server_like_config(server, config)
+        try:
+            server_user_id = await resolve_server_user_id(server_cfg, session)
+            server_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            views_url = f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{server_user_id}/Views"
+            async with session.get(
+                views_url, headers=server_headers,
+                proxy=emby_proxy_from_config(server_cfg),
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"枚举从服 {sid} 媒体库失败: Status={resp.status}")
+                    continue
+                items = (await resp.json(content_type=None)).get("Items", [])
+        except Exception as e:
+            logger.warning(f"枚举从服 {sid} 媒体库出错: {e}")
+            continue
+
+        for lib in items:
+            lib_id = lib.get("Id")
+            if not lib_id:
+                continue
+            tags = lib.get("ImageTags") or {}
+            libs.append({
+                "server_id": sid,
+                "composite_id": f"{sid}{_COMPOSITE_SEP}{lib_id}",
+                "name": f"{server.name or sid}·{lib.get('Name') or lib_id}",
+                "collection_type": lib.get("CollectionType"),
+                "image_tag": tags.get("Primary"),
+                "has_image": bool(tags.get("Primary")),
+            })
+        logger.info(f"枚举从服 {sid} 媒体库完成,共 {len(items)} 个库。")
+
+    _secondary_libs_cache[cache_key] = (libs, now)
+    return libs
+
+
 # ---------- 复合 ID ----------
 
 def encode_item_ref(server_id: str, item_id) -> str:
@@ -223,19 +286,23 @@ async def resolve_routed_request(request: Request, full_path: str, config, sessi
             hit = ref
             break
     if hit is None:
-        # 裸 ID 营救:部分客户端会把复合 ID 规范化成裸 ID 再发起播放流请求
-        # (/videos/1512/original.mp4)。仅对播放流路径(videos/audio 之后的段)
-        # 查出站改写时记录的映射,把这类请求救回属主服务器;
-        # 浏览类路径不参与,避免两服内部 ID 撞号时误路由。
+        # 裸 ID 营救:部分客户端会把复合 ID 规范化成裸 ID 再发起后续请求。
+        # 只救两类:播放流(videos/audio 之后的段)与图片(Items/{id}/Images/...,
+        # 限定 ID 段后必须紧跟 Images)—— 详情/浏览不参与,避免两服内部 ID
+        # 撞号时点错条目;图片顶多张冠李戴,可接受。
         for i, seg in enumerate(raw_segments):
-            if i == 0 or raw_segments[i - 1].lower() not in _RESCUE_PREV_SEGMENTS:
+            prev_lower = raw_segments[i - 1].lower() if i > 0 else ""
+            next_lower = raw_segments[i + 1].lower() if i + 1 < len(raw_segments) else ""
+            is_stream_id = prev_lower in _RESCUE_PREV_SEGMENTS
+            is_image_id = prev_lower == "items" and next_lower.startswith("images")
+            if not (is_stream_id or is_image_id):
                 continue
             mapped = _served_real_id_map.get(seg)
             if not mapped or time.time() - mapped[1] > _SERVED_MAP_TTL:
                 continue
             server = secondary_servers(config).get(mapped[0])
             if server is not None:
-                logger.info(f"多服路由:播放流裸 ID '{seg}' 命中映射,路由至 {mapped[0]}。")
+                logger.info(f"多服路由:裸 ID '{seg}' 命中映射,路由至 {mapped[0]}。")
                 hit = (mapped[0], seg, server)
                 break
     if hit is None:
@@ -399,6 +466,20 @@ def _prefix_ids_outbound(obj, server_id: str, marker: str, primary_server_id: st
     if isinstance(obj, list):
         return [_prefix_ids_outbound(item, server_id, marker, primary_server_id) for item in obj]
     return obj
+
+
+async def prefix_item_ids(items: List[dict], server_id: str, config, session) -> List[Dict[str, Any]]:
+    """出站改写的条目级封装:Id 加复合前缀 + ServerId 归一为客户端认识的主服 ID。
+
+    供代理自己构造的从服响应(如从服真实库的首页「最新」分区)复用,
+    与路由透传响应的出站改写保持同一套改写规则。
+    """
+    primary_server_id = await get_primary_server_id(config, session)
+    marker = f"{server_id}{_COMPOSITE_SEP}"
+    return [
+        _prefix_ids_outbound(item, server_id, marker, primary_server_id)
+        for item in items if isinstance(item, dict)
+    ]
 
 
 async def rewrite_routed_response_ids(response, server_id: str, config, session):

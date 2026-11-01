@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 async def get_all_libraries() -> List[dict]:
-    """真实库 + 虚拟库的合并列表,供前端排序与资源选择使用。"""
+    """真实库(主服 + 从服) + 虚拟库的合并列表,供前端排序与资源选择使用。"""
     all_libs = []
     real_libs_from_emby = await get_real_libraries()
     for lib in real_libs_from_emby:
@@ -28,6 +28,20 @@ async def get_all_libraries() -> List[dict]:
             "id": lib.get("Id"), "name": lib.get("Name"), "type": "real",
             "collectionType": lib.get("CollectionType")
         })
+
+    # 从服真实库:复合 ID(s2~库ID)形态,首页磁贴经路由直达从服原生浏览
+    try:
+        import aiohttp
+        from services import server_context
+        async with aiohttp.ClientSession() as session:
+            secondary_libs = await server_context.get_secondary_libraries(config_manager.load_config(), session)
+        for lib in secondary_libs:
+            all_libs.append({
+                "id": lib["composite_id"], "name": lib["name"], "type": "real",
+                "collectionType": lib.get("collection_type"), "server": lib["server_id"],
+            })
+    except Exception as e:
+        logger.warning(f"枚举从服媒体库失败(布局页不含从服库): {e}")
 
     config = config_manager.load_config()
     for lib in config.virtual_libraries:

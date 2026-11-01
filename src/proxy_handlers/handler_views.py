@@ -2,6 +2,7 @@
 
 import json
 import logging
+from typing import List, Optional
 from fastapi import Request, Response
 from aiohttp import ClientSession
 from models import AppConfig
@@ -13,6 +14,7 @@ from . import handler_autogen
 from .handler_images import cover_file_exists
 from emby_net import emby_proxy_of
 from services import credential_service
+from services import server_context
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +110,26 @@ def build_vlib_view_stub(vlib, server_id: str, user_id=None, api_key=None) -> di
     return vlib_data
 
 
-def apply_full_layout(original_data: dict, config: AppConfig, params, full_path: str) -> dict:
-    """全量布局控制:按 display_order 重建媒体库列表并注入虚拟库。
+def build_secondary_library_stub(lib: dict, server_id: str) -> dict:
+    """从服真实库在首页视图/磁贴中的占位条目(复合 ID,浏览经路由直达从服)。"""
+    stub = {
+        "Name": lib["name"], "ServerId": server_id, "Id": lib["composite_id"],
+        "Type": "CollectionFolder", "CollectionType": lib.get("collection_type"),
+        "IsFolder": True, "ImageTags": {}
+    }
+    if lib.get("image_tag"):
+        stub["ImageTags"] = {"Primary": lib["image_tag"]}
+        stub["HasPrimaryImage"] = True
+    return stub
+
+
+def apply_full_layout(original_data: dict, config: AppConfig, params, full_path: str,
+                      secondary_libs: Optional[List[dict]] = None) -> dict:
+    """全量布局控制:按 display_order 重建媒体库列表并注入虚拟库与从服真实库。
 
     供 /Views 与 Emby 4.10+ 的 /Sections/smalllibrarytiles/Items 共用。
-    直接修改并返回 original_data。
+    直接修改并返回 original_data。display_order 是白名单+顺序:
+    从服库与虚拟库一样,需在布局页拖入才会显示。
     """
     all_available_libs = {item["Id"]: item for item in original_data.get("Items", [])}
 
@@ -124,13 +141,17 @@ def apply_full_layout(original_data: dict, config: AppConfig, params, full_path:
     for vlib in config.virtual_libraries:
         all_available_libs[vlib.id] = build_vlib_view_stub(vlib, server_id, user_id, api_key)
 
+    for lib in (secondary_libs or []):
+        all_available_libs[lib["composite_id"]] = build_secondary_library_stub(lib, server_id)
+
     original_data["Items"] = [all_available_libs[lib_id] for lib_id in config.display_order if lib_id in all_available_libs]
     original_data["TotalRecordCount"] = len(original_data["Items"])
     return original_data
 
 
-def apply_legacy_layout(content_json: dict, config: AppConfig) -> dict:
-    """旧版布局:按 hide 过滤真实库后,把虚拟库追加到列表末尾。"""
+def apply_legacy_layout(content_json: dict, config: AppConfig,
+                        secondary_libs: Optional[List[dict]] = None) -> dict:
+    """旧版布局:按 hide 过滤真实库后,把虚拟库与从服真实库追加到列表末尾。"""
     if content_json.get("Items"):
         if config.hide:
             content_json["Items"] = [item for item in content_json["Items"] if item.get("CollectionType") not in config.hide]
@@ -145,6 +166,10 @@ def apply_legacy_layout(content_json: dict, config: AppConfig) -> dict:
                     "Type": "CollectionFolder", "CollectionType": get_vlib_collection_type(vlib),
                     "IsFolder": True, "ImageTags": {}
                 })
+
+        for lib in (secondary_libs or []):
+            if not any(item.get("Id") == lib["composite_id"] for item in content_json["Items"]):
+                content_json["Items"].append(build_secondary_library_stub(lib, server_id))
     return content_json
 
 
@@ -168,12 +193,14 @@ async def handle_view_injection(
     target_url = f"{real_emby_url}/{full_path}"
     params = request.query_params
 
+    secondary_libs = await server_context.get_secondary_libraries(config, session)
+
     async with session.get(target_url, params=params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
             return None
 
         original_data = await resp.json()
-        original_data = apply_full_layout(original_data, config, params, full_path)
+        original_data = apply_full_layout(original_data, config, params, full_path, secondary_libs)
 
         final_content = json.dumps(original_data).encode('utf-8')
         return Response(content=final_content, status_code=200, media_type="application/json")
@@ -183,11 +210,13 @@ async def legacy_handle_view_injection(request: Request, full_path: str, method:
     target_url = f"{real_emby_url}/{full_path}"
     params = request.query_params
 
+    secondary_libs = await server_context.get_secondary_libraries(config, session)
+
     async with session.get(target_url, params=params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
         if resp.status == 200 and "application/json" in resp.headers.get("Content-Type", ""):
             content_json = await resp.json()
             if content_json.get("Items"):
-                content_json = apply_legacy_layout(content_json, config)
+                content_json = apply_legacy_layout(content_json, config, secondary_libs)
                 final_content = json.dumps(content_json).encode('utf-8')
                 return Response(content=final_content, status_code=200, media_type="application/json")
     return None

@@ -929,10 +929,11 @@ async def reverse_proxy(request: Request, full_path: str):
     # (如详情页合集部件的 ListItemIds=s2~1540)同样要进路由;其余未命中 → 原样放行。
     lowered_path = f"/{full_path.lower()}/"
     raw_query = (request.scope.get("query_string", b"") or b"").decode("latin-1", "ignore")
-    # 注意查询串是百分号编码的:~ 可能以 %7E 形态出现(ListItemIds=s2%7E1540),两种都要认
+    # 注意查询串是百分号编码的:~ 可能以 %7E 形态出现(ListItemIds=s2%7E1540),两种都要认。
+    # /images/ 路径同样进路由:部分客户端拼图片 URL 时会把复合 ID 剥成裸 ID,靠映射营救。
     needs_routing = (
         "~" in full_path or "~" in raw_query or "%7e" in raw_query.lower()
-        or "/videos/" in lowered_path or "/audio/" in lowered_path
+        or "/videos/" in lowered_path or "/audio/" in lowered_path or "/images/" in lowered_path
     )
     routed_server = None
     if needs_routing:

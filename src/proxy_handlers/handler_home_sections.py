@@ -31,7 +31,8 @@ from . import handler_merger, handler_views
 from . import handler_items
 from emby_net import emby_proxy_of
 from services import credential_service
-from .handler_views import apply_full_layout, apply_legacy_layout, get_vlib_collection_type, get_vlib_include_item_types
+from services import server_context
+from .handler_views import apply_full_layout, apply_legacy_layout, build_secondary_library_stub, get_vlib_collection_type, get_vlib_include_item_types
 from ._filter_translator import resolve_for_user_query
 from .handler_items import _apply_post_filter
 
@@ -91,6 +92,10 @@ async def handle_home_sections(
         vlib = next((v for v in config.virtual_libraries if v.id == vlib_id), None)
         if vlib:
             return await _handle_vlib_latest_media(request, full_path, vlib, real_emby_url, session, config)
+        # 从服真实库分区:latestmedia_{server_id~libId} —— 直达从服原生取最新
+        ref = server_context.split_item_ref(vlib_id, config)
+        if ref:
+            return await _handle_secondary_library_latest(request, full_path, ref, session, config)
 
     return None
 
@@ -199,6 +204,34 @@ def _build_vlib_latest_section(vlib: VirtualLibrary, server_id: str, user_id=Non
     }
 
 
+def _build_secondary_latest_section(lib: dict, server_id: str) -> dict:
+    """仿照虚拟库的 latestmedia 分区结构,构造从服真实库的"最新"分区。
+
+    数据请求(/Sections/{key}/Items)由 _handle_secondary_library_latest
+    直达从服原生获取,无需本地缓存管线。
+    """
+    parent_item = build_secondary_library_stub(lib, server_id)
+    parent_item.setdefault("SortName", lib["name"])
+    parent_item.setdefault("BackdropImageTags", [])
+    parent_item.setdefault("UserData", {"PlaybackPositionTicks": 0, "IsFavorite": False, "Played": False})
+    parent_item["DisplayPreferencesId"] = lib["composite_id"]
+
+    return {
+        "Name": f"最新{lib['name']}",
+        "Id": f"latestmedia_{lib['composite_id']}",
+        "SectionType": "latestmedia",
+        "CollectionType": lib.get("collection_type"),
+        "Monitor": ["markplayed", "videoplayback"],
+        "ItemTypes": [],
+        "ExcludedFolders": [],
+        "CardSizeOffset": 0,
+        "ParentItem": parent_item,
+        "ParentId": lib["composite_id"],
+        "IncludeNextUpInResume": True,
+        "Query": {"StudioIds": [], "TagIds": [], "GenreIds": [], "CollectionTypes": []}
+    }
+
+
 async def _handle_home_sections_layout(
     request: Request, full_path: str, real_emby_url: str, session: ClientSession, config: AppConfig
 ) -> Response | None:
@@ -245,6 +278,17 @@ async def _handle_home_sections_layout(
                 continue
             vlib_sections[vlib.id] = _build_vlib_latest_section(vlib, server_id, user_id, api_key)
 
+    # 3. 注入从服真实库的「最新」分区:与磁贴同一套 display_order 规则,
+    #    数据请求由 _handle_secondary_library_latest 直达从服原生获取
+    secondary_libs = await server_context.get_secondary_libraries(config, session)
+    for lib in secondary_libs:
+        cid = lib["composite_id"]
+        if f"latestmedia_{cid}" in existing_ids:
+            continue
+        if config.display_order and cid not in set(config.display_order):
+            continue
+        vlib_sections[cid] = _build_secondary_latest_section(lib, server_id)
+
     added = len(vlib_sections)
     if not removed and not added:
         return None
@@ -252,6 +296,57 @@ async def _handle_home_sections_layout(
     kept = _rebuild_layout(sections, hidden_idx, vlib_sections, config.display_order)
     logger.info(f"HOME_SECTIONS: 首页分区布局已调整(剔除隐藏库分区 {removed} 个,注入虚拟库分区 {added} 个)。")
     return Response(content=json.dumps(kept).encode('utf-8'), status_code=200, media_type="application/json")
+
+
+async def _handle_secondary_library_latest(
+    request: Request, full_path: str, ref, session: ClientSession, config: AppConfig
+) -> Response | None:
+    """从服真实库的首页「最新」分区:路由到属主从服原生取最新列表。
+
+    条目经出站改写(Id 加复合前缀 + ServerId 归一)后返回,
+    海报/详情/播放与其它从服条目共用同一路由链。
+    """
+    server_id, real_lib_id, server = ref
+    user_id = _get_user_id(request.query_params, full_path)
+    if not user_id:
+        return None
+
+    logger.info(f"HOME_SECTIONS: 拦截从服真实库 '{server_id}~{real_lib_id}' 的最新分区请求。")
+    server_cfg = server_context.server_like_config(server, config)
+    try:
+        server_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+        server_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+    except Exception as e:
+        logger.warning(f"从服最新分区获取失败(server {server_id}): {e}")
+        return None
+
+    # 继承客户端的分页/图片参数,换掉凭证;排序固定最新入库
+    params = {
+        k: v for k, v in request.query_params.items()
+        if k.lower() not in ("x-emby-token", "api_key", "userid")
+    }
+    params["ParentId"] = real_lib_id
+    params["Recursive"] = "true"
+    params["SortBy"] = "DateCreated"
+    params["SortOrder"] = "Descending"
+    params.setdefault("Limit", "12")
+    params["EnableUserData"] = "true"
+
+    url = f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{server_user_id}/Items"
+    async with session.get(url, params=params, headers=server_headers,
+                           proxy=emby_proxy_of(request)) as resp:
+        if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
+            logger.warning(f"从服最新分区请求失败 (server {server_id}, Status: {resp.status})")
+            return None
+        data = await resp.json(content_type=None)
+
+    items = [it for it in data.get("Items", []) if isinstance(it, dict)]
+    items = await server_context.prefix_item_ids(items, server_id, config, session)
+    if items:
+        # 诊断:首条 Id 必须带复合前缀,否则客户端会用裸 ID 请求图片/详情(打到主服 500)
+        logger.info(f"从服最新分区:返回 {len(items)} 项,首条 Id={items[0].get('Id')}。")
+    final_data = {"Items": items, "TotalRecordCount": len(items)}
+    return Response(content=json.dumps(final_data).encode('utf-8'), status_code=200, media_type="application/json")
 
 
 # --- 2. smalllibrarytiles:"我的媒体"磁贴 ---
@@ -270,10 +365,11 @@ async def _handle_small_library_tiles(
         return None
 
     logger.info(f"HOME_SECTIONS: 拦截首页『我的媒体』磁贴 ({key}),按布局规则重建。")
+    secondary_libs = await server_context.get_secondary_libraries(config, session)
     if config.display_order:
-        data = apply_full_layout(data, config, request.query_params, full_path)
+        data = apply_full_layout(data, config, request.query_params, full_path, secondary_libs)
     else:
-        data = apply_legacy_layout(data, config)
+        data = apply_legacy_layout(data, config, secondary_libs)
 
     return Response(content=json.dumps(data).encode('utf-8'), status_code=200, media_type="application/json")
 

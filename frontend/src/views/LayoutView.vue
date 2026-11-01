@@ -179,11 +179,13 @@ function hideLibrary(element: LibraryBrief) {
 }
 
 function chipText(element: LibraryBrief): string {
-  return element.type === 'virtual' ? '虚拟库' : '真实库'
+  if (element.type === 'virtual') return '虚拟库'
+  return element.server ? '从服真实库' : '真实库'
 }
 
 function chipColor(element: LibraryBrief): string {
-  return element.type === 'virtual' ? 'success' : 'primary'
+  if (element.type === 'virtual') return 'success'
+  return element.server ? 'info' : 'primary'
 }
 
 async function initialize() {
