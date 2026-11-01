@@ -8,6 +8,7 @@ from fastapi import Request, Response
 from aiohttp import ClientSession
 from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 from emby_net import emby_proxy_of
+from services import server_context, credential_service
 import config_manager
 import proxy_cache
 
@@ -18,6 +19,10 @@ TMDB_API_BASE_URL = "https://api.themoviedb.org/3"
 EPISODES_PATH_REGEX = re.compile(r"/Shows/([a-f0-9\-]+)/Episodes")
 
 async def handle_episodes_merge(request: Request, full_path: str, session: ClientSession, real_emby_url: str) -> Response | None:
+    # 跨服合并只从主服侧代表条目触发;从服真实库点开的剧集走原生路由(不合并)
+    if getattr(request.state, "evp_server_id", None):
+        return None
+
     match = EPISODES_PATH_REGEX.search(f"/{full_path}")
     season_id = request.query_params.get("SeasonId")
     if not match or not season_id: return None
@@ -62,9 +67,22 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     try:
         tmdb_id = await resolve_tmdb_id_for_item(session, real_emby_url, user_id, series_id_from_path, headers, auth_token_param, proxy=emby_proxy_of(request))
 
-        season_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{season_id}"
-        season_params = {'Fields': 'IndexNumber', **auth_token_param}
-        async with session.get(season_url, params=season_params, headers=headers, proxy=emby_proxy_of(request)) as resp:
+        # 目标季号:SeasonId 可能是跨服合并下发的复合 ID(s2~季ID)—— 从属主服解析季号
+        season_ref = server_context.split_item_ref(season_id, config)
+        if season_ref:
+            s_sid, real_season_id, s_server = season_ref
+            server_cfg = server_context.server_like_config(s_server, config)
+            s_uid = await server_context.resolve_server_user_id(server_cfg, session)
+            s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            season_url = f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{s_uid}/Items/{real_season_id}"
+            season_params: dict = {}
+            season_proxy = emby_proxy_from_config(server_cfg)
+        else:
+            season_url = f"{real_emby_url}/emby/Users/{user_id}/Items/{season_id}"
+            season_params = {'Fields': 'IndexNumber', **auth_token_param}
+            season_proxy = emby_proxy_of(request)
+
+        async with session.get(season_url, params=season_params, headers=headers if not season_ref else s_headers, proxy=season_proxy) as resp:
             target_season_number = (await resp.json()).get("IndexNumber")
 
     except Exception as e:
@@ -82,25 +100,51 @@ async def handle_episodes_merge(request: Request, full_path: str, session: Clien
     logger.info(f"EPISODES_HANDLER: ✅ 找到 {len(original_series_ids)} 个关联剧集: {original_series_ids}。")
 
     async def fetch_episodes(series_id: str):
-        seasons_url = f"{real_emby_url}/emby/Shows/{series_id}/Seasons"
+        # 多服:复合 ID 的兄弟系列来自从服 —— 用属主服的地址/凭证与剥前缀的真实 ID 拉取;
+        # 主服兄弟沿用客户端身份
+        ref = server_context.split_item_ref(series_id, config)
+        if ref:
+            _sid, series_id, server = ref
+            server_cfg = server_context.server_like_config(server, config)
+            try:
+                s_uid = await server_context.resolve_server_user_id(server_cfg, session)
+                s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            except Exception as e:
+                logger.warning(f"EPISODES_HANDLER: 从服兄弟 {series_id} 拉取失败: {e}")
+                return []
+            s_base = server_cfg.emby_url.rstrip('/')
+            s_extra: dict = {}
+            s_proxy = emby_proxy_from_config(server_cfg)
+
+        seasons_url = f"{(s_base if ref else real_emby_url)}/emby/Shows/{series_id}/Seasons"
+        s_headers_final = s_headers if ref else headers
+        s_extra_final = s_extra if ref else auth_token_param
+        s_proxy_final = s_proxy if ref else emby_proxy_of(request)
         try:
-            async with session.get(seasons_url, params=auth_token_param, headers=headers, proxy=emby_proxy_of(request)) as resp:
+            async with session.get(seasons_url, params=s_extra_final, headers=s_headers_final, proxy=s_proxy_final) as resp:
                 seasons = (await resp.json()).get("Items", [])
-            
+
             # 找到这个剧集里，与我们目标季号相同的那个季的ID
             matching_season = next((s for s in seasons if s.get("IndexNumber") == target_season_number), None)
             if not matching_season: return []
 
-            episodes_url = f"{real_emby_url}/emby/Shows/{series_id}/Episodes"
-            episode_params = dict(params)
+            episodes_url = f"{(s_base if ref else real_emby_url)}/emby/Shows/{series_id}/Episodes"
+            episode_params = {k: v for k, v in params.items() if k.lower() not in ("x-emby-token", "api_key", "userid")}
+            episode_params.update(s_extra_final)
             episode_params["SeasonId"] = matching_season.get("Id") # 使用正确的季ID
             # 移除分页参数，以获取所有集
             episode_params.pop("Limit", None)
             episode_params.pop("StartIndex", None)
-            
-            async with session.get(episodes_url, params=episode_params, headers=headers, proxy=emby_proxy_of(request)) as resp:
-                return (await resp.json()).get("Items", []) if resp.status == 200 else []
+
+            async with session.get(episodes_url, params=episode_params, headers=s_headers_final, proxy=s_proxy_final) as resp:
+                episodes = (await resp.json()).get("Items", []) if resp.status == 200 else []
         except Exception: return []
+
+        if ref:
+            # 从服兄弟的集:Id/SeriesId/SeasonId 加复合前缀 + ServerId 归一(点开/播放经既有路由)
+            episodes = await server_context.prefix_item_ids(
+                [e for e in episodes if isinstance(e, dict)], _sid, config, session)
+        return episodes
 
     tasks = [fetch_episodes(sid) for sid in original_series_ids]
     all_episodes = [ep for sublist in await asyncio.gather(*tasks) for ep in sublist]

@@ -836,19 +836,19 @@ def _remember_cover_materials(vlib, items: List[Dict[str, Any]]) -> None:
     logger.debug(f"封面素材缓存已落盘:'{vlib.name}' {len(items)} 条。")
 
 
-async def build_user_overlay_data(user_id: str, source_key: str, ids: List[str], session: ClientSession,
-                                  real_emby_url: str, headers: Dict[str, str],
+async def build_user_overlay_data(config: AppConfig, user_id: str, source_key: str, ids: List[str],
+                                  session: ClientSession, real_emby_url: str, headers: Dict[str, str],
                                   proxy: Optional[str] = None) -> Optional[Dict[str, dict]]:
-    """按给定条目 Id 分批拉取该用户的 UserData,返回 {条目ID: UserData}。
+    """按给定条目 Id 分批拉取用户 UserData,返回 {条目ID: UserData}。
 
-    返回 None 表示构建失败(调用方不应落盘);叠加层缺失的 Id 即该用户不可见的条目。
+    多服聚合:复合 ID({server}~{item})按属主从服分组,用各从服的后台凭证
+    分批拉取该服的真实状态后映射回复合键 —— 从服条目显示真实已看状态。
+    返回 None 表示主服侧构建失败(调用方不应落盘);从服侧失败按未看处理。
     """
     if not ids:
         return {}
 
-    # 多服聚合:复合 ID({server}~{item})不是主服的有效 Guid,混进 Ids= 批次会让
-    # Emby 整批报 500 "Unrecognized Guid format",必须先剥离。这些条目的 UserData
-    # 在拉取后注入空状态(v1:从服条目一律按未看处理)。
+    # 复合 ID 不是主服的有效 Guid,混进 Ids= 批次会让 Emby 整批 500,必须先剥离
     upstream_ids = [i for i in ids if "~" not in str(i)]
     composite_ids = [str(i) for i in ids if "~" in str(i)]
 
@@ -856,27 +856,64 @@ async def build_user_overlay_data(user_id: str, source_key: str, ids: List[str],
     url = f"{real_emby_url}/emby/Users/{user_id}/Items"
     data: Dict[str, dict] = {}
 
-    for chunk_start in range(0, len(upstream_ids), _SERVING_OVERLAY_CHUNK):
-        chunk = upstream_ids[chunk_start:chunk_start + _SERVING_OVERLAY_CHUNK]
-        params: Dict[str, Any] = {"Ids": ",".join(chunk), "EnableUserData": "true", "Limit": "2000"}
-        if token:
-            params["X-Emby-Token"] = token
-        try:
-            async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
-                if resp.status != 200:
-                    body_snippet = (await resp.text())[:200].replace("\n", " ")
-                    logger.warning(f"叠加层构建失败:数据源 {source_key} 用户 {user_id} 批次 Status={resp.status} Body={body_snippet}")
-                    return None
-                for it in (await resp.json(content_type=None)).get("Items", []):
-                    if it.get("Id"):
-                        data[it["Id"]] = it.get("UserData") or {}
-        except Exception as e:
-            logger.warning(f"叠加层构建失败 (数据源 {source_key} 用户 {user_id}): {e}")
-            return None
+    async def _fetch_user_data_chunks(target_url: str, chunk_ids: List[str], hdrs: Dict[str, str],
+                                      px: Optional[str], label: str) -> Optional[Dict[str, dict]]:
+        result: Dict[str, dict] = {}
+        for chunk_start in range(0, len(chunk_ids), _SERVING_OVERLAY_CHUNK):
+            chunk = chunk_ids[chunk_start:chunk_start + _SERVING_OVERLAY_CHUNK]
+            q: Dict[str, Any] = {"Ids": ",".join(chunk), "EnableUserData": "true", "Limit": "2000"}
+            tok = _extract_token(hdrs)
+            if tok:
+                q["X-Emby-Token"] = tok
+            try:
+                async with session.get(target_url, params=q, headers=hdrs, proxy=px) as resp:
+                    if resp.status != 200:
+                        body_snippet = (await resp.text())[:200].replace("\n", " ")
+                        logger.warning(f"叠加层构建失败:{label} 批次 Status={resp.status} Body={body_snippet}")
+                        return None
+                    for it in (await resp.json(content_type=None)).get("Items", []):
+                        if it.get("Id"):
+                            result[it["Id"]] = it.get("UserData") or {}
+            except Exception as e:
+                logger.warning(f"叠加层构建失败 ({label}): {e}")
+                return None
+        return result
 
-    # 从服条目:主服上查不到 UserData,显式注入空状态(=未看)。
-    # 叠加层缺失的 Id 会被 assemble_visible_items 当作"该用户不可见"整批裁掉,
-    # 不注入会导致从服条目从所有列表里消失。单服场景无复合 ID,零影响。
+    primary_data = await _fetch_user_data_chunks(url, upstream_ids, headers, proxy, f"数据源 {source_key} 用户 {user_id}")
+    if primary_data is None:
+        return None
+    data.update(primary_data)
+
+    # 多服聚合:复合 ID 按属主从服分组,用各从服的后台凭证拉取真实状态后映射回复合键。
+    # 从服查询失败该组按未看处理(不阻塞主服部分);单服场景无复合 ID,零变化。
+    secondaries = server_context.secondary_servers(config) if config is not None else {}
+    if secondaries and composite_ids:
+        groups: Dict[str, List[Tuple[str, str]]] = {}
+        for ref_str in composite_ids:
+            prefix, sep, real = ref_str.partition("~")
+            if sep and prefix in secondaries and real:
+                groups.setdefault(prefix, []).append((ref_str, real))
+
+        for sid, pairs in groups.items():
+            server_cfg = server_context.server_like_config(secondaries[sid], config)
+            try:
+                server_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+                server_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+                s_data = await _fetch_user_data_chunks(
+                    f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{server_user_id}/Items",
+                    [real for _, real in pairs], server_headers,
+                    emby_proxy_from_config(server_cfg), f"从服 {sid}")
+                if s_data is None:
+                    raise RuntimeError(f"{sid} 状态查询失败")
+                s_lookup = {str(k): v for k, v in s_data.items()}
+                for ref_str, real in pairs:
+                    data[ref_str] = s_lookup.get(real, {})
+            except Exception as e:
+                logger.warning(f"叠加层:从服 {sid} 状态获取失败(按未看处理): {e}")
+                for ref_str, _real in pairs:
+                    data[ref_str] = {}
+
+    # 其余无法归属从服的复合 ID(极少数)注入空状态,避免被"缺失=不可见"裁掉
     for ref_str in composite_ids:
         if ref_str not in data:
             data[ref_str] = {}
@@ -928,7 +965,7 @@ async def build_and_store_user_overlay(config: AppConfig, vlib, user_id: str, se
     if not ids:
         logger.warning(f"叠加层构建跳过:数据源 {source_key} 与库 '{vlib.name}' 均无可用条目。")
         return None
-    data = await build_user_overlay_data(user_id, source_key, ids, session, real_emby_url, headers, proxy=proxy)
+    data = await build_user_overlay_data(config, user_id, source_key, ids, session, real_emby_url, headers, proxy=proxy)
     if data is None:
         return None
     store_user_overlay(source_key, user_id, data)
@@ -990,7 +1027,7 @@ def _refresh_overlay_background(config: AppConfig, vlib, user_id: str, session: 
             if not ids:
                 logger.warning(f"后台重建用户叠加层跳过:数据源 {source_key} 无条目。")
                 return
-            data = await build_user_overlay_data(user_id, source_key, ids, session, real_emby_url, headers, proxy=proxy)
+            data = await build_user_overlay_data(config, user_id, source_key, ids, session, real_emby_url, headers, proxy=proxy)
             if data is None:
                 logger.warning(f"后台重建用户叠加层失败 (数据源 {source_key} 用户 {user_id})。")
                 return
@@ -1360,6 +1397,107 @@ _VLIB_EMPTY_SUBRESOURCE_MARKERS = (
 )
 
 
+# ---------- 全局搜索聚合(主服 + 各从服) ----------
+
+_SEARCH_FETCH_CAP = 500
+
+
+async def _handle_aggregated_search(request: Request, full_path: str, params, session: ClientSession,
+                                    config: AppConfig) -> Response | None:
+    """全局搜索聚合:主服(客户端身份,可见性与已看状态准确)+ 各从服(后台凭证)同词搜索。
+
+    头部拉取法:每服取 StartIndex+Limit 条后本地切片,支持客户端懒加载翻页;
+    主服结果在前,从服条目带复合 ID(点击后经既有路由直达属主)。
+    """
+    user_id = next((v for k, v in params.items() if k.lower() == "userid"), None)
+    if not user_id:
+        path_parts = full_path.split('/')
+        if 'Users' in path_parts:
+            try:
+                user_id = path_parts[path_parts.index('Users') + 1]
+            except (ValueError, IndexError):
+                pass
+    if not user_id:
+        return None
+
+    try:
+        start_idx = max(0, int(params.get("StartIndex") or 0))
+    except (TypeError, ValueError):
+        start_idx = 0
+    try:
+        limit = max(1, int(params.get("Limit") or 30))
+    except (TypeError, ValueError):
+        limit = 30
+    fetch_limit = min(start_idx + limit, _SEARCH_FETCH_CAP)
+
+    # 主服:客户端原参数原样转发 —— 含 URL 里的 token(搜索请求的凭证只在
+    # 查询参数里、请求头没有,剥掉就变成无凭证访问,一条都搜不到)
+    upstream_params = {k: v for k, v in params.items()}
+    upstream_params["StartIndex"] = "0"
+    upstream_params["Limit"] = str(fetch_limit)
+
+    headers_to_forward = {
+        k: v for k, v in request.headers.items()
+        if k.lower() in (
+            'accept', 'accept-language', 'user-agent', 'x-emby-authorization',
+            'x-emby-client', 'x-emby-device-name', 'x-emby-device-id',
+            'x-emby-client-version', 'x-emby-language', 'x-emby-token',
+        )
+    }
+
+    merged: List[Dict[str, Any]] = []
+    total = 0
+
+    primary_url = f"{config.emby_url.rstrip('/')}/emby/Users/{user_id}/Items"
+    try:
+        async with session.get(primary_url, params=upstream_params, headers=headers_to_forward,
+                               proxy=emby_proxy_of(request)) as resp:
+            if resp.status == 200 and "application/json" in resp.headers.get("Content-Type", ""):
+                data = await resp.json(content_type=None)
+                merged.extend(it for it in data.get("Items", []) if isinstance(it, dict))
+                total += int(data.get("TotalRecordCount") or len(data.get("Items", [])))
+            else:
+                logger.warning(f"聚合搜索:主服查询失败 Status={resp.status}")
+    except Exception as e:
+        logger.warning(f"聚合搜索:主服查询失败: {e}")
+
+    # 从服:参数用安全白名单 —— 客户端搜索参数可能携带从服不认识的字段
+    # (如 GroupProgramsBySeries),原样转发会触发 500;白名单外一律不转发
+    search_param_whitelist = (
+        "searchterm", "includeitemtypes", "recursive", "limit", "startindex",
+        "fields", "enableimagetypes", "imagetypelimit", "sortby", "sortorder",
+        "enableuserdata",
+    )
+
+    for sid, server in server_context.secondary_servers(config).items():
+        server_cfg = server_context.server_like_config(server, config)
+        try:
+            server_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+            server_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            server_url = f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{server_user_id}/Items"
+            s_params = {k: v for k, v in upstream_params.items() if k.lower() in search_param_whitelist}
+            s_params["StartIndex"] = "0"
+            s_params["Limit"] = str(fetch_limit)
+            async with session.get(server_url, params=s_params, headers=server_headers,
+                                   proxy=emby_proxy_from_config(server_cfg)) as resp:
+                if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
+                    logger.warning(f"聚合搜索:从服 {sid} 查询失败 Status={resp.status}")
+                    continue
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"聚合搜索:从服 {sid} 查询出错: {e}")
+            continue
+
+        s_items = [it for it in data.get("Items", []) if isinstance(it, dict)]
+        total += int(data.get("TotalRecordCount") or len(s_items))
+        merged.extend(await server_context.prefix_item_ids(s_items, sid, config, session))
+
+    page = merged[start_idx:start_idx + limit]
+    payload = {"Items": page, "TotalRecordCount": total, "StartIndex": start_idx}
+    logger.info(f"聚合搜索: '{params.get('SearchTerm')}' 共 {total} 条(主服+从服),本页 {len(page)} 条。")
+    return Response(content=json.dumps(payload).encode("utf-8"), status_code=200, media_type="application/json")
+
+
 async def handle_virtual_library_items(
     request: Request,
     full_path: str,
@@ -1398,6 +1536,14 @@ async def handle_virtual_library_items(
                 logger.info("检测到非标准客户端请求 (无 'Id' 后缀参数)，作为后备方案返回媒体库视图。")
                 # 调用 handler_views 中的逻辑来返回一个伪造的根视图
                 return await handler_views.handle_view_injection(request, full_path, method, real_emby_url, session, config)
+
+        # 全局搜索聚合:主服(客户端身份)+ 各从服(后台凭证)同词搜索,
+        # 主服结果在前、从服条目带复合 ID(点击后经既有路由直达属主)。
+        # 路径限定 Users/{uid}/Items 形态 —— /ItemTypes 等携带 SearchTerm 的
+        # 分面端点不能劫持(客户端要的是类型列表,喂搜索结果会打乱搜索页)。
+        if (method == "GET" and (params.get("SearchTerm") or "").strip()
+                and "Users" in full_path and full_path.rstrip('/').lower().endswith("/items")):
+            return await _handle_aggregated_search(request, full_path, params, session, config)
 
         # 如果有 'Id' 参数但不是虚拟库，则为正常请求，放行
         return None
@@ -1439,8 +1585,9 @@ async def handle_virtual_library_items(
     client_start_index = params.get("StartIndex", "0")
     client_limit = params.get("Limit", "50")
     safe_params_to_inherit = [
-        "SortBy", "SortOrder", "Fields", "EnableImageTypes", "ImageTypeLimit", 
-        "EnableTotalRecordCount", "X-Emby-Token", "StartIndex", "Limit"
+        "SortBy", "SortOrder", "Fields", "EnableImageTypes", "ImageTypeLimit",
+        "EnableTotalRecordCount", "X-Emby-Token", "StartIndex", "Limit",
+        "SearchTerm"  # vlib 内搜索:上游按词过滤(本地全量模式另有本地过滤兜底)
     ]
     for key in safe_params_to_inherit:
         if key in params: new_params[key] = params[key]
@@ -1594,40 +1741,75 @@ async def handle_virtual_library_items(
     else:
         logger.info(f"{'本地全量模式' if is_local_exec else 'TMDB合并已启用'},开始获取全量数据...")
         all_items = []
-        start_index = 0
         limit = 200  # 每次请求200个
 
         # 移除客户端的分页参数，因为我们要自己控制
         new_params.pop("StartIndex", None)
         new_params.pop("Limit", None)
-        
-        while True:
-            fetch_params = new_params.copy()
-            fetch_params["StartIndex"] = str(start_index)
-            fetch_params["Limit"] = str(limit)
-            
-            logger.debug(f"正在获取批次: StartIndex={start_index}, Limit={limit}")
-            async with session.request(method, search_url, params=fetch_params, headers=headers_to_forward, proxy=emby_proxy_of(request)) as resp:
-                if resp.status != 200:
-                    logger.error(f"获取批次失败，状态码: {resp.status}")
-                    # 返回错误或一个空的成功响应
-                    return Response(content=json.dumps({"Items": [], "TotalRecordCount": 0}), status_code=200, media_type="application/json")
 
-                batch_data = await resp.json()
-                batch_items = batch_data.get("Items", [])
-                
+        # 多服聚合:库引用了从服时,逐服(主服在前)全量拉取后拼接。
+        # 从服条目以复合 ID 形态进入后续管线(后筛选/搜索过滤/TMDB 合并均天然生效),
+        # UserData 剥离(从服 v1 语义:未看;与直出路径一致)。
+        allowed_servers = server_context.vlib_allowed_server_ids(found_vlib, config)
+        fetch_targets = [(None, user_id, real_emby_url, headers_to_forward, emby_proxy_of(request))]
+        if allowed_servers is not None:
+            client_server_id = await server_context.get_primary_server_id(config, session)
+            for sid, server in server_context.secondary_servers(config).items():
+                if sid not in allowed_servers:
+                    continue
+                server_cfg = server_context.server_like_config(server, config)
+                try:
+                    s_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+                    s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+                except Exception as e:
+                    logger.warning(f"全量拉取跳过从服 {sid}:凭证/用户解析失败: {e}")
+                    continue
+                fetch_targets.append((sid, s_user_id, server_cfg.emby_url.rstrip('/'), s_headers, emby_proxy_from_config(server_cfg)))
+
+        for sid, s_user_id, s_url, s_headers, s_proxy in fetch_targets:
+            label = sid or "主服"
+            start_index = 0
+            while True:
+                fetch_params = new_params.copy()
+                fetch_params["StartIndex"] = str(start_index)
+                fetch_params["Limit"] = str(limit)
+
+                logger.debug(f"正在获取批次({label}): StartIndex={start_index}, Limit={limit}")
+                async with session.request(method, f"{s_url}/emby/Users/{s_user_id}/Items", params=fetch_params, headers=s_headers, proxy=s_proxy) as resp:
+                    if resp.status != 200:
+                        logger.error(f"获取批次失败({label})，状态码: {resp.status}")
+                        if sid is None:
+                            # 主服失败保持原行为:返回空成功响应
+                            return Response(content=json.dumps({"Items": [], "TotalRecordCount": 0}), status_code=200, media_type="application/json")
+                        break  # 从服失败跳过该服,不阻塞其它服务器
+
+                    batch_data = await resp.json()
+                    batch_items = batch_data.get("Items", [])
+
                 if not batch_items:
-                    logger.info("已获取所有数据。")
+                    logger.info(f"已获取 {label} 全部数据。")
                     break
-                
+
+                if sid:
+                    fixed = []
+                    for it in batch_items:
+                        if not isinstance(it, dict) or not it.get("Id"):
+                            continue
+                        it = dict(it)
+                        it.pop("UserData", None)
+                        it["Id"] = server_context.encode_item_ref(sid, it["Id"])
+                        it["ServerId"] = client_server_id
+                        fixed.append(it)
+                    batch_items = fixed
+
                 all_items.extend(batch_items)
                 start_index += len(batch_items)
-                
+
                 # 如果返回的项目数小于请求的limit，说明是最后一页
                 if len(batch_items) < limit:
-                    logger.info("已到达最后一页。")
+                    logger.info(f"{label} 已到达最后一页。")
                     break
-        
+
         logger.info(f"全量数据获取完成，总共 {len(all_items)} 个项目。")
 
         # 1. 本地评估筛选规则:先筛后合并,避免合并主条目的字段遮蔽本应命中的版本
@@ -1642,6 +1824,16 @@ async def handle_virtual_library_items(
                 allowed_types = {t.strip() for t in client_types.split(",") if t.strip()}
                 if allowed_types:
                     all_items = [i for i in all_items if i.get("Type") in allowed_types]
+
+        # 2.5 SearchTerm 本地过滤兜底(vlib 内搜索:上游已按词过滤,此处双保险,
+        #     兼容个别服务器对搜索参数的忽略;多服拼接后的从服条目同样参与)
+        search_term = str(params.get("SearchTerm") or "").strip().lower()
+        if search_term:
+            all_items = [
+                i for i in all_items
+                if search_term in str(i.get("Name") or "").lower()
+                or search_term in str(i.get("SortName") or "").lower()
+            ]
 
         # 3. 应用TMDB合并
         if is_tmdb_merge_enabled:

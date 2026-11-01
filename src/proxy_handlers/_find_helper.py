@@ -7,8 +7,9 @@ from aiohttp import ClientSession
 
 import config_manager
 import db_manager
-from emby_net import emby_proxy_of
+from emby_net import emby_proxy_of, emby_proxy_from_config
 from proxy_cache import vlib_metadata_cache
+from services import server_context, credential_service
 
 logger = logging.getLogger(__name__)
 
@@ -153,40 +154,120 @@ async def _validate_ids_visible(
     return visible
 
 
+async def _validate_secondary_ids_visible(
+    session: ClientSession, base_url: str, user_id: str, real_ids: List[str], headers: Dict,
+    proxy: Optional[str] = None
+) -> List[str]:
+    """批量校验条目对从服后台账号是否可见,返回实际可见的真实 Id 列表。"""
+    visible: List[str] = []
+    for start in range(0, len(real_ids), _VALIDATION_CHUNK):
+        chunk = real_ids[start:start + _VALIDATION_CHUNK]
+        params = {
+            'Ids': ','.join(chunk),
+            'EnableUserData': 'false',
+            'Limit': '2000',
+            'UserId': user_id,
+        }
+        try:
+            async with session.get(f"{base_url}/emby/Users/{user_id}/Items", params=params, headers=headers, proxy=proxy) as resp:
+                if resp.status != 200:
+                    logger.warning(f"TMDB_INDEX: 从服 Ids 校验批次失败 Status={resp.status}。")
+                    return []
+                for it in (await resp.json(content_type=None)).get("Items", []):
+                    if it.get("Id"):
+                        visible.append(it["Id"])
+        except Exception as e:
+            logger.warning(f"TMDB_INDEX: 从服 Ids 校验出错: {e}")
+            return []
+    return visible
+
+
 async def find_all_series_by_tmdb_id(
     session: ClientSession, real_emby_url: str, user_id: str, tmdb_id: str, headers: Dict, auth_token_param: Dict,
     proxy: Optional[str] = None
 ) -> List[str]:
-    """按 TMDB ID 查找全部关联剧集。
+    """按 TMDB ID 查找全部关联剧集(主服 + 各从服副本)。
 
-    索引开启时:查本地索引(毫秒级) → Ids 批量校验确认存活与用户可见性;
-    索引未命中或校验全部失效时回退全局遍历,并把结果回写索引自愈。
-    索引关闭时:直接走旧的全局遍历方案(不读写索引)。
+    返回扁平 Id 列表:主服副本为裸 ID,从服副本为复合 ID({server}~{id})——
+    调用方用 server_context.split_item_ref 即可得到每个副本的属主服务器;
+    顺序主服在前,保证跨服合并的"先到先得"优先主服。
     """
-    if not config_manager.load_config_readonly().enable_tmdb_index:
-        return await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=proxy)
+    config = config_manager.load_config_readonly()
+    secondaries = server_context.secondary_servers(config)
 
-    entries = db_manager.find_items_by_tmdb(tmdb_id, "Series")
-    if entries:
-        candidate_ids = [e["emby_item_id"] for e in entries]
-        visible_ids = await _validate_ids_visible(session, real_emby_url, user_id, candidate_ids, headers, auth_token_param, proxy=proxy)
-        if visible_ids:
-            logger.info(f"TMDB_INDEX: 索引命中 tmdb_id={tmdb_id},候选 {len(candidate_ids)},用户可见 {len(visible_ids)}。")
-            return list(set(visible_ids))
-        # 索引有但校验全失效:可能索引过期,回退遍历兜底(下一轮预热会重建索引)
-        logger.info(f"TMDB_INDEX: 索引条目全部校验失效 (tmdb_id={tmdb_id}),回退全局遍历。")
+    primary_ids: List[str] = []
+    secondary_composite: List[str] = []
 
-    found_ids = await _find_all_series_by_tmdb_id_traversal(session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=proxy)
+    if config.enable_tmdb_index:
+        # 索引条目:主服行裸 ID,从服行复合 ID —— 按前缀分组后逐服校验可见性
+        for e in db_manager.find_items_by_tmdb(tmdb_id, "Series"):
+            eid = str(e["emby_item_id"])
+            prefix = eid.split("~", 1)[0] if "~" in eid else None
+            if prefix and prefix in secondaries:
+                secondary_composite.append(eid)
+            elif "~" not in eid:
+                primary_ids.append(eid)
+            # 未注册前缀的复合 ID(注册表变更残留)忽略
 
-    if found_ids:
-        # 自愈回写:把遍历结果写进索引,后续请求直接走索引
+        if primary_ids:
+            visible = await _validate_ids_visible(session, real_emby_url, user_id, primary_ids, headers, auth_token_param, proxy=proxy)
+            primary_ids = visible
+
+        by_prefix: Dict[str, List[str]] = {}
+        for eid in secondary_composite:
+            p, _, real = eid.partition("~")
+            by_prefix.setdefault(p, []).append(real)
+
+        validated_secondary: List[str] = []
+        for p, real_ids in by_prefix.items():
+            server = secondaries.get(p)
+            if server is None:
+                continue
+            server_cfg = server_context.server_like_config(server, config)
+            try:
+                s_uid = await server_context.resolve_server_user_id(server_cfg, session)
+                s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+                visible = await _validate_secondary_ids_visible(
+                    session, server_cfg.emby_url.rstrip('/'), s_uid, real_ids, s_headers,
+                    proxy=emby_proxy_from_config(server_cfg))
+            except Exception as e:
+                logger.warning(f"TMDB_INDEX: 从服 {p} 校验失败(该服副本跳过): {e}")
+                continue
+            validated_secondary.extend(f"{p}~{vid}" for vid in visible)
+        secondary_composite = validated_secondary
+
+        if primary_ids or secondary_composite:
+            logger.info(f"TMDB_INDEX: 索引命中 tmdb_id={tmdb_id},主服 {len(primary_ids)} + 从服 {len(secondary_composite)} 个副本。")
+            return list(dict.fromkeys(primary_ids + secondary_composite))
+        logger.info(f"TMDB_INDEX: 索引条目全部校验失效 (tmdb_id={tmdb_id}),回退遍历(主服 + 从服)。")
+
+    # 遍历兜底:主服 + 各从服(索引关闭,或索引全部失效)
+    primary_found = await _find_all_series_by_tmdb_id_traversal(
+        session, real_emby_url, user_id, tmdb_id, headers, auth_token_param, proxy=proxy)
+
+    secondary_found: List[str] = []
+    for sid, server in secondaries.items():
+        server_cfg = server_context.server_like_config(server, config)
+        try:
+            s_uid = await server_context.resolve_server_user_id(server_cfg, session)
+            s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            found = await _find_all_series_by_tmdb_id_traversal(
+                session, server_cfg.emby_url.rstrip('/'), s_uid, tmdb_id, s_headers, {},
+                proxy=emby_proxy_from_config(server_cfg))
+        except Exception as e:
+            logger.warning(f"TMDB_INDEX: 从服 {sid} 遍历失败: {e}")
+            continue
+        secondary_found.extend(server_context.encode_item_ref(sid, fid) for fid in found)
+
+    if primary_found or secondary_found:
+        # 自愈回写:主服行裸 ID,从服行复合 ID
         db_manager.upsert_tmdb_index_entries([
-            {"tmdb_id": tmdb_id, "media_type": "Series", "emby_item_id": sid, "title": ""}
-            for sid in found_ids
+            {"tmdb_id": tmdb_id, "media_type": "Series", "emby_item_id": fid, "title": ""}
+            for fid in list(dict.fromkeys(primary_found + secondary_found))
         ])
-        logger.info(f"TMDB_INDEX: 遍历结果已回写索引 ({len(found_ids)} 条)。")
+        logger.info(f"TMDB_INDEX: 遍历结果已回写索引 (主服 {len(primary_found)} + 从服 {len(secondary_found)})。")
 
-    return found_ids
+    return list(dict.fromkeys(primary_found + secondary_found))
 
 
 async def _find_all_series_by_tmdb_id_traversal(

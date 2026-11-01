@@ -731,19 +731,12 @@ async def apply_cache_ttl(ttl_seconds: int):
 
 
 async def _rebuild_tmdb_index_with_reauth(config) -> dict:
-    """带凭证自愈的 TMDB 索引重建:401 → 清缓存重登 → 重试一次。"""
-    for attempt in (1, 2):
-        headers = await credential_service.get_backend_headers(
-            config, session=proxy_app.state.aiohttp_session, force_refresh=(attempt == 2))
-        try:
-            return await tmdb_index_service.rebuild_if_stale(
-                proxy_app.state.aiohttp_session, config.emby_url.rstrip('/'), headers)
-        except RuntimeError as e:
-            if attempt == 1 and "Status=401" in str(e):
-                await credential_service.invalidate_backend_auth("TMDB 索引重建遇到 401")
-                continue
-            raise
-    return {"rebuilt": False, "count": db_manager.count_tmdb_index()}
+    """TMDB 索引重建(多服:逐服拉取,凭证由 credential_service 自愈)。"""
+    try:
+        return await tmdb_index_service.rebuild_if_stale(config, proxy_app.state.aiohttp_session)
+    except Exception as e:
+        logger.warning(f"TMDB 索引重建失败: {e}")
+        return {"rebuilt": False, "count": db_manager.count_tmdb_index()}
 
 
 @proxy_app.post("/api/internal/rebuild-tmdb-index")
@@ -897,7 +890,11 @@ def _maybe_invalidate_user_state(request: Request, full_path: str, response) -> 
     if not (200 <= int(getattr(response, "status_code", 500)) < 300):
         return
 
-    user_id = request.query_params.get("UserId")
+    # 路由请求优先用改写前的客户端 uid 失效叠加层(改写后的 uid 是从服后台账号,
+    # 与叠加层的键不一致;客户端 uid 已在 request.state.evp_client_uid 保留)
+    user_id = getattr(request.state, "evp_client_uid", None)
+    if not user_id:
+        user_id = request.query_params.get("UserId")
     if not user_id:
         parts = full_path.split('/')
         if 'Users' in parts:
@@ -967,6 +964,16 @@ async def reverse_proxy(request: Request, full_path: str):
         if cache_key:
             proxy_cache.bump("api_miss")
             logger.debug(f"响应缓存未命中: {cache_key}")
+
+    # 播放状态上报体路由:ItemId 在请求体里(路径无可路由信息)——带从服复合
+    # 前缀或命中营救映射时转发属主服,从服条目的播放进度因此可续。
+    if request.method == "POST":
+        try:
+            playstate_response = await server_context.route_playstate_body(request, full_path, config, session)
+        except (server_context.RoutingError, credential_service.CredentialError) as e:
+            return JSONResponse(status_code=502, content={"detail": f"播放状态路由失败: {e}"})
+        if playstate_response is not None:
+            return playstate_response
 
     proxy_address = f"{request.url.scheme}://{request.url.netloc}"
     response = None

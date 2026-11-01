@@ -97,6 +97,10 @@ async def handle_home_sections(
         if ref:
             return await _handle_secondary_library_latest(request, full_path, ref, session, config)
 
+    # 继续观看聚合:主服 + 各从服(后台账号)的 Resume 合并
+    if method == "GET" and ("/items/resume" in full_path.lower() or _section_key(full_path) == "resume"):
+        return await _handle_merged_resume(request, full_path, real_emby_url, session, config)
+
     return None
 
 
@@ -298,6 +302,88 @@ async def _handle_home_sections_layout(
     return Response(content=json.dumps(kept).encode('utf-8'), status_code=200, media_type="application/json")
 
 
+async def _handle_merged_resume(
+    request: Request, full_path: str, real_emby_url: str, session: ClientSession, config: AppConfig
+) -> Response | None:
+    """继续观看聚合:主服(客户端身份)+ 各从服(后台账号)的 Resume 合并。
+
+    从服条目带复合 ID(点开续播经既有路由),保留其 UserData(后台账号的
+    进度/LastPlayedDate,与叠加层状态源一致)并按最近播放排序。
+    未配置从服时返回 None(原样透传主服,零变化)。
+    """
+    secondaries = server_context.secondary_servers(config)
+    if not secondaries:
+        return None
+
+    user_id = _get_user_id(request.query_params, full_path)
+    if not user_id:
+        return None
+
+    logger.info("HOME_SECTIONS: 聚合继续观看(主服 + 从服)。")
+    try:
+        limit = max(1, int(request.query_params.get("Limit") or 12))
+    except (ValueError, TypeError):
+        limit = 12
+
+    fetch_params = {
+        k: v for k, v in request.query_params.items()
+        if k.lower() not in ("x-emby-token", "api_key")
+    }
+    fetch_params["Limit"] = str(limit)
+    fetch_params["EnableUserData"] = "true"
+    fetch_params.setdefault("Fields", "PrimaryImageAspectRatio,BasicSyncInfo,CanDelete,UserDataLastPlayedDate")
+
+    client_server_id = await server_context.get_primary_server_id(config, session)
+
+    items: List[dict] = []
+    # 主服:客户端身份
+    try:
+        async with session.get(f"{real_emby_url}/{full_path}", params=fetch_params,
+                               headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
+            if resp.status == 200 and "application/json" in resp.headers.get("Content-Type", ""):
+                items.extend((await resp.json(content_type=None)).get("Items", []))
+    except Exception as e:
+        logger.warning(f"继续观看:主服查询失败: {e}")
+
+    # 从服:后台账号(保留其 UserData 作为进度来源)
+    for sid, server in secondaries.items():
+        server_cfg = server_context.server_like_config(server, config)
+        try:
+            s_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+            s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            async with session.get(
+                f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{s_user_id}/Items/Resume",
+                params=fetch_params, headers=s_headers,
+                proxy=emby_proxy_from_config(server_cfg),
+            ) as resp:
+                if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
+                    logger.warning(f"继续观看:从服 {sid} 查询失败 Status={resp.status}")
+                    continue
+                batch = (await resp.json(content_type=None)).get("Items", [])
+        except Exception as e:
+            logger.warning(f"继续观看:从服 {sid} 查询出错: {e}")
+            continue
+
+        for it in batch:
+            if not isinstance(it, dict):
+                continue
+            it = dict(it)
+            if it.get("Id"):
+                it["Id"] = server_context.encode_item_ref(sid, it["Id"])
+                it["ServerId"] = client_server_id
+            items.append(it)
+
+    # 最近播放优先(主服条目的 LastPlayedDate 来自客户端用户,从服来自后台账号)
+    def _last_played(item: dict) -> str:
+        return str((item.get("UserData") or {}).get("LastPlayedDate") or "")
+
+    items.sort(key=_last_played, reverse=True)
+    items = items[:limit]
+
+    final_data = {"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}
+    return Response(content=json.dumps(final_data).encode('utf-8'), status_code=200, media_type="application/json")
+
+
 async def _handle_secondary_library_latest(
     request: Request, full_path: str, ref, session: ClientSession, config: AppConfig
 ) -> Response | None:
@@ -463,25 +549,68 @@ async def _handle_vlib_latest_media(
         new_params[resource_map[vlib.resource_type]] = vlib.resource_id
     # 'all' 类型不加资源过滤,即取全库最新
 
-    target_url = f"{real_emby_url}/emby/Users/{user_id}/Items"
-    async with session.get(target_url, params=new_params, headers=_forward_headers(request), proxy=emby_proxy_of(request)) as resp:
-        if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
-            return None
+    # 多服聚合:库引用了从服时,逐服(主服在前)取最新后合并重排;
+    # 从服条目前缀化 + ServerId 归一,UserData 剥离(v1 语义:未看)
+    allowed_servers = server_context.vlib_allowed_server_ids(vlib, config)
+    fetch_targets = [(None, user_id, real_emby_url, _forward_headers(request), emby_proxy_of(request))]
+    client_server_id = "emby"
+    if allowed_servers is not None:
+        client_server_id = await server_context.get_primary_server_id(config, session)
+        for sid, server in server_context.secondary_servers(config).items():
+            if sid not in allowed_servers:
+                continue
+            server_cfg = server_context.server_like_config(server, config)
+            try:
+                s_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+                s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            except Exception as e:
+                logger.warning(f"最新分区跳过从服 {sid}: {e}")
+                continue
+            fetch_targets.append((sid, s_user_id, server_cfg.emby_url.rstrip('/'), s_headers, emby_proxy_from_config(server_cfg)))
 
-        data = await resp.json()
-        items_list = data.get("Items", [])
+    items_list = []
+    for sid, s_user_id, s_url, s_headers, s_proxy in fetch_targets:
+        target_url = f"{s_url}/emby/Users/{s_user_id}/Items"
+        try:
+            async with session.get(target_url, params=new_params, headers=s_headers, proxy=s_proxy) as resp:
+                if resp.status != 200 or "application/json" not in resp.headers.get("Content-Type", ""):
+                    logger.warning(f"最新分区查询失败({sid or '主服'}, Status: {resp.status})")
+                    if sid is None:
+                        return None
+                    continue
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning(f"最新分区查询出错({sid or '主服'}): {e}")
+            if sid is None:
+                return None
+            continue
 
-        if post_filter_rules:
-            items_list = _apply_post_filter(items_list, post_filter_rules, match_all=match_all)
+        batch = [it for it in data.get("Items", []) if isinstance(it, dict)]
+        if sid:
+            fixed = []
+            for it in batch:
+                it = dict(it)
+                it.pop("UserData", None)
+                if it.get("Id"):
+                    it["Id"] = server_context.encode_item_ref(sid, it["Id"])
+                    it["ServerId"] = client_server_id
+                fixed.append(it)
+            batch = fixed
+        items_list.extend(batch)
 
-        if is_tmdb_merge_enabled:
-            items_list = await handler_merger.merge_items_by_tmdb(items_list)
+    if post_filter_rules:
+        items_list = _apply_post_filter(items_list, post_filter_rules, match_all=match_all)
 
-        items_list = items_list[:client_limit]
+    if is_tmdb_merge_enabled:
+        items_list = await handler_merger.merge_items_by_tmdb(items_list)
 
-        # 分区接口返回 {Items: [...]} 形状(与真实库的 latestmedia 分区一致)
-        final_data = {"Items": items_list, "TotalRecordCount": len(items_list)}
-        return Response(content=json.dumps(final_data).encode('utf-8'), status_code=200, media_type="application/json")
+    # 各服各自返回 DateCreated 降序,拼接后统一重排再截断
+    items_list.sort(key=lambda i: str(i.get("DateCreated") or ""), reverse=True)
+    items_list = items_list[:client_limit]
+
+    # 分区接口返回 {Items: [...]} 形状(与真实库的 latestmedia 分区一致)
+    final_data = {"Items": items_list, "TotalRecordCount": len(items_list)}
+    return Response(content=json.dumps(final_data).encode('utf-8'), status_code=200, media_type="application/json")
 
 
 async def _rss_latest_items(

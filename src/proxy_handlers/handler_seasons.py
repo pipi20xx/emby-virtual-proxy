@@ -8,6 +8,8 @@ from fastapi import Request, Response
 from aiohttp import ClientSession
 from ._find_helper import find_all_series_by_tmdb_id, is_item_in_a_merge_enabled_vlib, resolve_tmdb_id_for_item  # noqa
 from emby_net import emby_proxy_of
+from services import server_context, credential_service
+import config_manager
 import proxy_cache
 
 logger = logging.getLogger(__name__)
@@ -21,6 +23,10 @@ def _seasons_cache_key(user_id: str, representative_id: str, params) -> tuple:
 
 
 async def handle_seasons_merge(request: Request, full_path: str, session: ClientSession, real_emby_url: str) -> Response | None:
+    # 跨服合并只从主服侧代表条目触发;从服真实库点开的剧集走原生路由(不合并)
+    if getattr(request.state, "evp_server_id", None):
+        return None
+
     match = SEASONS_PATH_REGEX.search(f"/{full_path}")
     if not match: return None
 
@@ -66,15 +72,40 @@ async def handle_seasons_merge(request: Request, full_path: str, session: Client
     if len(original_series_ids) < 2: return None
     logger.info(f"SEASONS_HANDLER: ✅ 找到 {len(original_series_ids)} 个关联剧集: {original_series_ids}。")
 
-    async def fetch_seasons(series_id: str, proxy: str | None = None):
-        url = f"{real_emby_url}/emby/Shows/{series_id}/Seasons"
+    async def fetch_seasons(series_id: str):
+        # 多服:复合 ID 的兄弟系列来自从服 —— 用属主服的地址/凭证与剥前缀的真实 ID 拉取;
+        # 返回的从服季条目已加复合前缀(客户端据此请求对应集,经既有路由直达从服)
+        ref = server_context.split_item_ref(series_id, config)
+        if ref:
+            s_sid, real_series_id, server = ref
+            server_cfg = server_context.server_like_config(server, config)
+            try:
+                s_uid = await server_context.resolve_server_user_id(server_cfg, session)
+                s_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            except Exception as e:
+                logger.warning(f"SEASONS_HANDLER: 从服兄弟 {series_id} 拉取失败: {e}")
+                return []
+            url = f"{server_cfg.emby_url.rstrip('/')}/emby/Shows/{real_series_id}/Seasons"
+            s_params = {k: v for k, v in params.items() if k.lower() not in ("x-emby-token", "api_key", "userid")}
+            s_proxy = emby_proxy_from_config(server_cfg)
+        else:
+            url = f"{real_emby_url}/emby/Shows/{series_id}/Seasons"
+            s_params = params
+            s_headers = headers
+            s_proxy = proxy
+
         try:
-            async with session.get(url, params=params, headers=headers, proxy=proxy) as resp:
-                return (await resp.json()).get("Items", []) if resp.status == 200 else []
+            async with session.get(url, params=s_params, headers=s_headers, proxy=s_proxy) as resp:
+                seasons = (await resp.json()).get("Items", []) if resp.status == 200 else []
         except Exception: return []
 
+        if ref:
+            seasons = await server_context.prefix_item_ids(
+                [s for s in seasons if isinstance(s, dict)], s_sid, config, session)
+        return seasons
+
     proxy = emby_proxy_of(request)
-    tasks = [fetch_seasons(sid, proxy=proxy) for sid in original_series_ids]
+    tasks = [fetch_seasons(sid) for sid in original_series_ids]
     all_seasons = [s for sublist in await asyncio.gather(*tasks) for s in sublist]
 
     merged_seasons = {}

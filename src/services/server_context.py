@@ -332,6 +332,19 @@ async def resolve_routed_request(request: Request, full_path: str, config, sessi
     server_user_id = await resolve_server_user_id(server_cfg, session)
     composite_marker = f"{server_id}{_COMPOSITE_SEP}"
 
+    # 记录原始客户端 uid(路径/查询改写前的形态):播放状态类写操作失效叠加层时,
+    # 必须用客户端身份的键,而不是被改写后的从服后台账号
+    client_uid = None
+    for i in range(1, len(raw_segments)):
+        if raw_segments[i - 1] == "Users" and raw_segments[i]:
+            client_uid = raw_segments[i]
+            break
+    if not client_uid:
+        for key, value in parse_qsl((request.scope.get("query_string", b"") or b"").decode("latin-1"), keep_blank_values=True):
+            if key.lower() == "userid":
+                client_uid = value
+                break
+
     # 1) 路径改写:复合 ID → 真实 id;/Users/{客户端uid}/ → /Users/{属主服uid}/;
     #    段内嵌复合值(如字幕路径的 mediasource_s2~1576)剥前缀保留真实形态。
     raw_segments = full_path.split("/")
@@ -381,6 +394,8 @@ async def resolve_routed_request(request: Request, full_path: str, config, sessi
     scope["headers"] = new_headers
     new_request = Request(scope, request.receive)
     new_request.state.evp_server_id = server_id
+    if client_uid:
+        new_request.state.evp_client_uid = client_uid
     logger.info(f"多服路由:请求携带 {server_id} 复合 ID,已改写指向 {server.name or server_id}。")
     return new_request, new_full_path, server, server_id
 
@@ -481,6 +496,53 @@ async def prefix_item_ids(items: List[dict], server_id: str, config, session) ->
         _prefix_ids_outbound(item, server_id, marker, primary_server_id)
         for item in items if isinstance(item, dict)
     ]
+
+
+async def route_playstate_body(request: Request, full_path: str, config, session):
+    """播放状态上报(POST /Sessions/Playing/*)的请求体路由。
+
+    ItemId 在请求体里、路径上无从判断属主:体 ItemId 带从服复合前缀或命中
+    营救映射时,把上报转发给属主服(凭证替换、体 ItemId 剥前缀)——
+    从服条目的播放进度因此可续。未命中返回 None(原样主服,零变化)。
+    """
+    if request.method != "POST":
+        return None
+    if "/sessions/playing/" not in f"/{full_path.lower()}/":
+        return None
+
+    body = await request.body()
+    try:
+        payload = json.loads(body or b"{}")
+        item_id = str(payload.get("ItemId") or "")
+    except Exception:
+        return None
+    if not item_id:
+        return None
+
+    ref = split_item_ref(item_id, config)
+    if ref is None:
+        mapped = _served_real_id_map.get(item_id)
+        if mapped and time.time() - mapped[1] <= _SERVED_MAP_TTL:
+            server = secondary_servers(config).get(mapped[0])
+            if server is not None:
+                ref = (mapped[0], item_id, server)
+    if ref is None:
+        return None
+
+    server_id, real_item_id, server = ref
+    server_cfg = server_like_config(server, config)
+    auth = await credential_service.get_backend_auth(server_cfg, session=session)
+
+    payload["ItemId"] = real_item_id
+    url = f"{server_cfg.emby_url.rstrip('/')}/emby/{full_path}"
+    send_headers = {"Content-Type": "application/json", "X-Emby-Token": auth["token"]}
+    async with session.post(url, json=payload, headers=send_headers,
+                            proxy=emby_proxy_from_config(server_cfg)) as resp:
+        status = resp.status
+        resp_body = await resp.read()
+    logger.info(f"多服路由:播放状态上报(ItemId={item_id})已路由至 {server_id}(Status={status})。")
+    return Response(content=resp_body if resp_body else None, status_code=status,
+                    media_type="application/json")
 
 
 async def rewrite_routed_response_ids(response, server_id: str, config, session):
