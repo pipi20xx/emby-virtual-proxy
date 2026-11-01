@@ -2,7 +2,7 @@
 
 本项目是一个功能强大的 **Emby 代理服务器**。它作为中间层部署在您的 Emby 客户端（如浏览器、手机APP）和真实的 Emby 服务器之间。通过智能地拦截和修改客户端与服务器之间的通信数据（API请求），本项目实现了许多 Emby 原生不支持的高级功能，极大地增强了您的媒体库管理和浏览体验。
 
-**功能总览**：虚拟媒体库 · 高级筛选器 · TMDB ID 合并 · RSS 虚拟库（豆瓣/Bangumi）· 风格化封面生成（含动态封面）· 四层缓存与本地直出 · 图片本地化缓存 · 缺失剧集显示 · 实时运行日志 · 缓存状态面板 · Web 管理后台
+**功能总览**：虚拟媒体库 · **多 Emby 服务器聚合** · 高级筛选器 · TMDB ID 合并 · RSS 虚拟库（豆瓣/Bangumi）· 风格化封面生成（含动态封面）· 四层缓存与本地直出 · 图片本地化缓存 · 缺失剧集显示 · 聚合搜索 · 继续观看聚合 · 实时运行日志 · 缓存状态面板 · Web 管理后台
 
 ---
 
@@ -225,6 +225,46 @@ curl -sI 'http://127.0.0.1:8999/emby/Items/123456/Images/Primary?maxHeight=563&m
 
 ---
 
+## 🌐 多 Emby 服务器聚合 (Multi-Emby)
+
+支持同时接入多台 Emby 服务器：在「系统设置 → Emby 服务器」中登记任意多台（每台可用 API 密钥或账号密码连接，可指定一台为主服），从服内容与主服内容在客户端中聚合呈现。仅配置一台服务器时，所有行为与单服模式完全一致。
+
+### 基本概念
+
+| 概念 | 说明 |
+|---|---|
+| 主服 | 客户端登录入口（账号密码透传主服验证），系统接口/会话走主服；保存设置时主服连接信息会同步到兼容字段 |
+| 从服 | 额外登记的服务器；其内容通过虚拟库聚合或首页磁贴暴露 |
+| 复合 ID | 从服条目下发给客户端的 ID 形态为 `{服务器ID}~{条目ID}`（如 `s2~3891`）；代理入口自动识别，把详情/图片/播放/进度等请求路由回属主服务器 |
+| 状态源 | 从服条目的已看/进度以该从服配置的后台账号为准（单用户家庭精确；多用户各自绑定账号为后续计划） |
+
+### 从服内容的两种暴露方式
+
+1. **虚拟库聚合**：虚拟库编辑页的「内容来源」勾选从服 → 该库同时聚合多台服务器的条目，重复内容按 TMDB ID 合并（主服版本优先）。
+2. **从服真实库直通**：主页布局页把从服的真实媒体库（带「从服真实库」徽章）拖入显示列表 → 首页出现该库磁贴与「最新」横排，浏览请求直达从服**原生处理**（排序/筛选/音乐子视图全部保真）。
+
+### 覆盖的功能范围
+
+- **搜索**：全局搜索同时查询主服 + 全部从服，结果合并展示（主服在前）。
+- **详情 / 海报 / 播放 / 字幕 / 合集归属**：自动路由到条目所属服务器。
+- **季/集合并**：两台服务器都有同一部剧时，季与集自动合并、缺失集占位照常（需开启对应虚拟库的 TMDB 合并）。
+- **已看状态 / 播放进度 / 继续观看**：从服条目显示真实状态、进度可续；首页「继续观看」聚合主服与从服，按最近播放排序。
+- **后台任务**：缓存预热、TMDB 索引、封面生成均覆盖主服 + 从服。
+- **布局管理**：从服真实库与主服库、虚拟库一起参与首页排序与隐藏。
+
+### 从服凭证说明
+
+- 每台服务器可配置 **API 密钥**（需该服管理员权限）或**账号 + 密码**（无管理员权限时的兜底；明文存于 config.json，仅建议可信环境使用）。
+- 后台任务（预热/索引/封面/状态同步）使用各服务器自己的凭证；从服内容的可见范围由该凭证对应账号的权限决定。
+
+### 注意事项
+
+- 修改服务器标识（ID）后建议清一次虚拟库缓存。
+- LiveTV、QuickConnect、设备管理等服务器级功能始终走主服。
+- 从服条目的已看标记以从服后台账号视角计算，与主服账号相互独立。
+
+---
+
 ## ⚙️ 配置项参考 (config.json)
 
 所有配置推荐在管理后台修改，持久化于 `config/config.json`。以下为全部配置项速查：
@@ -232,7 +272,9 @@ curl -sI 'http://127.0.0.1:8999/emby/Items/123456/Images/Primary?maxHeight=563&m
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `emby_url` | `http://127.0.0.1:8096` | 上游 Emby 服务器地址 |
-| `emby_api_key` | （空） | 上游 Emby 的 API 密钥 |
+| `emby_api_key` | （空） | 主服 Emby 的 API 密钥（与 `emby_servers` 主服条目联动） |
+| `emby_username` / `emby_password` | （空） | 主服账号密码：无 API 密钥时后台任务的登录兜底（明文存储，仅建议可信环境） |
+| `emby_servers` | `[]` | 多服务器注册表：`[{id, name, url, api_key, username, password, proxy, is_primary}]`，数量不限；主服条目保存时镜像到 `emby_url` 等兼容字段 |
 | `emby_server_id` | （空） | 上游服务器 ID，用于 TMDB 占位符的备用 ServerId |
 | `emby_proxy` | （空） | 访问 Emby 上游的 HTTP 代理，格式 `http://[user:pass@]host:port`，留空直连，保存后即时生效 |
 | `log_level` | `info` | 日志级别：debug / info / warn / error |
@@ -261,7 +303,7 @@ curl -sI 'http://127.0.0.1:8999/emby/Items/123456/Images/Primary?maxHeight=563&m
 | `custom_zh_font_path` / `custom_en_font_path` | （空） | 全局封面中/英文字体路径（容器内绝对路径） |
 | `custom_image_path` | （空） | 全局封面素材图片目录（库级未指定时的后备） |
 
-> 虚拟库对象（`library` 数组元素）的关键字段：`resource_type`（见资源类型表）、`resource_id`、`collection_type`（展示类型：`tvshows` / `movies` / `mixed`，`null` 为自动推导——全库→混合，其余→电视剧）、`advanced_filter_id`、`merge_by_tmdb_id`、`source_library`、`rsshub_url`、`rss_type`、`enable_retention` / `retention_days`、`fallback_tmdb_id` / `fallback_tmdb_type`、`cover_style` / `cover_title_zh` / `cover_title_en` / `cover_animation_format` 等封面字段。
+> 虚拟库对象（`library` 数组元素）的关键字段：`resource_type`（见资源类型表）、`resource_id`、`collection_type`（展示类型：`tvshows` / `movies` / `mixed`，`null` 为自动推导——全库→混合，其余→电视剧）、`server_ids`（内容来源服务器 ID 列表，空 = 仅主服，勾选后聚合多服条目并按 TMDB 合并）、`advanced_filter_id`、`merge_by_tmdb_id`、`source_library`、`rsshub_url`、`rss_type`、`enable_retention` / `retention_days`、`fallback_tmdb_id` / `fallback_tmdb_type`、`cover_style` / `cover_title_zh` / `cover_title_en` / `cover_animation_format` 等封面字段。
 
 ---
 
@@ -289,14 +331,14 @@ src/
 │   └── translator.py       #   纯函数,无网络请求
 │
 ├── admin_server.py         # 管理后台 API (纯薄路由层,只调用 services/)
-├── services/               # 管理后台业务服务层 (认证/虚拟库/封面/RSS/日志/缓存预热/TMDB索引/容器重启)
+├── services/               # 业务服务层 (认证/虚拟库/封面/RSS/日志/缓存预热/TMDB索引/凭证/多服上下文/容器重启)
 ├── rss_processor/          # RSS 数据刷新处理器 (豆瓣/Bangumi, 基类+子类)
 ├── cover_generator/        # 封面样式插件 (3 静态 + 4 动态,每个 style_*.py 一个样式,可插拔)
 └── assets/                 # 内置字体与占位图
 ```
 
 运行时数据都在 `config/`（容器内 `/app/config`，建议整目录挂载持久化）：
-`config.json` · `vlib_items.db`（全库数据源/派生元数据/用户状态层/封面素材/合并缓存/TMDB 索引）· `images/`（生成的封面）· `image_cache/`（海报本地化缓存）· `logs/`（按天日志）· RSS 相关缓存库。
+`config.json` · `vlib_items.db`（全库数据源/派生元数据/用户状态层/封面素材/合并缓存/TMDB 索引/多服来源计数）· `backend_auth.db`（账号密码登录的凭证缓存）· `images/`（生成的封面）· `image_cache/`（海报本地化缓存）· `logs/`（按天日志）· RSS 相关缓存库。
 
 分层原则:**代理核心** (`proxy_server.py` + `proxy_handlers/`) 面向客户端,
 改动需极度谨慎;**管理后台** (`admin_server.py` + `services/`) 面向配置,
