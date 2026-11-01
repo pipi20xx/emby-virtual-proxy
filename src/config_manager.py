@@ -17,6 +17,7 @@ import time
 
 from models import AppConfig
 from app_paths import CONFIG_DIR, CONFIG_FILE_PATH
+from services.server_registry import normalize_servers, sync_legacy_primary_fields
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,10 @@ def load_config_for_write() -> AppConfig:
 
 def save_config(config: AppConfig) -> None:
     try:
+        # 服务器注册表归一化 + 主服镜像(均幂等;所有写路径在此自动一致)
+        normalize_servers(config)
+        sync_legacy_primary_fields(config)
+
         CONFIG_DIR.mkdir(exist_ok=True)
 
         payload = config.model_dump_json(by_alias=True, indent=4)

@@ -540,6 +540,15 @@ async def restart_proxy_container():
 
 # --- 后台凭证(API 密钥 / 账号密码)状态与连接测试 ---
 
+class CredentialTestBody(BaseModel):
+    """行级连接测试的临时凭证(测试尚未保存的服务器条目)。"""
+    url: str = ""
+    api_key: str = ""
+    username: str = ""
+    password: str = ""
+    proxy: str = ""
+
+
 @api_router.get("/emby-credential/status", tags=["System Management"])
 async def get_emby_credential_status():
     """当前凭证模式与缓存健康度(读本地缓存,不发网络请求)。"""
@@ -547,8 +556,21 @@ async def get_emby_credential_status():
 
 
 @api_router.post("/emby-credential/test", tags=["System Management"])
-async def test_emby_credential():
-    """用当前配置实测 Emby 连接:API 密钥校验或账号密码重新登录。"""
+async def test_emby_credential(body: Optional[CredentialTestBody] = None):
+    """用给定凭证实测 Emby 连接。
+
+    - 带 body:测试未保存的服务器条目(服务器管理卡行级「测试连接」);
+    - 无 body:测试当前已保存的主服配置(兼容旧前端调用)。
+    """
+    if body and (body.url.strip() or body.api_key.strip() or body.username.strip()):
+        transient = AppConfig(
+            emby_url=body.url.strip(),
+            emby_api_key=body.api_key,
+            emby_username=body.username,
+            emby_password=body.password,
+            emby_proxy=body.proxy,
+        )
+        return await credential_service.test_connection(transient)
     return await credential_service.test_connection()
 
 

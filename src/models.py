@@ -57,6 +57,24 @@ class VirtualLibrary(BaseModel):
     cover_animation_format: Optional[str] = Field(default=None) # <-- 【新增】上次生成的动图格式(gif/webp/png)
     cover_source_hash: Optional[str] = Field(default=None) # <-- 【新增】上次生成时的内容指纹(条目 Id 集合),未变化则不重绘
 
+class EmbyServerConfig(BaseModel):
+    """多服务器注册表条目(多服聚合,见 docs/multi-emby-aggregation.md)。
+
+    - id: 短标识,限 [a-z0-9_-]{1,8},用作从服条目 ID 前缀({id}~{item_id});
+      空/重复由 server_registry.normalize_servers 自动生成补齐。
+    - is_primary: 恰好一台;客户端登录/系统接口/会话走主服,保存时主服条目
+      会被镜像到旧字段 emby_url/emby_api_key/... 保证现有代码兼容。
+    """
+    id: str = Field(default="")
+    name: str = Field(default="")
+    url: str = Field(default="")
+    api_key: Optional[str] = Field(default="")
+    username: Optional[str] = Field(default="")
+    password: Optional[str] = Field(default="")
+    proxy: Optional[str] = Field(default="")
+    is_primary: bool = Field(default=False)
+
+
 class AppConfig(BaseModel):
     emby_url: str = Field(default="http://127.0.0.1:8096")
     emby_api_key: Optional[str] = Field(default="")
@@ -64,6 +82,8 @@ class AppConfig(BaseModel):
     emby_password: Optional[str] = Field(default="") # 新增:与 admin_password 同级明文存储,仅建议可信环境使用
     emby_server_id: Optional[str] = Field(default=None) # 新增：用于TMDB缓存占位符的备用服务器ID
     emby_proxy: Optional[str] = Field(default="") # 新增：访问 Emby 上游的 HTTP 代理(留空直连)
+    # 多服务器注册表(阶段1:仅面板管理,保存时主服镜像到上方旧字段;代理核心暂不读取)
+    emby_servers: List[EmbyServerConfig] = Field(default_factory=list)
     log_level: Literal["debug", "info", "warn", "error"] = Field(default="info")
     display_order: List[str] = Field(default_factory=list)
     hide: List[str] = Field(default_factory=list)

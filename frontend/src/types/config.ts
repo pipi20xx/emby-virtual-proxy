@@ -61,6 +61,18 @@ export interface VirtualLibrary {
   cover_custom_image_path: string | null
 }
 
+/** 多服务器注册表条目(id 用作从服条目 ID 前缀;is_primary 恰好一台,保存时镜像进旧字段) */
+export interface EmbyServerConfig {
+  id: string
+  name: string
+  url: string
+  api_key: string
+  username: string
+  password: string
+  proxy: string
+  is_primary: boolean
+}
+
 export interface AppConfig {
   emby_url: string
   emby_api_key: string
@@ -68,6 +80,8 @@ export interface AppConfig {
   emby_username: string
   /** 与 admin_password 同级明文存于 config.json,仅建议可信环境 */
   emby_password: string
+  /** 多服务器注册表(主服条目保存时镜像到上方旧字段) */
+  emby_servers: EmbyServerConfig[]
   /** 访问 Emby 上游的 HTTP 代理(http://[user:pass@]host:port),留空直连 */
   emby_proxy: string
   emby_server_id: string | null
@@ -207,6 +221,7 @@ export function createDefaultConfig(): AppConfig {
     emby_api_key: '',
     emby_username: '',
     emby_password: '',
+    emby_servers: [],
     emby_proxy: '',
     emby_server_id: null,
     log_level: 'info',

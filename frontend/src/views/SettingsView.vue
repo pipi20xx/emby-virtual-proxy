@@ -17,84 +17,129 @@
 
     <template v-if="ready">
       <v-form ref="formRef" @submit.prevent>
-        <!-- Emby 连接 -->
+        <!-- Emby 服务器 -->
         <v-card>
-          <v-card-title class="d-flex align-center ga-2">
-            <v-icon icon="mdi-server" size="small" /> Emby 连接
+          <v-card-title class="d-flex align-center ga-2 flex-wrap">
+            <v-icon icon="mdi-server" size="small" /> Emby 服务器
+            <v-chip
+              v-if="credentialStatus && credentialStatus.mode === 'api_key'"
+              color="success" size="small" variant="tonal" prepend-icon="mdi-key-variant"
+            >
+              主服 · API 密钥模式
+            </v-chip>
+            <v-chip
+              v-else-if="credentialStatus && credentialStatus.mode === 'user_pass'"
+              color="info" size="small" variant="tonal" prepend-icon="mdi-account"
+            >
+              主服 · 账号密码模式{{ credentialStatus.token_cached ? ' · 凭证已缓存' : '' }}
+            </v-chip>
+            <v-chip
+              v-else-if="credentialStatus"
+              color="warning" size="small" variant="tonal" prepend-icon="mdi-alert-outline"
+            >
+              主服 · 未配置凭证
+            </v-chip>
+            <v-spacer />
+            <v-btn color="primary" variant="tonal" size="small" prepend-icon="mdi-plus" @click="addServer">
+              添加服务器
+            </v-btn>
           </v-card-title>
           <v-card-text class="d-flex flex-column ga-4">
-            <v-text-field
-              v-model="draft.emby_url"
-              label="Emby 服务器地址"
-              placeholder="http://192.168.50.12:8096"
-              hint="真实 Emby/Jellyfin 服务器的完整访问地址"
-              persistent-hint
-              :rules="[rules.required('Emby 服务器地址'), rules.httpUrl]"
-            />
-            <SecretField
-              v-model="draft.emby_api_key"
-              label="Emby API 密钥(可选)"
-              placeholder="在 Emby 控制台 -> 高级 -> API 密钥 中生成"
-              hint="预热/索引/封面等后台任务的凭证;没有管理员权限时可改用下方账号密码"
-              persistent-hint
-              :rules="[credentialRule]"
-            />
-            <v-row>
-              <v-col cols="12" md="6" class="py-0">
-                <v-text-field
-                  v-model="draft.emby_username"
-                  label="Emby 账号(可选)"
-                  placeholder="没有 API 密钥时的后台任务登录账号"
-                />
-              </v-col>
-              <v-col cols="12" md="6" class="py-0">
-                <SecretField
-                  v-model="draft.emby_password"
-                  label="Emby 密码(可选)"
-                  hint="与 API 密钥二选一;明文存于 config.json,仅建议可信环境使用"
-                  persistent-hint
-                  :rules="[credentialRule]"
-                />
-              </v-col>
-            </v-row>
-            <v-text-field
-              v-model="draft.emby_proxy"
-              label="Emby 连接代理(可选)"
-              placeholder="留空直连;例如 http://user:pass@127.0.0.1:7890"
-              hint="代理核心与管理后台访问 Emby 的所有请求(浏览转发、季/集合并、封面素材下载等)都会经由该代理,适合 Emby 与代理不在同一网络的环境。仅支持 HTTP 代理;保存后即时生效,无需重启。"
-              persistent-hint
-            />
-            <div class="d-flex align-center ga-2 flex-wrap">
-              <v-btn
-                color="secondary"
-                variant="tonal"
-                prepend-icon="mdi-connection"
-                :loading="testing"
-                @click="onTestCredential"
-              >
-                测试连接
-              </v-btn>
-              <template v-if="credentialStatus">
-                <v-chip
-                  v-if="credentialStatus.mode === 'api_key'"
-                  color="success" size="small" variant="tonal" prepend-icon="mdi-key-variant"
-                >
-                  API 密钥模式
-                </v-chip>
-                <v-chip
-                  v-else-if="credentialStatus.mode === 'user_pass'"
-                  color="info" size="small" variant="tonal" prepend-icon="mdi-account"
-                >
-                  账号密码模式 · {{ credentialStatus.token_cached ? '凭证已缓存' : '尚未登录' }}
-                </v-chip>
-                <v-chip v-else color="warning" size="small" variant="tonal" prepend-icon="mdi-alert-outline">
-                  未配置凭证(后台任务不可用)
-                </v-chip>
-                <span v-if="credentialStatus.last_error" class="text-caption text-error">
-                  {{ credentialStatus.last_error }}
+            <v-sheet
+              v-for="(server, index) in draft.emby_servers"
+              :key="index"
+              border
+              rounded
+              class="pa-4"
+            >
+              <div class="d-flex align-center ga-2 mb-3 flex-wrap">
+                <span class="text-subtitle-1 font-weight-medium">
+                  {{ server.name || ('服务器 ' + (index + 1)) }}
                 </span>
-              </template>
-            </div>
+                <v-chip v-if="server.is_primary" color="primary" size="small" variant="tonal">主服</v-chip>
+                <v-spacer />
+                <v-btn
+                  size="small" variant="text" prepend-icon="mdi-connection"
+                  :loading="testingIndex === index"
+                  @click="onTestServer(index)"
+                >
+                  测试连接
+                </v-btn>
+                <v-btn
+                  size="small" variant="text" color="error" prepend-icon="mdi-delete-outline"
+                  @click="onRemoveServer(index)"
+                >
+                  删除
+                </v-btn>
+              </div>
+              <div class="d-flex flex-column ga-3">
+                <v-row>
+                  <v-col cols="12" md="6" class="py-0">
+                    <v-text-field v-model="server.name" label="名称" placeholder="如:主服 / 高清库" />
+                  </v-col>
+                  <v-col cols="12" md="6" class="py-0">
+                    <v-text-field
+                      v-model="server.id"
+                      label="标识 (ID)"
+                      hint="用于多服路由前缀;留空自动生成;小写字母/数字/-/_,最长 8 位"
+                      persistent-hint
+                      :rules="[rules.serverId]"
+                    />
+                  </v-col>
+                </v-row>
+                <v-text-field
+                  v-model="server.url"
+                  label="服务器地址"
+                  :placeholder="URL_EXAMPLE"
+                  :rules="[rules.required('服务器地址'), rules.httpUrl]"
+                />
+                <SecretField
+                  v-model="server.api_key"
+                  label="API 密钥(可选)"
+                  placeholder="在 Emby 控制台 -> 高级 -> API 密钥 中生成"
+                  :rules="[serverCredentialRule(server)]"
+                />
+                <v-row>
+                  <v-col cols="12" md="6" class="py-0">
+                    <v-text-field
+                      v-model="server.username"
+                      label="账号(可选)"
+                      placeholder="没有 API 密钥时的后台任务登录账号"
+                    />
+                  </v-col>
+                  <v-col cols="12" md="6" class="py-0">
+                    <SecretField
+                      v-model="server.password"
+                      label="密码(可选)"
+                      hint="与 API 密钥二选一;明文存于 config.json,仅建议可信环境使用"
+                      persistent-hint
+                      :rules="[serverCredentialRule(server)]"
+                    />
+                  </v-col>
+                </v-row>
+                <v-text-field
+                  v-model="server.proxy"
+                  label="连接代理(可选)"
+                  :placeholder="PROXY_EXAMPLE"
+                  hint="主服的代理保存后即成为全局 Emby 代理;从服代理在多服路由启用后生效"
+                  persistent-hint
+                />
+                <div>
+                  <v-switch
+                    :model-value="server.is_primary"
+                    color="primary"
+                    density="compact"
+                    label="设为主服(客户端登录入口)"
+                    hint="全表恰好一台;保存时主服连接信息会同步到代理兼容配置"
+                    persistent-hint
+                    @update:model-value="setPrimary(index)"
+                  />
+                </div>
+              </div>
+            </v-sheet>
+            <v-alert type="info" variant="tonal" density="compact" icon="mdi-information-outline">
+              「主服」是客户端的登录入口与系统接口的默认上游;从服内容将在后续版本通过虚拟库聚合展示。切换主服后,客户端需使用新主服的账号登录。
+            </v-alert>
           </v-card-text>
         </v-card>
 
@@ -399,16 +444,18 @@ import { computed, onMounted, ref } from 'vue'
 import type { VForm } from 'vuetify/components'
 
 import { useNotification } from '@/composables/useNotification'
+import { useConfirm } from '@/composables/useConfirm'
 import { useConfigStore } from '@/stores/useConfigStore'
 import { deepClone } from '@/utils/clone'
-import { COVER_STYLES, HIDE_TYPE_PRESETS, createDefaultConfig, type AppConfig } from '@/types/config'
-import { getCredentialStatus, testCredential, type CredentialStatus } from '@/api/emby'
+import { COVER_STYLES, HIDE_TYPE_PRESETS, createDefaultConfig, type AppConfig, type EmbyServerConfig } from '@/types/config'
+import { getCredentialStatus, testServerCredential, type CredentialStatus } from '@/api/emby'
 import EmptyState from '@/components/common/EmptyState.vue'
 import SecretField from '@/components/common/SecretField.vue'
 import SectionHeader from '@/components/common/SectionHeader.vue'
 
 const configStore = useConfigStore()
 const notify = useNotification()
+const { confirm } = useConfirm()
 
 const formRef = ref<VForm | null>(null)
 const draft = ref<AppConfig>(createDefaultConfig())
@@ -422,41 +469,107 @@ const rules = {
     Boolean(value && String(value).trim()) || `${label}不能为空`,
   httpUrl: (value: string) =>
     /^https?:\/\//.test(String(value ?? '')) || '地址必须以 http:// 或 https:// 开头',
+  // 留空合法(后端自动生成 sN);填写则校验格式
+  serverId: (value: string) => {
+    const v = String(value ?? '').trim()
+    if (!v) return true
+    return /^[a-z0-9_-]{1,8}$/.test(v) || '仅小写字母/数字/-/_,最长 8 位'
+  },
 }
 
-// 跨字段校验:API 密钥与账号密码至少配置一项(两项字段共用同一条规则)
-const credentialRule = (value: string) => {
-  const hasKey = Boolean(value && String(value).trim())
-  const hasAccount =
-    Boolean((draft.value.emby_username || '').trim()) && Boolean((draft.value.emby_password || '').trim())
-  return hasKey || hasAccount || 'API 密钥与账号密码至少配置一项'
+// 行级跨字段校验:该服务器的 API 密钥与账号密码至少配置一项
+function serverCredentialRule(server: EmbyServerConfig) {
+  return (value: string) => {
+    const hasKey = Boolean(value && String(value).trim())
+    const hasAccount =
+      Boolean((server.username || '').trim()) && Boolean((server.password || '').trim())
+    return hasKey || hasAccount || 'API 密钥与账号密码至少配置一项'
+  }
+}
+
+// 示例值放 script 而非模板属性:模板属性值中出现 "//" 会被 vue-tsc 虚拟代码
+// 当作行注释,吞掉 v-for 后续作用域(见构建报错 TS2304)。
+const URL_EXAMPLE = 'http://192.168.50.12:8096'
+const PROXY_EXAMPLE = '留空直连;例如 http://user:pass@127.0.0.1:7890'
+
+// --- 服务器注册表行操作 ---
+
+const testingIndex = ref<number | null>(null)
+
+function addServer() {
+  const taken = new Set(draft.value.emby_servers.map((s) => s.id))
+  let n = draft.value.emby_servers.length + 1
+  let id = `s${n}`
+  while (taken.has(id)) {
+    n += 1
+    id = `s${n}`
+  }
+  draft.value.emby_servers.push({
+    id, name: '', url: '', api_key: '', username: '', password: '', proxy: '',
+    is_primary: draft.value.emby_servers.length === 0,
+  })
+}
+
+function setPrimary(index: number) {
+  // 单选语义:全表恰好一台主服(后端归一化亦有兜底)
+  draft.value.emby_servers.forEach((s, i) => {
+    s.is_primary = i === index
+  })
+}
+
+async function onRemoveServer(index: number) {
+  if (draft.value.emby_servers.length <= 1) {
+    notify.error('至少保留一台服务器')
+    return
+  }
+  const server = draft.value.emby_servers[index]
+  const yes = await confirm({
+    title: '删除服务器',
+    message: `确定删除「${server.name || server.id || `服务器 ${index + 1}`}」吗?\n仅移除注册表条目,Emby 服务器本身不受影响。`,
+    confirmText: '删除',
+    cancelText: '取消',
+    color: 'error',
+    icon: 'mdi-delete-outline',
+  })
+  if (!yes) return
+  draft.value.emby_servers.splice(index, 1)
+  if (!draft.value.emby_servers.some((s) => s.is_primary)) {
+    draft.value.emby_servers[0].is_primary = true
+  }
+}
+
+async function onTestServer(index: number) {
+  const server = draft.value.emby_servers[index]
+  if (!server.url || !server.url.trim()) {
+    notify.error('请先填写该服务器的地址')
+    return
+  }
+  testingIndex.value = index
+  try {
+    const result = await testServerCredential({
+      url: server.url,
+      api_key: server.api_key,
+      username: server.username,
+      password: server.password,
+      proxy: server.proxy,
+    })
+    if (result.ok) notify.success(result.message)
+    else notify.error(result.message)
+  } catch (error) {
+    notify.error(error instanceof Error ? error.message : '测试连接失败')
+  } finally {
+    testingIndex.value = null
+    loadCredentialStatus()
+  }
 }
 
 const credentialStatus = ref<CredentialStatus | null>(null)
-const testing = ref(false)
 
 async function loadCredentialStatus() {
   try {
     credentialStatus.value = await getCredentialStatus()
   } catch {
     credentialStatus.value = null
-  }
-}
-
-async function onTestCredential() {
-  if (dirty.value) {
-    notify.info('存在未保存的修改,测试连接使用的是已保存的配置')
-  }
-  testing.value = true
-  try {
-    const result = await testCredential()
-    if (result.ok) notify.success(result.message)
-    else notify.error(result.message)
-  } catch (error) {
-    notify.error(error instanceof Error ? error.message : '测试连接失败')
-  } finally {
-    testing.value = false
-    loadCredentialStatus()
   }
 }
 
@@ -470,6 +583,19 @@ async function initialize() {
 
 function resetDraft(source: AppConfig) {
   draft.value = deepClone(source)
+  // 旧安装兼容预填:注册表为空时用旧字段合成主服行(保存后进入新模型,旧字段值不变)
+  if (!draft.value.emby_servers || draft.value.emby_servers.length === 0) {
+    draft.value.emby_servers = [{
+      id: 'home',
+      name: '主服',
+      url: draft.value.emby_url || '',
+      api_key: draft.value.emby_api_key || '',
+      username: draft.value.emby_username || '',
+      password: draft.value.emby_password || '',
+      proxy: draft.value.emby_proxy || '',
+      is_primary: true,
+    }]
+  }
   initialSnapshot.value = JSON.stringify(draft.value)
 }
 

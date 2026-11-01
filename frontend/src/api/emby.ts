@@ -52,3 +52,18 @@ export async function testCredential(): Promise<CredentialTestResult> {
   const { data } = await client.post<CredentialTestResult>('/emby-credential/test')
   return data
 }
+
+/** 行级连接测试请求体(测试尚未保存的服务器条目) */
+export interface CredentialTestBody {
+  url: string
+  api_key: string
+  username: string
+  password: string
+  proxy: string
+}
+
+/** 行级连接测试;不传参则测试已保存的主服 */
+export async function testServerCredential(payload?: Partial<CredentialTestBody>): Promise<CredentialTestResult> {
+  const { data } = await client.post<CredentialTestResult>('/emby-credential/test', payload ?? {})
+  return data
+}
