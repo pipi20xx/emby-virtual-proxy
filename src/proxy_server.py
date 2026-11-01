@@ -925,9 +925,15 @@ async def reverse_proxy(request: Request, full_path: str):
     # 多服路由:路径携带从服复合 ID({server}~{item})时,把整个请求改写为属主服务器
     # 的真实形态(真实 id / 属主服 user / 属主服 token),后续 handler 链完全无感。
     # 播放流路径(/videos/、/audio/)即使无复合 ID 也要进路由 —— 部分客户端会把
-    # 复合 ID 规范化成裸 ID,靠出站改写记录的映射营救;其余未命中 → 原样放行。
+    # 复合 ID 规范化成裸 ID,靠出站改写记录的映射营救;查询参数里出现复合 ID
+    # (如详情页合集部件的 ListItemIds=s2~1540)同样要进路由;其余未命中 → 原样放行。
     lowered_path = f"/{full_path.lower()}/"
-    needs_routing = "~" in full_path or "/videos/" in lowered_path or "/audio/" in lowered_path
+    raw_query = (request.scope.get("query_string", b"") or b"").decode("latin-1", "ignore")
+    # 注意查询串是百分号编码的:~ 可能以 %7E 形态出现(ListItemIds=s2%7E1540),两种都要认
+    needs_routing = (
+        "~" in full_path or "~" in raw_query or "%7e" in raw_query.lower()
+        or "/videos/" in lowered_path or "/audio/" in lowered_path
+    )
     routed_server = None
     if needs_routing:
         try:
@@ -980,10 +986,10 @@ async def reverse_proxy(request: Request, full_path: str):
     if not response: response = await handler_views.handle_view_injection(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_default.forward_request(request, full_path, request.method, real_emby_url, session)
 
-    # 多服出站改写:属主服响应里的条目 ID 加回复合前缀,客户端后续的
-    # 图片/播放/进度请求才能带前缀被路由回属主(仅 JSON,流媒体/图片不受影响)
+    # 多服出站改写:属主服响应里的条目 ID 加回复合前缀、ServerId 统一为主服,
+    # 客户端后续的图片/播放/进度请求才能带前缀被路由回属主(仅 JSON,流媒体/图片不受影响)
     if routed_server is not None and response is not None and response.status_code == 200:
-        response = await server_context.rewrite_routed_response_ids(response, routed_server.id)
+        response = await server_context.rewrite_routed_response_ids(response, routed_server.id, config, session)
 
     # 播放/收藏状态写操作成功后,立即失效该用户的叠加层(否则"已看/未看"最长要等 10 分钟)
     _maybe_invalidate_user_state(request, full_path, response)

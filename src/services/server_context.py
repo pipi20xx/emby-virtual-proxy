@@ -34,6 +34,10 @@ _USER_RESOLVE_TTL = 1800
 # 复合 ID 解析(用于生成 Token="..." 替换)
 _AUTH_TOKEN_RE = re.compile(r'(Token=")([^"]*)(")')
 _TOKEN_PARAM_KEYS = {"x-emby-token", "api_key"}
+# 可能携带条目引用的查询参数(值里出现从服复合 ID 时,请求应路由到该服)。
+# 典型如详情页"收录于合集"部件:GET /Users/{uid}/Items?IncludeItemTypes=BoxSet&ListItemIds=s2~1540
+_QUERY_ID_PARAM_KEYS = {"listitemids", "ids", "parentid", "mediasourceid",
+                        "seriesid", "seasonid", "albumid", "itemids"}
 
 # {服务器 base url: (user_id, resolved_at)}
 _user_cache: Dict[str, Tuple[str, float]] = {}
@@ -235,6 +239,22 @@ async def resolve_routed_request(request: Request, full_path: str, config, sessi
                 hit = (mapped[0], seg, server)
                 break
     if hit is None:
+        # 参数营救:部分请求把条目引用放在查询参数里(ListItemIds/Ids/ParentId 等),
+        # 路径上无从判断属主 —— ID 类参数的值里出现从服复合 ID 即路由到该服,
+        # 后续的参数改写会把复合值剥回真实形态再转发。
+        query_string_raw = request.scope.get("query_string", b"") or b""
+        for key, value in parse_qsl(query_string_raw.decode("latin-1"), keep_blank_values=True):
+            if key.lower() not in _QUERY_ID_PARAM_KEYS:
+                continue
+            for part in value.split(","):
+                ref = split_item_ref(part.strip(), config)
+                if ref:
+                    logger.info(f"多服路由:参数 {key} 携带 {ref[0]} 复合 ID,路由至 {ref[0]}。")
+                    hit = ref
+                    break
+            if hit:
+                break
+    if hit is None:
         return None
 
     server_id, _real_id, server = hit
@@ -297,6 +317,41 @@ async def resolve_routed_request(request: Request, full_path: str, config, sessi
     return new_request, new_full_path, server, server_id
 
 
+_primary_server_id_cache: Dict[str, Tuple[str, float]] = {}
+
+
+async def get_primary_server_id(config, session) -> str:
+    """客户端唯一认识的服务器 ID(主服 System/Info 的 Id)。
+
+    聚合下发的所有条目必须统一用这个 ServerId —— 客户端渲染卡片时执行
+    `connectionManager.getApiClient(item.ServerId)`,ServerId 是它没登记过的
+    从服 ID 时会拿到 null,随后 `null.getImageUrl` 直接让 Emby Web 渲染崩溃。
+    """
+    cache_key = (config.emby_url or "").rstrip("/")
+    now = time.time()
+    cached = _primary_server_id_cache.get(cache_key)
+    if cached and now - cached[1] < 24 * 3600:
+        return cached[0]
+
+    server_id = (getattr(config, "emby_server_id", "") or "").strip()
+    if not server_id:
+        try:
+            headers = await credential_service.get_backend_headers(config, session=session)
+            async with session.get(
+                f"{cache_key}/emby/System/Info", headers=headers,
+                proxy=emby_proxy_from_config(config),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    server_id = str((await resp.json(content_type=None)).get("Id") or "")
+        except Exception as e:
+            logger.warning(f"解析主服 ServerId 失败: {e}")
+    if not server_id:
+        server_id = "emby"
+    _primary_server_id_cache[cache_key] = (server_id, now)
+    return server_id
+
+
 # ---------- 出站改写:属主服响应的条目 ID 加回复合前缀 ----------
 
 # 需要加前缀的 ID 字段(客户端会拿它们发起后续请求:详情/图片/播放/进度/导航)
@@ -322,12 +377,15 @@ def _record_served_id(real_id: str, server_id: str) -> None:
             _served_real_id_map.pop(k, None)
 
 
-def _prefix_ids_outbound(obj, server_id: str, marker: str):
+def _prefix_ids_outbound(obj, server_id: str, marker: str, primary_server_id: str):
     if isinstance(obj, dict):
         out = {}
         for key, value in obj.items():
             if key in _OUTBOUND_SKIP_KEYS:
                 out[key] = value
+            elif key == "ServerId":
+                # 统一成客户端认识的主服 ServerId(从服自带的 ID 客户端解析不到 apiClient)
+                out[key] = primary_server_id
             elif key in _OUTBOUND_ID_FIELDS and isinstance(value, (str, int)) and value:
                 s = str(value)
                 if s.startswith(marker):
@@ -336,18 +394,19 @@ def _prefix_ids_outbound(obj, server_id: str, marker: str):
                     _record_served_id(s, server_id)
                     out[key] = f"{server_id}{_COMPOSITE_SEP}{s}"
             else:
-                out[key] = _prefix_ids_outbound(value, server_id, marker)
+                out[key] = _prefix_ids_outbound(value, server_id, marker, primary_server_id)
         return out
     if isinstance(obj, list):
-        return [_prefix_ids_outbound(item, server_id, marker) for item in obj]
+        return [_prefix_ids_outbound(item, server_id, marker, primary_server_id) for item in obj]
     return obj
 
 
-async def rewrite_routed_response_ids(response, server_id: str):
-    """属主服响应出站前,把 JSON 里的条目 ID 字段加回复合前缀。
+async def rewrite_routed_response_ids(response, server_id: str, config, session):
+    """属主服响应出站前,把 JSON 里的条目 ID 字段加回复合前缀,ServerId 统一为主服。
 
     没有这一步,客户端拿到属主服的裸 ID 后发起的播放/图片/进度请求不带前缀,
-    路由无法识别属主,会被打到主服(404/500)。仅处理 JSON;非 JSON 原样返回。
+    路由无法识别属主,会被打到主服(404/500);ServerId 不归一则客户端
+    connectionManager 解析不到 apiClient,渲染直接崩溃。仅处理 JSON。
     已带前缀的值幂等跳过(响应可能来自缓存)。
     """
     content_type = (response.headers.get("content-type") or "").lower()
@@ -364,9 +423,10 @@ async def rewrite_routed_response_ids(response, server_id: str):
         body = await response.body()
 
     try:
+        primary_server_id = await get_primary_server_id(config, session)
         data = json.loads(body)
         marker = f"{server_id}{_COMPOSITE_SEP}"
-        data = _prefix_ids_outbound(data, server_id, marker)
+        data = _prefix_ids_outbound(data, server_id, marker, primary_server_id)
         new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     except Exception as e:
         logger.warning(f"多服出站改写失败(原样返回): {e}")

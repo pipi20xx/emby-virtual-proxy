@@ -92,11 +92,32 @@ _SERVING_NUMERIC_SORT_FIELDS = {
     "ParentIndexNumber", "IndexNumber", "ChildCount",
 }
 _SERVING_DATE_SORT_FIELDS = {"DateCreated", "PremiereDate"}
-# 可安全本地排序的字段白名单;出现白名单之外的 SortBy 一律回退实时查询(避免"排序静默失效")
-_SERVING_SAFE_SORT_FIELDS = (
+# 文件夹视图专用字段:Emby Web 的文件夹视图固定发 SortBy=IsFolder,Filename。
+# 虚拟库是平铺列表(无子文件夹、无文件名概念),按常量/标题处理即可。
+# 全量缓存在手,任意字段都能本地排 —— 不再维护排序白名单;唯一回退条件是
+# 排序字段在本地数据里完全不存在(见 try_serve_locally 的可得性检查)。
+_SERVING_PLACEHOLDER_SORT_FIELDS = {"IsFolder", "Filename"}
+_KNOWN_SORT_ALIASES = (
     _SERVING_NUMERIC_SORT_FIELDS | _SERVING_DATE_SORT_FIELDS
     | {"SortName", "Name", "Random", "DateLastContentAdded"}
+    | _SERVING_PLACEHOLDER_SORT_FIELDS
 )
+
+
+def _normalize_sort_token(token: str) -> str:
+    """排序字段归一化:大小写不敏感地映射回已知标准形(如 sortName → SortName)。"""
+    t = token.strip()
+    for known in _KNOWN_SORT_ALIASES:
+        if t.lower() == known.lower():
+            return known
+    return t
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 # 叠加层按 Id 批量查询的每批条目数(控制 URL 长度)
 _SERVING_OVERLAY_CHUNK = 150
@@ -482,6 +503,9 @@ async def build_multi_server_base(config: AppConfig, session: ClientSession) -> 
     all_items: List[Dict[str, Any]] = []
     date_maps: List[Dict[str, str]] = []
     primary = server_context.primary_server(config)
+    # 从服条目必须挂客户端认识的主服 ServerId(否则 Emby Web 渲染卡片时
+    # connectionManager.getApiClient 解析不到 apiClient,null.getImageUrl 崩溃)
+    client_server_id = await server_context.get_primary_server_id(config, session)
     for server_id, server_cfg in server_context.iter_server_configs(config):
         label = server_id or "主服(旧字段)"
         try:
@@ -501,10 +525,10 @@ async def build_multi_server_base(config: AppConfig, session: ClientSession) -> 
         except Exception as e:
             logger.warning(f"多服数据源 {label}「最近更新」时间戳抓取出错(忽略): {e}")
             dates = {}
-        # 仅从服条目做复合 ID;主服条目(primary 或旧字段形态)保持原 ID
+        # 仅从服条目做复合 ID + 归一 ServerId;主服条目(primary 或旧字段形态)保持原样
         if server_id and (primary is None or server_id != primary.id):
             items = [
-                dict(it, Id=server_context.encode_item_ref(server_id, it["Id"]))
+                dict(it, Id=server_context.encode_item_ref(server_id, it["Id"]), ServerId=client_server_id)
                 for it in items if isinstance(it, dict) and it.get("Id")
             ]
             dates = {server_context.encode_item_ref(server_id, k): v for k, v in dates.items()}
@@ -996,9 +1020,13 @@ def invalidate_user_overlay(user_id: str, source_key: Optional[str] = None) -> i
 
 
 def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: str) -> List[Dict[str, Any]]:
-    """在代理端对直出列表按客户端的 SortBy/SortOrder 排序。"""
+    """在代理端对直出列表按客户端的 SortBy/SortOrder 排序。
+
+    全量缓存在手,任意字段本地排;字段比较方式按实际数据自动判定:
+    采样值全部可解析为数字 → 数值序,否则字符串序(ISO 日期字符串天然正确)。
+    """
     descending = (sort_order or "Ascending").lower() == "descending"
-    tokens = [t.strip() for t in (sort_by or "SortName").split(",") if t.strip()]
+    tokens = [_normalize_sort_token(t) for t in (sort_by or "SortName").split(",") if t.strip()]
 
     if "Random" in tokens:
         random.shuffle(items)
@@ -1008,10 +1036,20 @@ def _sort_items_locally(items: List[Dict[str, Any]], sort_by: str, sort_order: s
         if token == _PROXY_RANK_SORT:
             # 排名越大越新,与其它字段一样用 reverse=descending 表达"新→旧"
             return lambda i: i.get(_PROXY_RANK_FIELD, -1)
-        if token in _SERVING_NUMERIC_SORT_FIELDS:
-            return lambda i: float(i.get(token) or 0)
-        if token in _SERVING_DATE_SORT_FIELDS:
-            return lambda i: (i.get(token) or "")
+        if token == "IsFolder":
+            # 虚拟库是平铺列表,该字段为常量,仅作为文件夹视图的占位排序
+            return lambda i: 0
+        if token == "Filename":
+            # 条目 DTO 无 Filename 字段,文件夹视图用它做标题排序,按 Name 处理
+            return lambda i: str(i.get("Name") or "").lower()
+
+        # 按该字段的真实数据形态选择比较方式(采样前 200 条)
+        sample_values = [i.get(token) for i in items[:200] if isinstance(i, dict)]
+        present = [v for v in sample_values if v not in (None, "")]
+        numeric = bool(present) and all(_as_float(v) is not None for v in present)
+        if numeric:
+            return lambda i: _as_float(i.get(token)) or 0.0
+        # 字符串序:字段为空的条目退回按标题排(与旧实现一致,如 SortName 缺失时)
         return lambda i: str(i.get(token) or i.get("Name") or "").lower()
 
     # 逆序多级稳定排序,保证第一个 SortBy 权重最高
@@ -1165,16 +1203,9 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
     # 注意:Recursive=false(文件夹视图)同样直出 —— 实时路径本就无条件强制
     # Recursive=true,客户端拿到的一直是递归结果;这里跳过只会白白触发
     # "全量实时拉取"(本地全量筛选器下要 20 秒+),且让文件夹视图丢失从服条目。
-    # 排序字段白名单:本地排序不支持的字段直接回退实时查询,不让"排序静默失效"
+    # 排序字段不再设白名单:全量缓存在手,任意字段都能本地排;
+    # 唯一例外(字段在本地数据里完全不存在)在拿到元数据后检查,见下方。
     sort_by_raw = params.get("SortBy", "SortName")
-    unsupported_sorts = [
-        t.strip() for t in (sort_by_raw or "").split(",")
-        if t.strip() and t.strip() not in _SERVING_SAFE_SORT_FIELDS
-    ]
-    if unsupported_sorts:
-        proxy_cache.bump("serving_skip_sort")
-        logger.info(f"直出跳过:'{vlib.name}' 请求使用了不支持的排序字段 {unsupported_sorts},回退实时查询。")
-        return None
 
     now = int(time.time())
     source_key = base_source_key(vlib)
@@ -1196,13 +1227,19 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
 
     # 「最近更新」排序依赖构建期烙进条目的排名;老数据没有时会静默给出错误顺序,
     # 所以这里显式检查,缺排名就回退实时查询(重建一次后自动可用)。
-    if _PROXY_RANK_SORT in (sort_by_raw or "") and not _base_has_rank(meta["items"]):
+    sort_tokens = [_normalize_sort_token(t) for t in (sort_by_raw or "").split(",") if t.strip()]
+    sort_tokens_lower = [t.lower() for t in sort_tokens]
+    if _PROXY_RANK_SORT.lower() in sort_tokens_lower and not _base_has_rank(meta["items"]):
         proxy_cache.bump("serving_skip_sort_no_rank")
         logger.info(f"直出跳过:'{vlib.name}' 的派生结果缺少「最近更新」排名,本次回退并后台补建。")
         # 从共享数据源本地重新派生即可补上排名(不产生 Emby 请求),后台自愈:
         # 本次先回退实时查询,下一次同样请求就能直出。
         _refresh_metadata_background(config, vlib, user_id, session, real_emby_url, proxy=proxy)
         return None
+
+    # 排序不再有任何回退:全量缓存在手,存在的字段按值排,不存在的字段是 no-op
+    # (退化为按标题序,与 Emby 服务端对无关字段的空值处理一致 —— 例如混合库视图
+    # 固定携带的音乐字段 Album/IndexNumber 对电影条目就是空值)。
 
     overlay = await aget_user_overlay(source_key, user_id)
     if overlay is None:
@@ -1316,6 +1353,13 @@ async def try_serve_latest_locally(config: AppConfig, vlib, user_id: str,
     return items[:wanted]
 
 
+# 虚拟库无法应答的子资源路径(命中即返回空列表):音乐/演唱者/人员等视图,
+# 其内容类型不在虚拟库拉取范围(Movie,Series,Video)内
+_VLIB_EMPTY_SUBRESOURCE_MARKERS = (
+    "/artists", "/albumartists", "/songs", "/musicgenres", "/musicalbums", "/musicvideos", "/persons",
+)
+
+
 async def handle_virtual_library_items(
     request: Request,
     full_path: str,
@@ -1359,8 +1403,25 @@ async def handle_virtual_library_items(
         return None
 
     logger.info(f"拦截到虚拟库 '{found_vlib.name}'，开始高性能筛选流程。")
-    
-    user_id = params.get("UserId")
+
+    # 混合库的音乐/人员子视图(演唱者/歌曲/专辑等):虚拟库内容只有电影/剧集,
+    # 这些视图无法有意义地应答。返回空列表让客户端渲染空分区 —— 否则透传给主服
+    # 会因 ParentId 是虚拟库合成 ID 而得到 400,进而级联出 Emby Web 渲染崩溃
+    # (imagehelper null TypeError)。
+    # 注意形状:Prefixes 类端点(字母索引条)必须返回裸数组 —— 客户端
+    # getArtistPrefixes 拿到结果直接 result.map,回对象会抛
+    # "result.map is not a function" 并中断整个刷新链(标题/年份排序因此全挂)。
+    lowered_path = full_path.lower()
+    if any(marker in lowered_path for marker in _VLIB_EMPTY_SUBRESOURCE_MARKERS):
+        if "/prefixes" in lowered_path:
+            body = json.dumps([]).encode("utf-8")
+        else:
+            body = json.dumps({"Items": [], "TotalRecordCount": 0}).encode("utf-8")
+        return Response(content=body, status_code=200, media_type="application/json")
+
+    # 用户 ID 大小写不敏感提取:Emby Web 部分请求(如 Artists/Prefixes)用小驼峰
+    # userId 且路径无 /Users/ 段,大小写敏感的取法会拿不到用户而误回 400
+    user_id = next((v for k, v in params.items() if k.lower() == "userid"), None)
     if not user_id:
         # (保持原有的UserId查找逻辑)
         path_parts_for_user = full_path.split('/')
