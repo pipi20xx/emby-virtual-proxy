@@ -189,6 +189,8 @@ async def clear_all_caches() -> dict:
     removed_meta = db_manager.clear_vlib_metadata()
     removed_overlay = db_manager.clear_vlib_user_overlay()
     removed_index = db_manager.clear_tmdb_index()
+    # 多服来源计数一并清空(派生时重建)
+    db_manager.clear_vlib_server_counts()
     # 季/集合并结果落盘缓存同样失效(否则清空后详情页仍返回旧合并结果)
     db_manager.clear_merge_results()
     # 旧版按用户全量缓存表一并清理(历史数据)

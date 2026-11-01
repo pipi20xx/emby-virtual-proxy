@@ -267,6 +267,17 @@ def init_databases():
     )
     """, commit=True)
 
+    # 多服聚合:派生时各来源服务器的条目数(合并前口径),供 probe 按服比对
+    vlib_items_db.execute("""
+    CREATE TABLE IF NOT EXISTS vlib_server_counts (
+        library_id TEXT,
+        server_id TEXT,
+        item_count INTEGER,
+        updated_at INTEGER,
+        PRIMARY KEY (library_id, server_id)
+    )
+    """, commit=True)
+
     # 季/集合并结果落盘缓存:内存 TTL 缓存被淘汰或进程重启后仍可直接复用
     vlib_items_db.execute("""
     CREATE TABLE IF NOT EXISTS merge_result_cache (
@@ -559,6 +570,56 @@ def delete_vlib_user_overlay(library_id: str) -> None:
         )
     except Exception as e:
         print(f"Error deleting vlib user overlay for {library_id}: {e}")
+
+
+# --- 多服聚合:派生时各来源服务器的条目数(合并前口径),probe 按服比对用 ---
+
+def save_vlib_server_counts(library_id: str, counts: Dict[str, int], updated_at: int) -> None:
+    """整体替换某库的来源服务器计数。counts: {server_id: 条目数}。"""
+    if not counts:
+        return
+    try:
+        with DBManager._locks[VLIB_ITEMS_DB]:
+            conn = DBManager(VLIB_ITEMS_DB).get_conn()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM vlib_server_counts WHERE library_id = ?", (library_id,))
+            cursor.executemany(
+                "INSERT OR REPLACE INTO vlib_server_counts (library_id, server_id, item_count, updated_at) "
+                "VALUES (?, ?, ?, ?)",
+                [(library_id, str(sid), int(n), updated_at) for sid, n in counts.items()],
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"Error saving vlib server counts for {library_id}: {e}")
+
+
+def load_vlib_server_counts(library_id: str) -> Dict[str, int]:
+    try:
+        rows = DBManager(VLIB_ITEMS_DB).fetchall(
+            "SELECT server_id, item_count FROM vlib_server_counts WHERE library_id = ?", (library_id,)
+        )
+        return {r["server_id"]: int(r["item_count"] or 0) for r in rows}
+    except Exception as e:
+        print(f"Error loading vlib server counts for {library_id}: {e}")
+        return {}
+
+
+def delete_vlib_server_counts(library_id: str) -> None:
+    try:
+        DBManager(VLIB_ITEMS_DB).execute(
+            "DELETE FROM vlib_server_counts WHERE library_id = ?", (library_id,), commit=True
+        )
+    except Exception as e:
+        print(f"Error deleting vlib server counts for {library_id}: {e}")
+
+
+def clear_vlib_server_counts() -> int:
+    try:
+        cursor = DBManager(VLIB_ITEMS_DB).execute("DELETE FROM vlib_server_counts", commit=True)
+        return cursor.rowcount or 0
+    except Exception as e:
+        print(f"Error clearing vlib server counts: {e}")
+        return 0
 
 
 def delete_user_overlay_rows(user_id: str, source_key: Optional[str] = None) -> None:

@@ -33,9 +33,10 @@ from proxy_cache import (
     drop_source_overlays,
 )
 import proxy_cache
-from emby_net import emby_proxy_of
+from emby_net import emby_proxy_of, emby_proxy_from_config
 import db_manager
 from services import credential_service
+from services import server_context
 logger = logging.getLogger(__name__)
 
 # ================= 本地直出(访问加速,分层缓存) =================
@@ -354,9 +355,10 @@ def _base_fetch_params(api_token: Optional[str]) -> Dict[str, Any]:
     return params
 
 
-async def build_base_items(user_id: str, session: ClientSession, real_emby_url: str,
-                           headers: Dict[str, str], proxy: Optional[str] = None) -> List[Dict[str, Any]]:
-    """以传入身份裸拉全库条目(不筛选、不合并),失败返回空列表。"""
+async def _fetch_base_page_items(real_emby_url: str, user_id: str, session: ClientSession,
+                                 headers: Dict[str, str],
+                                 proxy: Optional[str] = None) -> List[Dict[str, Any]]:
+    """以传入身份分页裸拉全库条目(不筛选、不合并、不烙排名),失败返回空列表。"""
     params = _base_fetch_params(_extract_token(headers))
     url = f"{real_emby_url}/emby/Users/{user_id}/Items"
     all_items: List[Dict[str, Any]] = []
@@ -379,6 +381,77 @@ async def build_base_items(user_id: str, session: ClientSession, real_emby_url: 
 
     for item in all_items:
         item.pop("UserData", None)
+    return all_items
+
+
+async def _fetch_content_added_dates(real_emby_url: str, user_id: str, session: ClientSession,
+                                     headers: Dict[str, str],
+                                     proxy: Optional[str] = None) -> Dict[str, str]:
+    """按 DateLastContentAdded 降序拉一遍,返回 {条目ID: 时间戳字符串}。
+
+    多服聚合用:时间戳可跨服务器比较,用于合并出全局「最近更新」顺序;
+    失败返回空字典(该服条目在该排序下退居末位)。
+    """
+    params_base: Dict[str, Any] = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series,Video",
+        "SortBy": _PROXY_RANK_SORT,
+        "SortOrder": "Descending",
+        "Limit": str(_RANK_PAGE),
+        "Fields": "DateCreated,DateLastContentAdded",
+        "EnableUserData": "false",
+        "EnableImages": "false",
+    }
+    token = _extract_token(headers)
+    if token:
+        params_base["X-Emby-Token"] = token
+
+    dates: Dict[str, str] = {}
+    start = 0
+    while True:
+        params = dict(params_base)
+        params["StartIndex"] = str(start)
+        async with session.get(f"{real_emby_url}/emby/Users/{user_id}/Items",
+                               params=params, headers=headers, proxy=proxy) as resp:
+            if resp.status != 200:
+                logger.warning(f"「最近更新」时间戳抓取失败, Status: {resp.status}。")
+                return dates
+            batch = (await resp.json(content_type=None)).get("Items", [])
+        if not batch:
+            break
+        for it in batch:
+            if it.get("Id"):
+                dates[str(it["Id"])] = str(it.get("DateLastContentAdded") or "")
+        start += len(batch)
+        if len(batch) < _RANK_PAGE:
+            break
+    return dates
+
+
+def _bake_global_ranks(items: List[Dict[str, Any]], date_maps: List[Dict[str, str]]) -> None:
+    """按各服时间戳合并出全局「最近更新」顺序,把排名烙进条目(越大越新)。"""
+    merged: Dict[str, str] = {}
+    for date_map in date_maps:
+        merged.update(date_map)
+    if not merged:
+        return
+    ordered = [key for key, _ in sorted(merged.items(), key=lambda kv: kv[1], reverse=True)]
+    ranks = {item_id: (len(ordered) - index) for index, item_id in enumerate(ordered)}
+    matched = 0
+    for item in items:
+        rank = ranks.get(str(item.get("Id")))
+        if rank is not None:
+            item[_PROXY_RANK_FIELD] = rank
+            matched += 1
+    logger.info(f"「最近更新」全局排序已就绪:覆盖 {matched}/{len(items)} 个条目。")
+
+
+async def build_base_items(user_id: str, session: ClientSession, real_emby_url: str,
+                           headers: Dict[str, str], proxy: Optional[str] = None) -> List[Dict[str, Any]]:
+    """以传入身份裸拉全库条目(不筛选、不合并),失败返回空列表。"""
+    all_items = await _fetch_base_page_items(real_emby_url, user_id, session, headers, proxy=proxy)
+    if not all_items:
+        return []
 
     # 顺带把「最近更新」顺序烙进条目,让这个排序也能本地直出(失败则跳过,不影响主流程)
     try:
@@ -395,6 +468,53 @@ async def build_base_items(user_id: str, session: ClientSession, real_emby_url: 
         logger.warning(f"「最近更新」排序抓取出错(忽略): {e}")
 
     logger.info(f"全库数据源裸拉完成,共 {len(all_items)} 个条目。")
+    return all_items
+
+
+async def build_multi_server_base(config: AppConfig, session: ClientSession) -> List[Dict[str, Any]]:
+    """多服聚合的全库数据源:逐台(主服在前)裸拉后拼接。
+
+    - 仅从服条目浅拷贝并把 Id 改写为 `{server_id}~{item_id}` 复合形态;
+      主服条目保持原对象原 ID(主服 ID 直达,复合形态主服自己反而不认)。
+    - 单台失败记 warning 跳过(该服贡献为空),不阻塞其它服务器。
+    - 排名:各服 DateLastContentAdded 时间戳合并出全局序(ISO 字符串可直接比较)。
+    """
+    all_items: List[Dict[str, Any]] = []
+    date_maps: List[Dict[str, str]] = []
+    primary = server_context.primary_server(config)
+    for server_id, server_cfg in server_context.iter_server_configs(config):
+        label = server_id or "主服(旧字段)"
+        try:
+            server_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+            server_headers = await credential_service.get_backend_headers(server_cfg, session=session)
+        except Exception as e:
+            logger.warning(f"多服数据源跳过 {label}:凭证/用户解析失败: {e}")
+            continue
+        proxy = emby_proxy_from_config(server_cfg)
+        server_url = server_cfg.emby_url.rstrip("/")
+        items = await _fetch_base_page_items(server_url, server_user_id, session, server_headers, proxy=proxy)
+        if not items:
+            logger.warning(f"多服数据源 {label} 裸拉为空,本轮无该服条目。")
+            continue
+        try:
+            dates = await _fetch_content_added_dates(server_url, server_user_id, session, server_headers, proxy=proxy)
+        except Exception as e:
+            logger.warning(f"多服数据源 {label}「最近更新」时间戳抓取出错(忽略): {e}")
+            dates = {}
+        # 仅从服条目做复合 ID;主服条目(primary 或旧字段形态)保持原 ID
+        if server_id and (primary is None or server_id != primary.id):
+            items = [
+                dict(it, Id=server_context.encode_item_ref(server_id, it["Id"]))
+                for it in items if isinstance(it, dict) and it.get("Id")
+            ]
+            dates = {server_context.encode_item_ref(server_id, k): v for k, v in dates.items()}
+        all_items.extend(items)
+        if dates:
+            date_maps.append(dates)
+        logger.info(f"多服数据源 {label} 就绪,共 {len(items)} 个条目。")
+
+    _bake_global_ranks(all_items, date_maps)
+    logger.info(f"多服全库数据源构建完成,共 {len(all_items)} 个条目。")
     return all_items
 
 
@@ -450,7 +570,11 @@ async def ensure_base_items(config: AppConfig, source_key: str, user_id: str, se
             return entry
         logger.info(f"全库数据源 '{source_key}' 缺少「最近更新」排名,重建一次以支持该排序。")
 
-    items = await build_base_items(user_id, session, real_emby_url, headers, proxy=proxy)
+    # 多服聚合:至少一个虚拟库引用了从服时,base 改为逐台拉取拼接(复合 ID 形态)
+    if server_context.multi_server_active(config):
+        items = await build_multi_server_base(config, session)
+    else:
+        items = await build_base_items(user_id, session, real_emby_url, headers, proxy=proxy)
     if not items:
         if entry:
             logger.warning(f"全库数据源 '{source_key}' 刷新失败,沿用旧快照({len(entry['items'])} 项)。")
@@ -510,12 +634,30 @@ def _resource_matches(vlib, item: Dict[str, Any]) -> bool:
     return True
 
 
-async def derive_metadata_from_base(config: AppConfig, vlib, base_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """在全库数据源上本地派生该虚拟库的共享元数据(资源过滤 → 规则过滤 → TMDB 合并)。
+def _count_items_by_server(items: List[Dict[str, Any]], config: AppConfig) -> Dict[str, int]:
+    """按归属服务器统计条目数(合并前口径,probe 按服比对的基准)。"""
+    counts: Dict[str, int] = {}
+    for item in items:
+        server_id = server_context.item_server_id(item, config)
+        counts[server_id] = counts.get(server_id, 0) + 1
+    return counts
+
+
+async def derive_metadata_from_base(config: AppConfig, vlib, base_items: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """在全库数据源上本地派生该虚拟库的共享元数据(来源过滤 → 资源过滤 → 规则过滤 → TMDB 合并)。
 
     顺序与逐库拉取完全一致(先筛后合并),因此合并代表条目的选择不变;
-    返回的列表与 base 共享同一批 item dict,不产生第二份条目数据。
+    未引用从服的库与 base 共享同一批 item dict,不产生第二份条目数据。
+    返回 (条目列表, 各来源服务器条目数 —— 合并前口径)。
     """
+    # 多服:该库限定了内容来源时,先按归属服务器过滤(base 是全服并集)
+    allowed_servers = server_context.vlib_allowed_server_ids(vlib, config)
+    if allowed_servers is not None:
+        base_items = [
+            it for it in base_items
+            if isinstance(it, dict) and server_context.item_server_id(it, config) in allowed_servers
+        ]
+
     if vlib.resource_type == "all":
         items = list(base_items)
     else:
@@ -525,11 +667,13 @@ async def derive_metadata_from_base(config: AppConfig, vlib, base_items: List[Di
     if post_filter_rules:
         items = _apply_post_filter(items, post_filter_rules, match_all=match_all)
 
+    server_counts = _count_items_by_server(items, config)
+
     if vlib.merge_by_tmdb_id or config.force_merge_by_tmdb_id:
         items = await handler_merger.merge_items_by_tmdb(items)
 
     logger.info(f"从共享数据源派生 '{vlib.name}' 完成,共 {len(items)} 个项目。")
-    return items
+    return items, server_counts
 
 
 def _build_resolution_params(config: AppConfig, vlib, api_token: Optional[str]) -> Tuple[Dict[str, Any], List, List, bool]:
@@ -598,14 +742,16 @@ async def _resolve_shared_metadata_direct(config: AppConfig, vlib, user_id: str,
 
 async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session: ClientSession,
                                   real_emby_url: str, headers: Dict[str, str],
-                                  proxy: Optional[str] = None, force_base: bool = False) -> List[Dict[str, Any]]:
-    """解析虚拟库共享元数据(规则过滤 + 高级筛选 + TMDB 合并),并剥离 UserData。
+                                  proxy: Optional[str] = None, force_base: bool = False
+                                  ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """解析虚拟库共享元数据(来源/规则/高级筛选 + TMDB 合并),并剥离 UserData。
 
     优先从「全库基础数据源」本地派生:所有虚拟库共享一次裸拉,不再各自向 Emby 拉一遍。
-    数据源不可用(字段不足 / native 筛选器 / 拉取失败)时回退到逐库拉取,行为与历史一致。
+    数据源不可用(字段不足 / native 筛选器 / 拉取失败)时回退到逐库拉取(仅主服),行为与历史一致。
     共享元数据与用户无关,所有用户共用一份;可见性差异由用户叠加层在服务时裁剪。
     用户态规则(IsPlayed/IsUnplayed)在此不评估 —— 共享元数据已剥离用户状态,
     由 try_serve_locally 在叠加用户 UserData 后评估。
+    返回 (条目列表, 各来源服务器条目数 —— 合并前口径,probe 比对基准)。
     """
     try:
         if can_derive_from_base(config, vlib):
@@ -618,10 +764,11 @@ async def resolve_shared_metadata(config: AppConfig, vlib, user_id: str, session
                 logger.warning(
                     f"全库数据源缺少 '{vlib.resource_type}' 过滤所需字段,库 '{vlib.name}' 回退为逐库拉取。"
                 )
-        return await _resolve_shared_metadata_direct(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
+        items = await _resolve_shared_metadata_direct(config, vlib, user_id, session, real_emby_url, headers, proxy=proxy)
+        return items, {}
     except Exception as e:
         logger.warning(f"解析虚拟库 '{vlib.name}' 完整列表时出错: {e}")
-        return []
+        return [], {}
 
 
 
@@ -636,10 +783,13 @@ def get_shared_metadata(vlib_id: str) -> Optional[Dict[str, Any]]:
     return entry
 
 
-def store_shared_metadata(vlib, items: List[Dict[str, Any]]) -> None:
+def store_shared_metadata(vlib, items: List[Dict[str, Any]],
+                          server_counts: Optional[Dict[str, int]] = None) -> None:
     now = int(time.time())
     vlib_metadata_cache[vlib.id] = {"items": items, "updated_at": now}
     db_manager.save_vlib_metadata(vlib.id, items, now)
+    if server_counts is not None:
+        db_manager.save_vlib_server_counts(vlib.id, server_counts, now)
 
 
 # 封面素材缓存落盘节流:同一虚拟库最多每 10 分钟写一次 SQLite。
@@ -672,12 +822,18 @@ async def build_user_overlay_data(user_id: str, source_key: str, ids: List[str],
     if not ids:
         return {}
 
+    # 多服聚合:复合 ID({server}~{item})不是主服的有效 Guid,混进 Ids= 批次会让
+    # Emby 整批报 500 "Unrecognized Guid format",必须先剥离。这些条目的 UserData
+    # 在拉取后注入空状态(v1:从服条目一律按未看处理)。
+    upstream_ids = [i for i in ids if "~" not in str(i)]
+    composite_ids = [str(i) for i in ids if "~" in str(i)]
+
     token = _extract_token(headers)
     url = f"{real_emby_url}/emby/Users/{user_id}/Items"
     data: Dict[str, dict] = {}
 
-    for chunk_start in range(0, len(ids), _SERVING_OVERLAY_CHUNK):
-        chunk = ids[chunk_start:chunk_start + _SERVING_OVERLAY_CHUNK]
+    for chunk_start in range(0, len(upstream_ids), _SERVING_OVERLAY_CHUNK):
+        chunk = upstream_ids[chunk_start:chunk_start + _SERVING_OVERLAY_CHUNK]
         params: Dict[str, Any] = {"Ids": ",".join(chunk), "EnableUserData": "true", "Limit": "2000"}
         if token:
             params["X-Emby-Token"] = token
@@ -693,6 +849,13 @@ async def build_user_overlay_data(user_id: str, source_key: str, ids: List[str],
         except Exception as e:
             logger.warning(f"叠加层构建失败 (数据源 {source_key} 用户 {user_id}): {e}")
             return None
+
+    # 从服条目:主服上查不到 UserData,显式注入空状态(=未看)。
+    # 叠加层缺失的 Id 会被 assemble_visible_items 当作"该用户不可见"整批裁掉,
+    # 不注入会导致从服条目从所有列表里消失。单服场景无复合 ID,零影响。
+    for ref_str in composite_ids:
+        if ref_str not in data:
+            data[ref_str] = {}
     return data
 
 
@@ -772,10 +935,10 @@ def _refresh_metadata_background(config: AppConfig, vlib, user_id: str, session:
             source_key = base_source_key(vlib)
             base = get_base_items(source_key)
             base_stale = base is None or (int(time.time()) - int(base["updated_at"])) > _BASE_SOFT_TTL
-            items = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers,
-                                                  proxy=proxy, force_base=base_stale)
+            items, server_counts = await resolve_shared_metadata(config, vlib, user_id, session, real_emby_url, headers,
+                                                                 proxy=proxy, force_base=base_stale)
             if items:
-                store_shared_metadata(vlib, items)
+                store_shared_metadata(vlib, items, server_counts)
                 logger.info(f"后台重建共享元数据完成:'{vlib.name}' 共 {len(items)} 项。")
             else:
                 logger.warning(f"后台重建共享元数据失败:'{vlib.name}' 解析结果为空。")
@@ -884,10 +1047,13 @@ async def aget_shared_metadata(vlib_id: str) -> Optional[Dict[str, Any]]:
     return entry
 
 
-async def astore_shared_metadata(vlib, items: List[Dict[str, Any]]) -> None:
+async def astore_shared_metadata(vlib, items: List[Dict[str, Any]],
+                                 server_counts: Optional[Dict[str, int]] = None) -> None:
     now = int(time.time())
     vlib_metadata_cache[vlib.id] = {"items": items, "updated_at": now}
     await asyncio.to_thread(db_manager.save_vlib_metadata, vlib.id, items, now)
+    if server_counts is not None:
+        await asyncio.to_thread(db_manager.save_vlib_server_counts, vlib.id, server_counts, now)
 
 
 async def aget_user_overlay(source_key: str, user_id: str) -> Optional[Dict[str, Any]]:
@@ -996,9 +1162,9 @@ async def try_serve_locally(config: AppConfig, vlib, user_id: str, params, metho
         proxy_cache.bump("serving_skip_blocked")
         logger.info(f"直出跳过:'{vlib.name}' 请求包含筛选参数 {blocked_params},回退实时查询。")
         return None
-    if str(params.get("Recursive", "true")).lower() not in ("", "true"):
-        proxy_cache.bump("serving_skip_recursive")
-        return None
+    # 注意:Recursive=false(文件夹视图)同样直出 —— 实时路径本就无条件强制
+    # Recursive=true,客户端拿到的一直是递归结果;这里跳过只会白白触发
+    # "全量实时拉取"(本地全量筛选器下要 20 秒+),且让文件夹视图丢失从服条目。
     # 排序字段白名单:本地排序不支持的字段直接回退实时查询,不让"排序静默失效"
     sort_by_raw = params.get("SortBy", "SortName")
     unsupported_sorts = [

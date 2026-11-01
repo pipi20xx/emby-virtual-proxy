@@ -1,0 +1,377 @@
+# src/services/server_context.py —— 多服聚合:属主解析、复合 ID 与入口请求路由(阶段 2/3)
+"""多 Emby 聚合的两个核心机制(设计见 docs/multi-emby-aggregation.md):
+
+1. 复合 ID 与属主解析:从服条目下发为 `{server_id}~{item_id}`(主服条目不加前缀);
+   任何携带复合 ID 的客户端请求都能反查出属主服务器。
+2. 入口请求路由:reverse_proxy 顶部调用 resolve_routed_request,把路径/查询参数/
+   认证头整体改写为属主服务器的真实形态(真实 item id、属主服 user id、属主服
+   后端 token),后续 handler 链完全无感。未命中复合 ID → 原样放行(主服,零改动)。
+
+多服激活条件:注册表含从服(非主服条目)且至少一个虚拟库引用了从服 ——
+否则所有函数均为无操作,行为与单服完全一致。
+"""
+
+import json
+import logging
+import re
+import time
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode
+
+import aiohttp
+from fastapi import Request, Response
+from fastapi.responses import StreamingResponse
+
+from emby_net import emby_proxy_from_config
+from models import AppConfig, EmbyServerConfig
+from services import credential_service
+
+logger = logging.getLogger(__name__)
+
+_COMPOSITE_SEP = "~"
+_USER_RESOLVE_TTL = 1800
+
+# 复合 ID 解析(用于生成 Token="..." 替换)
+_AUTH_TOKEN_RE = re.compile(r'(Token=")([^"]*)(")')
+_TOKEN_PARAM_KEYS = {"x-emby-token", "api_key"}
+
+# {服务器 base url: (user_id, resolved_at)}
+_user_cache: Dict[str, Tuple[str, float]] = {}
+
+
+class RoutingError(Exception):
+    """多服路由失败(属主服不可达 / 凭证或用户解析失败)。"""
+
+
+# ---------- 注册表视图 ----------
+
+def _registry(config) -> List[EmbyServerConfig]:
+    return list(getattr(config, "emby_servers", None) or [])
+
+
+def primary_server(config) -> Optional[EmbyServerConfig]:
+    for server in _registry(config):
+        if server.is_primary and server.id:
+            return server
+    return None
+
+
+def secondary_servers(config) -> Dict[str, EmbyServerConfig]:
+    """已注册的从服 {id: 条目};主服条目与空 id 不参与复合 ID。"""
+    return {s.id: s for s in _registry(config) if (not s.is_primary) and s.id}
+
+
+def server_like_config(server: EmbyServerConfig, config) -> AppConfig:
+    """把注册表条目转成临时 AppConfig —— credential_service 等字段驱动模块直接可用。"""
+    proxy = (server.proxy or "").strip() or (getattr(config, "emby_proxy", "") or "")
+    return AppConfig(
+        emby_url=server.url or "",
+        emby_api_key=server.api_key or "",
+        emby_username=server.username or "",
+        emby_password=server.password or "",
+        emby_proxy=proxy,
+    )
+
+
+def iter_server_configs(config):
+    """产出 (server_id|None, AppConfig-like),主服在前 —— 聚合管线依赖该顺序实现「主服优先合并」。
+
+    注册表为空时仅产出 (None, 原config),即旧字段形态的主服。
+    """
+    registry = _registry(config)
+    if not registry:
+        yield None, config
+        return
+    ordered = [s for s in registry if s.is_primary] + [s for s in registry if not s.is_primary]
+    for server in ordered:
+        yield server.id, server_like_config(server, config)
+
+
+def multi_server_active(config) -> bool:
+    """聚合管线是否激活:注册表有从服,且至少一个虚拟库引用了从服。"""
+    if not secondary_servers(config):
+        return False
+    for vlib in getattr(config, "virtual_libraries", None) or []:
+        if vlib_uses_secondary(vlib, config):
+            return True
+    return False
+
+
+def vlib_uses_secondary(vlib, config) -> bool:
+    secondaries = secondary_servers(config)
+    return any(sid in secondaries for sid in (getattr(vlib, "server_ids", None) or []))
+
+
+def vlib_allowed_server_ids(vlib, config) -> Optional[set]:
+    """该库允许的来源服务器 id 集合;None = 不限制(未引用从服,行为与单服一致)。"""
+    if not vlib_uses_secondary(vlib, config):
+        return None
+    secondaries = secondary_servers(config)
+    allowed = {sid for sid in (getattr(vlib, "server_ids", None) or []) if sid in secondaries}
+    primary = primary_server(config)
+    if primary and primary.id:
+        allowed.add(primary.id)
+    return allowed
+
+
+def iter_vlib_server_targets(vlib, config):
+    """probe/按服操作用:该库涉及的 (server_id, AppConfig-like),主服在前。"""
+    primary = primary_server(config)
+    if primary and primary.id:
+        yield primary.id, server_like_config(primary, config)
+    else:
+        yield "primary", config
+    for sid in (getattr(vlib, "server_ids", None) or []):
+        server = secondary_servers(config).get(sid)
+        if server:
+            yield sid, server_like_config(server, config)
+
+
+# ---------- 复合 ID ----------
+
+def encode_item_ref(server_id: str, item_id) -> str:
+    return f"{server_id}{_COMPOSITE_SEP}{item_id}"
+
+
+def split_item_ref_server(ref, config) -> Optional[str]:
+    """复合 ID → 从服 id;非复合形态或前缀未注册 → None。"""
+    s = str(ref or "")
+    if _COMPOSITE_SEP not in s:
+        return None
+    prefix = s.split(_COMPOSITE_SEP, 1)[0]
+    return prefix if prefix in secondary_servers(config) else None
+
+
+def split_item_ref(ref, config) -> Optional[Tuple[str, str, EmbyServerConfig]]:
+    """复合 ID → (server_id, 真实 item id, 属主条目);不合法返回 None。"""
+    s = str(ref or "")
+    if _COMPOSITE_SEP not in s:
+        return None
+    prefix, _, real_id = s.partition(_COMPOSITE_SEP)
+    server = secondary_servers(config).get(prefix)
+    if not server or not real_id:
+        return None
+    return prefix, real_id, server
+
+
+def item_server_id(item, config) -> str:
+    """条目归属服务器 id:带已注册前缀 → 从服;否则 → 主服(注册表空时为占位 'primary')。"""
+    server_id = split_item_ref_server(item.get("Id") if isinstance(item, dict) else item, config)
+    if server_id:
+        return server_id
+    primary = primary_server(config)
+    return primary.id if primary and primary.id else "primary"
+
+
+# ---------- 属主服用户解析(带缓存) ----------
+
+async def resolve_server_user_id(server_cfg, session) -> str:
+    """解析某台服务器的内部操作用户:user_pass 用登录账号;api_key 模式取用户列表第一个。"""
+    base_url = (server_cfg.emby_url or "").rstrip("/")
+    now = time.time()
+    cached = _user_cache.get(base_url)
+    if cached and now - cached[1] < _USER_RESOLVE_TTL:
+        return cached[0]
+
+    if credential_service.auth_mode(server_cfg) == "user_pass":
+        auth = await credential_service.get_backend_auth(server_cfg, session=session)
+        user_id = str(auth.get("user_id") or "")
+        if not user_id:
+            raise RoutingError(f"登录账号缺少用户 Id ({base_url})")
+    else:
+        headers = await credential_service.get_backend_headers(server_cfg, session=session)
+        try:
+            async with session.get(
+                f"{base_url}/emby/Users", headers=headers,
+                proxy=emby_proxy_from_config(server_cfg),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    raise RoutingError(f"解析服务器用户失败 ({base_url}) Status={resp.status}")
+                users = await resp.json(content_type=None)
+        except aiohttp.ClientError as e:
+            raise RoutingError(f"连接服务器失败 ({base_url}): {e}") from e
+        user_id = next(
+            (str(u.get("Id")) for u in (users if isinstance(users, list) else [])
+             if isinstance(u, dict) and u.get("Id")),
+            "",
+        )
+        if not user_id:
+            raise RoutingError(f"服务器用户列表无有效 Id ({base_url})")
+
+    _user_cache[base_url] = (user_id, now)
+    return user_id
+
+
+# ---------- 入口请求路由 ----------
+
+async def resolve_routed_request(request: Request, full_path: str, config, session):
+    """路径携带从服复合 ID 时,把整个请求改写为属主服务器的真实形态。
+
+    返回 (new_request, new_full_path, EmbyServerConfig, server_id);未命中返回 None。
+    属主服凭证/用户解析失败抛 RoutingError(调用方转 502)。
+    """
+    hit: Optional[Tuple[str, str, EmbyServerConfig]] = None
+    raw_segments = full_path.split("/")
+    for seg in raw_segments:
+        ref = split_item_ref(seg, config)
+        if ref:
+            hit = ref
+            break
+    if hit is None:
+        # 裸 ID 营救:部分客户端会把复合 ID 规范化成裸 ID 再发起播放流请求
+        # (/videos/1512/original.mp4)。仅对播放流路径(videos/audio 之后的段)
+        # 查出站改写时记录的映射,把这类请求救回属主服务器;
+        # 浏览类路径不参与,避免两服内部 ID 撞号时误路由。
+        for i, seg in enumerate(raw_segments):
+            if i == 0 or raw_segments[i - 1].lower() not in _RESCUE_PREV_SEGMENTS:
+                continue
+            mapped = _served_real_id_map.get(seg)
+            if not mapped or time.time() - mapped[1] > _SERVED_MAP_TTL:
+                continue
+            server = secondary_servers(config).get(mapped[0])
+            if server is not None:
+                logger.info(f"多服路由:播放流裸 ID '{seg}' 命中映射,路由至 {mapped[0]}。")
+                hit = (mapped[0], seg, server)
+                break
+    if hit is None:
+        return None
+
+    server_id, _real_id, server = hit
+    server_cfg = server_like_config(server, config)
+    auth = await credential_service.get_backend_auth(server_cfg, session=session)
+    token = auth["token"]
+    server_user_id = await resolve_server_user_id(server_cfg, session)
+    composite_marker = f"{server_id}{_COMPOSITE_SEP}"
+
+    # 1) 路径改写:复合 ID → 真实 id;/Users/{客户端uid}/ → /Users/{属主服uid}/;
+    #    段内嵌复合值(如字幕路径的 mediasource_s2~1576)剥前缀保留真实形态。
+    raw_segments = full_path.split("/")
+    new_segments: List[str] = []
+    for seg in raw_segments:
+        ref = split_item_ref(seg, config)
+        if ref and ref[0] == server_id:
+            seg = ref[1]
+        elif composite_marker in seg:
+            seg = seg.replace(composite_marker, "")
+        new_segments.append(seg)
+    for i in range(1, len(new_segments)):
+        if new_segments[i - 1] == "Users" and new_segments[i]:
+            new_segments[i] = server_user_id
+    new_full_path = "/".join(new_segments)
+
+    # 2) 查询参数改写:UserId 换属主服用户;客户端 token 参数换成属主服 token;
+    #    其余参数值里若带了本服下发的复合值(如 MediaSourceId=mediasource_s2~1576),
+    #    剥回真实形态再转发(值本身是属主服签发的,只是混入了我们的前缀)。
+    query_string = request.scope.get("query_string", b"") or b""
+    pairs = parse_qsl(query_string.decode("latin-1"), keep_blank_values=True)
+    new_pairs: List[Tuple[str, str]] = []
+    for key, value in pairs:
+        lowered = key.lower()
+        if lowered == "userid":
+            value = server_user_id
+        elif lowered in _TOKEN_PARAM_KEYS:
+            value = token
+        elif composite_marker in value:
+            value = value.replace(composite_marker, "")
+        new_pairs.append((key, value))
+
+    # 3) 请求头改写:X-Emby-Token 与 X-Emby-Authorization 内嵌 Token 替换为属主服 token
+    new_headers: List[Tuple[bytes, bytes]] = []
+    for name, value in request.scope["headers"]:
+        lowered = name.decode("latin-1").lower()
+        if lowered == "x-emby-token":
+            value = token.encode("latin-1")
+        elif lowered == "x-emby-authorization":
+            text = _AUTH_TOKEN_RE.sub(lambda m: f'{m.group(1)}{token}{m.group(3)}', value.decode("latin-1"))
+            value = text.encode("latin-1")
+        new_headers.append((name, value))
+
+    # 4) 以改写后的 scope 重建 Request(scope 共享 → state 互通)
+    scope = dict(request.scope)
+    scope["query_string"] = urlencode(new_pairs).encode("latin-1")
+    scope["headers"] = new_headers
+    new_request = Request(scope, request.receive)
+    new_request.state.evp_server_id = server_id
+    logger.info(f"多服路由:请求携带 {server_id} 复合 ID,已改写指向 {server.name or server_id}。")
+    return new_request, new_full_path, server, server_id
+
+
+# ---------- 出站改写:属主服响应的条目 ID 加回复合前缀 ----------
+
+# 需要加前缀的 ID 字段(客户端会拿它们发起后续请求:详情/图片/播放/进度/导航)
+_OUTBOUND_ID_FIELDS = {"Id", "SeriesId", "SeasonId", "EpisodeId", "AlbumId", "ParentId", "MediaSourceId"}
+# 这些集合里是"人名/演员"等非条目导航,客户端按名称或主服查询,加前缀反而打不通
+_OUTBOUND_SKIP_KEYS = {"People", "ArtistItems", "AlbumArtists"}
+
+# 裸 ID 营救映射:出站改写时记录 {真实ID: (属主服, 时间)}。
+# 部分客户端会把复合 ID 规范化成裸 ID 再发起播放请求(如 /videos/1512/original.mp4),
+# 无前缀无从判断属主,只能靠这份映射救回。仅用于播放流路径,浏览路径不参与,
+# 避免两台服务器内部 ID 撞号时误伤浏览。
+_SERVED_MAP_TTL = 24 * 3600
+_served_real_id_map: Dict[str, Tuple[str, float]] = {}
+_RESCUE_PREV_SEGMENTS = {"videos", "audio"}
+
+
+def _record_served_id(real_id: str, server_id: str) -> None:
+    _served_real_id_map[str(real_id)] = (server_id, time.time())
+    if len(_served_real_id_map) > 20000:
+        cutoff = time.time() - _SERVED_MAP_TTL
+        stale = [k for k, v in _served_real_id_map.items() if v[1] < cutoff][:2000]
+        for k in stale:
+            _served_real_id_map.pop(k, None)
+
+
+def _prefix_ids_outbound(obj, server_id: str, marker: str):
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            if key in _OUTBOUND_SKIP_KEYS:
+                out[key] = value
+            elif key in _OUTBOUND_ID_FIELDS and isinstance(value, (str, int)) and value:
+                s = str(value)
+                if s.startswith(marker):
+                    out[key] = s
+                else:
+                    _record_served_id(s, server_id)
+                    out[key] = f"{server_id}{_COMPOSITE_SEP}{s}"
+            else:
+                out[key] = _prefix_ids_outbound(value, server_id, marker)
+        return out
+    if isinstance(obj, list):
+        return [_prefix_ids_outbound(item, server_id, marker) for item in obj]
+    return obj
+
+
+async def rewrite_routed_response_ids(response, server_id: str):
+    """属主服响应出站前,把 JSON 里的条目 ID 字段加回复合前缀。
+
+    没有这一步,客户端拿到属主服的裸 ID 后发起的播放/图片/进度请求不带前缀,
+    路由无法识别属主,会被打到主服(404/500)。仅处理 JSON;非 JSON 原样返回。
+    已带前缀的值幂等跳过(响应可能来自缓存)。
+    """
+    content_type = (response.headers.get("content-type") or "").lower()
+    if "application/json" not in content_type:
+        return response
+
+    status = getattr(response, "status_code", 200)
+    headers = dict(response.headers)
+    if isinstance(response, StreamingResponse):
+        body = b"".join([chunk async for chunk in response.body_iterator])
+    elif hasattr(response, "body"):
+        body = response.body
+    else:
+        body = await response.body()
+
+    try:
+        data = json.loads(body)
+        marker = f"{server_id}{_COMPOSITE_SEP}"
+        data = _prefix_ids_outbound(data, server_id, marker)
+        new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    except Exception as e:
+        logger.warning(f"多服出站改写失败(原样返回): {e}")
+        new_body = body
+
+    headers.pop("content-length", None)
+    headers.pop("content-encoding", None)
+    return Response(content=new_body, status_code=status, headers=headers, media_type="application/json")

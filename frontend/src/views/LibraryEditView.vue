@@ -72,6 +72,28 @@
             clearable
           />
 
+          <v-select
+            v-model="draft.server_ids"
+            :items="serverOptions"
+            item-title="title"
+            item-value="value"
+            label="内容来源(可选)"
+            multiple
+            chips
+            closable-chips
+            hint="勾选其他服务器后,该库会聚合它们的条目并按 TMDB 与主服合并;留空 = 仅主服"
+            persistent-hint
+          />
+          <v-alert
+            v-if="!hasExtraServers"
+            type="info"
+            variant="tonal"
+            density="compact"
+            icon="mdi-information-outline"
+          >
+            尚未登记其他 Emby 服务器:请先在「系统设置 → Emby 服务器」中添加,才能为该库启用多服聚合。
+          </v-alert>
+
           <v-switch
             v-model="draft.merge_by_tmdb_id"
             color="primary"
@@ -166,6 +188,15 @@ const filterOptions = computed(() => [
     value: filter.id,
   })),
 ])
+
+// 多服聚合:内容来源选项来自服务器注册表(主服恒可用,无需勾选)
+const serverOptions = computed(() =>
+  (configStore.config?.emby_servers ?? [])
+    .filter((server) => !server.is_primary && server.id)
+    .map((server) => ({ title: `${server.name || server.id}(${server.id})`, value: server.id })),
+)
+
+const hasExtraServers = computed(() => serverOptions.value.length > 0)
 
 const rules = {
   required: (label: string) => (value: unknown) =>

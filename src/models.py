@@ -44,6 +44,9 @@ class VirtualLibrary(BaseModel):
     retention_days: int = Field(default=7) # <-- 【新增】RSS项目保留天数，默认7天
     advanced_filter_id: Optional[str] = None
     merge_by_tmdb_id: bool = Field(default=False)
+    # 多服聚合(阶段2/3):内容来源服务器 id 列表(对应 emby_servers[].id);
+    # 空列表 = 仅主服。从服条目以 {server_id}~{item_id} 复合 ID 呈现并按 TMDB 与主服合并。
+    server_ids: List[str] = Field(default_factory=list)
     order: int = 0
     source_library: Optional[str] = None
     conditions: Optional[list] = None

@@ -53,6 +53,8 @@ export interface VirtualLibrary {
   retention_days: number
   advanced_filter_id: string | null
   merge_by_tmdb_id: boolean
+  /** 多服聚合:内容来源服务器 id 列表(空 = 仅主服) */
+  server_ids: string[]
   order: number
   source_library: string | null
   conditions: unknown[] | null
@@ -205,6 +207,7 @@ export function createEmptyLibrary(): VirtualLibrary {  return {
     retention_days: 7,
     advanced_filter_id: null,
     merge_by_tmdb_id: false,
+    server_ids: [],
     order: 0,
     source_library: null,
     conditions: null,

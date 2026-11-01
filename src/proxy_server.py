@@ -29,6 +29,7 @@ import config_manager
 import db_manager
 from services import tmdb_index_service
 from services import credential_service
+from services import server_context
 from json_compress import JsonCompressionMiddleware
 from proxy_handlers import (
     handler_system,
@@ -55,7 +56,9 @@ def get_cache_key(request: Request, full_path: str) -> str:
         try: parts = full_path.split("/"); user_id_from_path = parts[parts.index("Users") + 1]
         except (ValueError, IndexError): pass
     user_id = params.get("UserId", user_id_from_path)
-    return f"user:{user_id}:path:{full_path}:params:{sorted_params}"
+    # 多服路由:命中属主服务器时加维度,避免不同服务器同 id 请求共用缓存键
+    server_part = getattr(request.state, "evp_server_id", None) or "primary"
+    return f"srv:{server_part}:user:{user_id}:path:{full_path}:params:{sorted_params}"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -242,7 +245,7 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
         # 避免 N 个虚拟库把同一份全库数据源拉 N 遍。
         base_entry = handler_items.get_base_items(source_key)
         base_fresh_enough = bool(base_entry) and (int(time.time()) - int(base_entry["updated_at"])) <= 60
-        items = await handler_items.resolve_shared_metadata(
+        items, server_counts = await handler_items.resolve_shared_metadata(
             config, vlib, user_id, proxy_app.state.aiohttp_session,
             config.emby_url.rstrip('/'), internal_headers,
             proxy=emby_proxy_from_config(config),
@@ -252,7 +255,7 @@ async def _refresh_vlib_items_internal(config, library_id: str) -> list:
             raise HTTPException(status_code=502, detail="未能从 Emby 获取到该虚拟库的任何项目,请检查库规则")
 
         if config.enable_vlib_cache:
-            await handler_items.astore_shared_metadata(vlib, items)
+            await handler_items.astore_shared_metadata(vlib, items, server_counts)
             # 封面素材缓存沿用元数据前 100 项
             cover_items = items[:100]
             vlib_items_cache[library_id] = cover_items
@@ -582,12 +585,12 @@ async def clear_image_cache():
 
 @proxy_app.post("/api/internal/probe-vlib/{library_id}")
 async def probe_vlib_change(library_id: str):
-    """用 1 个极小请求判断虚拟库内容是否可能有变化,替代"到点就全量重拉"。
+    """判断虚拟库内容是否可能有变化,替代"到点就全量重拉"。
 
-    判断依据两条,都来自同一个响应:
-      - TotalRecordCount 与该库缓存条目数不一致(能发现新增与删除);
-      - 最新条目的 DateCreated 晚于缓存更新时间(兜住计数恰好不变的新增+删除)。
-    探测成本:1 次 Limit=1 的查询,响应体只有一条记录的少数字段。
+    单服库:沿用 1 个 Limit=1 查询的计数+最新时间比对。
+    多服库(引用了从服):逐台发 1 个 Limit=1 资源过滤查询,按服比对派生时记录的
+    条目数(vlib_server_counts,合并前口径)。弃用"最新 DateCreated"检查 —— 合并
+    可能淘汰各服最新条目导致误报;新增/删除由计数覆盖,"替换式更新"最多等到软过期。
     """
     config = config_manager.load_config_readonly()
     vlib = next((v for v in config.virtual_libraries if v.id == library_id), None)
@@ -596,6 +599,60 @@ async def probe_vlib_change(library_id: str):
     if vlib.resource_type == "rsshub":
         return {"changed": True, "reasons": ["rss"]}
 
+    if not server_context.vlib_uses_secondary(vlib, config):
+        return await _probe_vlib_change_primary(config, vlib)
+
+    # --- 多服库:逐台计数比对 ---
+    counts = db_manager.load_vlib_server_counts(library_id)
+    if not counts:
+        return {"changed": True, "reasons": ["no_server_counts"]}
+
+    params_base = {
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie,Series,Video",
+        "Limit": "1",
+        "EnableUserData": "false",
+        "EnableTotalRecordCount": "true",
+    }
+    resource_map = {"collection": "CollectionIds", "tag": "TagIds", "person": "PersonIds",
+                    "genre": "GenreIds", "studio": "StudioIds"}
+    if vlib.resource_type in resource_map and vlib.resource_id:
+        params_base[resource_map[vlib.resource_type]] = vlib.resource_id
+
+    changed = False
+    reasons: List[str] = []
+    totals: Dict[str, Optional[int]] = {}
+    for server_id, server_cfg in server_context.iter_vlib_server_targets(vlib, config):
+        try:
+            session = proxy_app.state.aiohttp_session
+            server_user_id = await server_context.resolve_server_user_id(server_cfg, session)
+            headers = await credential_service.get_backend_headers(server_cfg, session=session)
+            async with session.get(
+                f"{server_cfg.emby_url.rstrip('/')}/emby/Users/{server_user_id}/Items",
+                params=dict(params_base), headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+                proxy=emby_proxy_from_config(server_cfg),
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Status={resp.status}")
+                total = (await resp.json(content_type=None)).get("TotalRecordCount")
+        except Exception as e:
+            logger.warning(f"多服探测 {server_id} 失败({vlib.name}): {e},按有变化处理。")
+            return {"changed": True, "reasons": [f"probe_failed:{server_id}"]}
+        totals[server_id] = total
+        expected = counts.get(server_id)
+        if expected is None or total is None or int(total) != int(expected):
+            changed = True
+            reasons.append(f"count_changed:{server_id}")
+
+    if changed:
+        logger.info(f"探测到多服库 '{vlib.name}' 内容有变化({', '.join(reasons)}),本轮需要刷新。")
+    return {"changed": changed, "reasons": reasons, "totals": totals}
+
+
+async def _probe_vlib_change_primary(config, vlib):
+    """单服库的变更探测(历史行为:计数 + 最新 DateCreated 双条件)。"""
+    library_id = vlib.id
     user_id = await _resolve_default_user_id(config)
     if not user_id:
         raise HTTPException(status_code=502, detail="无法从 Emby 解析可用用户")
@@ -863,13 +920,33 @@ def _maybe_invalidate_user_state(request: Request, full_path: str, response) -> 
 async def reverse_proxy(request: Request, full_path: str):
     # 热路径:只读快照,不深拷贝(深拷贝整份配置是每请求的固定浪费)
     config = config_manager.load_config_readonly()
-    real_emby_url = config.emby_url.rstrip('/')
-    # 本请求访问 Emby 上游应使用的代理(留空直连);handler 内通过 emby_proxy_of(request) 读取
-    request.state.emby_proxy = emby_proxy_from_config(config)
+    session = request.app.state.aiohttp_session
+
+    # 多服路由:路径携带从服复合 ID({server}~{item})时,把整个请求改写为属主服务器
+    # 的真实形态(真实 id / 属主服 user / 属主服 token),后续 handler 链完全无感。
+    # 播放流路径(/videos/、/audio/)即使无复合 ID 也要进路由 —— 部分客户端会把
+    # 复合 ID 规范化成裸 ID,靠出站改写记录的映射营救;其余未命中 → 原样放行。
+    lowered_path = f"/{full_path.lower()}/"
+    needs_routing = "~" in full_path or "/videos/" in lowered_path or "/audio/" in lowered_path
+    routed_server = None
+    if needs_routing:
+        try:
+            routed = await server_context.resolve_routed_request(request, full_path, config, session)
+        except server_context.RoutingError as e:
+            return JSONResponse(status_code=502, content={"detail": f"多服路由失败: {e}"})
+        if routed is not None:
+            request, full_path, routed_server, _routed_id = routed
+
+    if routed_server is not None:
+        real_emby_url = routed_server.url.rstrip("/")
+        request.state.emby_proxy = emby_proxy_from_config(server_context.server_like_config(routed_server, config))
+    else:
+        real_emby_url = config.emby_url.rstrip('/')
+        request.state.emby_proxy = emby_proxy_from_config(config)
     request.state.real_emby_url = real_emby_url
     # 运行时开关随配置同步(handler 里不再为此深拷贝一份配置)
     proxy_cache.merge_cache_enabled = bool(getattr(config, "enable_merge_cache", True))
-    
+
     cache_key = None
     if config.enable_cache and not proxy_cache.api_cache_disabled:
         cache_key = get_cache_key(request, full_path)
@@ -885,9 +962,10 @@ async def reverse_proxy(request: Request, full_path: str):
             logger.debug(f"响应缓存未命中: {cache_key}")
 
     proxy_address = f"{request.url.scheme}://{request.url.netloc}"
-    session = request.app.state.aiohttp_session
     response = None
 
+    # 路由请求的 path 已改写为属主服真实形态,拦截链通用;从服条目的季/集合并
+    # 会因主服资格判定未命中而自然透传,无需特判。
     if not response: response = await handler_images.handle_virtual_library_image(request, full_path)
     if not response: response = await handler_virtual_items.handle_get_virtual_item_info(request, full_path, config)
     if not response: response = await handler_latest.handle_home_latest_items(request, full_path, request.method, real_emby_url, session, config)
@@ -901,6 +979,11 @@ async def reverse_proxy(request: Request, full_path: str):
     if not response: response = await handler_items.handle_virtual_library_items(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_views.handle_view_injection(request, full_path, request.method, real_emby_url, session, config)
     if not response: response = await handler_default.forward_request(request, full_path, request.method, real_emby_url, session)
+
+    # 多服出站改写:属主服响应里的条目 ID 加回复合前缀,客户端后续的
+    # 图片/播放/进度请求才能带前缀被路由回属主(仅 JSON,流媒体/图片不受影响)
+    if routed_server is not None and response is not None and response.status_code == 200:
+        response = await server_context.rewrite_routed_response_ids(response, routed_server.id)
 
     # 播放/收藏状态写操作成功后,立即失效该用户的叠加层(否则"已看/未看"最长要等 10 分钟)
     _maybe_invalidate_user_state(request, full_path, response)
@@ -919,7 +1002,7 @@ async def reverse_proxy(request: Request, full_path: str):
             response_to_cache: Tuple[bytes, int, Dict] = (response_body, response.status_code, dict(response.headers))
             proxy_cache.api_cache[cache_key] = response_to_cache
             logger.info(f"📝 Cache SET for key: {cache_key}")
-            
+
             # Since body is already read, return a new Response object
             return Response(content=response_body, status_code=response.status_code, headers=response.headers)
 

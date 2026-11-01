@@ -43,6 +43,7 @@ import config_manager
 from emby_net import emby_proxy_from_config
 from models import AppConfig
 from services import credential_service
+from services import server_context
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +82,16 @@ def save_temp_image(file: UploadFile) -> Path:
 # --- 素材抓取(四级回退) ---
 
 async def _download_materials(selected_items: List[dict], temp_dir: Path, config: AppConfig, headers: Dict) -> None:
-    """并发下载项目主封面到临时目录,全部失败则抛错。"""
+    """并发下载项目主封面到临时目录,全部失败则抛错。
 
-    proxy = emby_proxy_from_config(config)
+    多服聚合:从服条目 Id 为 {server}~{real} 复合形态,按属主服务器解析
+    下载地址与凭证;主服条目沿用调用方传入的 headers。
+    """
 
-    async def download_image(session: aiohttp.ClientSession, item: dict, index: int) -> bool:
-        image_url = f"{config.emby_url.rstrip('/')}/emby/Items/{item['Id']}/Images/Primary"
+    async def download_image(session: aiohttp.ClientSession, image_url: str,
+                             image_headers: Dict, image_proxy: Optional[str], index: int) -> bool:
         try:
-            async with session.get(image_url, headers=headers, timeout=20, proxy=proxy) as response:
+            async with session.get(image_url, headers=image_headers, timeout=20, proxy=image_proxy) as response:
                 if response.status == 200:
                     content = await response.read()
                     with open(temp_dir / f"{index}.jpg", "wb") as f:
@@ -98,11 +101,33 @@ async def _download_materials(selected_items: List[dict], temp_dir: Path, config
             return False
         return False
 
+    # 预解析每张图的下载目标(地址/凭证/代理)
+    targets: List[Tuple[str, Dict, Optional[str]]] = []
+    for item in selected_items:
+        ref = server_context.split_item_ref(item.get("Id"), config)
+        if ref:
+            _server_id, real_id, server = ref
+            server_cfg = server_context.server_like_config(server, config)
+            try:
+                server_headers = await credential_service.get_backend_headers(server_cfg)
+            except credential_service.CredentialError as e:
+                logger.warning(f"封面素材跳过从服条目 {item.get('Id')}: {e}")
+                continue
+            targets.append((
+                f"{server_cfg.emby_url.rstrip('/')}/emby/Items/{real_id}/Images/Primary",
+                server_headers, emby_proxy_from_config(server_cfg),
+            ))
+        else:
+            targets.append((
+                f"{config.emby_url.rstrip('/')}/emby/Items/{item['Id']}/Images/Primary",
+                headers, emby_proxy_from_config(config),
+            ))
+
     async with aiohttp.ClientSession() as session:
-        tasks = [download_image(session, item, i + 1) for i, item in enumerate(selected_items)]
+        tasks = [download_image(session, url, hdrs, px, i + 1) for i, (url, hdrs, px) in enumerate(targets)]
         results = await asyncio.gather(*tasks)
 
-    if not any(results):
+    if not results or not any(results):
         raise HTTPException(status_code=500, detail="所有封面素材下载失败，无法生成海报。")
 
 
